@@ -386,13 +386,12 @@ def eva_block_forward(
     is_causal: bool = False,
 ) -> torch.Tensor:
     if self.gamma_1 is None:
-        y = self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal)
-        x = x + self.drop_path1(y)
+        x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
     else:
         x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
         x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
-    return x, y
+    return x
 
 
 def eva_forward_features(
@@ -408,11 +407,9 @@ def eva_forward_features(
     layer_features = []
 
     for i, blk in enumerate(self.blocks):
-        # x, y = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
         x = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
         if i + 1 in self.store_layers:
-            # visualize_patch_norms(x, 32, 32, 0, f"outputs/experiment_results/norm/norm_heatmap_l{i+1:02}.png")
-            # layer_features += [F.normalize(y, dim=-1)]
+            visualize_patch_norms(x, 32, 32, 0, f"outputs/experiment_results/norm/norm_heatmap_l{i+1:02}.png")
             layer_features += [F.normalize(x, dim=-1)]
 
     x = self.norm(x)

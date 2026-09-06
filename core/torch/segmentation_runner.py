@@ -241,6 +241,8 @@ class SegmentationRunner:
         # residual = remove_background_direction(fused_layer_feature, bg_mask.bool()).numpy()
         # fused_cluster_labels = self.fit_predict_kmeans(residual[:, 1:, :].reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
 
+        # compute_trajectory_drift(layer_features, feature_size, feature_size)
+
         # CLSトークンとパッチごとの類似度
         fused_cls2patch_sim = fused_np[:1, :] @ fused_np[1:, :].T
         fused_cls2patch_sim = (fused_cls2patch_sim + 1) / 2
@@ -286,7 +288,7 @@ class SegmentationRunner:
         fused_cls2patch_mask[np.argsort(fused_cls2patch_sim)[::-1][:K]] = 1
         fused_np_2 = fused_np.copy()[1:, :]
         fused_np_2[foreground_mask == 0, :] = \
-            fused_np_2[foreground_mask == 0, :] - np.mean(fused_np_2[fused_cls2patch_mask == 1, :], axis=0, keepdims=True) * 100
+            fused_np_2[foreground_mask == 0, :] - np.mean(fused_np_2[fused_cls2patch_mask == 1, :], axis=0, keepdims=True)
         fused_np_2 = fused_np_2 / np.linalg.norm(fused_np_2, axis=-1, keepdims=True)
         fused_cluster_labels2 = self.fit_predict_kmeans(fused_np_2, k=self.k_clusters, niter=self.niter)
 
@@ -535,3 +537,34 @@ def remove_background_direction(
     )  # [B, P+1, C]
 
     return corrected_features
+
+
+def compute_trajectory_drift(layer_features, H, W):
+    """layer_features: list of Tensors,各 [B, HW+1, C] (1~12層) H, W: パッチの縦横数 (例: 32, 32)
+
+    returns:
+        drifts: [11, H, W]  (層間 L_l -> L_{l+1} の急旋回量)
+    """
+    num_layers = len(layer_features)
+
+    for l in range(num_layers - 1):
+        # 1. CLSトークン(idx=0)を除外してパッチ特徴量を抽出 -> [B, HW, C]
+        feat_curr = layer_features[l][0, 1:, :]  # [HW, C] (B=0として処理)
+        feat_next = layer_features[l + 1][0, 1:, :]  # [HW, C]
+
+        # 2. L2 正規化 (方向ベクトルのみ抽出)
+        feat_curr_norm = F.normalize(feat_curr, p=2, dim=-1)
+        feat_next_norm = F.normalize(feat_next, p=2, dim=-1)
+
+        # 3. 層間のコサイン類似度を計算 -> [HW]
+        cos_sim = (feat_curr_norm * feat_next_norm).sum(dim=-1)
+
+        # 4. コサイン距離 (急旋回量 Δθ = 1 - CosSim) を算出
+        # 値が 0 に近いほど直線的・連続的変化 / 1 に近いほど急旋回
+        drift = (1.0 - cos_sim) / 2
+
+        # 5. [H, W] の2Dグリッド形状に変形
+        drift_2d = drift.reshape(H, W).numpy()
+
+        cv2.imwrite(f"./outputs/experiment_results/trajectory/{l:02d}_{l+1:02d}.png", (drift_2d * 255).astype(np.uint8))
+

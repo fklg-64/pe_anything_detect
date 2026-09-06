@@ -7,7 +7,7 @@ from config import *
 if __name__ == "__main__":
     image_paths = [
         "/home/llm/datasets/mvtec_anomaly_detection/capsule/test/good/000.png",
-        "/home/llm/datasets/mvtec_anomaly_detection/hazelnut/test/good/001.png",
+        # "/home/llm/datasets/mvtec_anomaly_detection/hazelnut/test/good/001.png",
         # "/home/llm/datasets/01_classification_sample/natural/pexels-rohit-george-1141376880-32113857.jpg",
         # "/home/llm/datasets/01_classification_sample/natural/011kumakichi0327_TP_V.jpg", 
         # "/home/llm/datasets/02_object_detection/coin/001_crop.png", 
