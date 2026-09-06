@@ -49,6 +49,8 @@ class TorchCLIPFeatureExtractor:
         # モンキーパッチの適用
         model.encode_image = types.MethodType(encode_image, model)
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
+        # for i in range(12):
+        #     model.visual.trunk.blocks[i].forward = types.MethodType(eva_block_forward, model.visual.trunk.blocks[i])
         model.visual.trunk.forward = types.MethodType(eva_forward, model.visual.trunk)
         model.visual.trunk.forward_head = types.MethodType(eva_forward_head, model.visual.trunk)
         model.visual.trunk.forward_features = types.MethodType(eva_forward_features, model.visual.trunk)

@@ -154,8 +154,9 @@ class SegmentationRunner:
             sim_map = sim_matrix[i].reshape(H, W)
 
             # 0.0 ~ 1.0 に Min-Max 正規化して 8bit 画像化
-            sim_min, sim_max = sim_map.min(), sim_map.max()
-            sim_normalized = (sim_map - sim_min) / (sim_max - sim_min + 1e-8)
+            # sim_min, sim_max = sim_map.min(), sim_map.max()
+            # sim_normalized = (sim_map - sim_min) / (sim_max - sim_min + 1e-8)
+            sim_normalized = (sim_map + 1) / 2
             sim_uint8 = (sim_normalized * 255).astype(np.uint8)
 
             # JET カラーマップを適用 (類似度高: 赤, 低: 青)
@@ -297,12 +298,12 @@ class SegmentationRunner:
         mask_image.save(save_dir / "foreground_mask.png")
 
         # 
-        self.save_patch_similarity_maps_numpy(
-            fused_layer_feature, 
-            (self.feature_size, self.feature_size), 
-            (width, height),
-            save_dir
-        )
+        # self.save_patch_similarity_maps_numpy(
+        #     fused_layer_feature, 
+        #     (self.feature_size, self.feature_size), 
+        #     (width, height),
+        #     save_dir
+        # )
 
         # アテンション画像を保存
         attn_2d = (

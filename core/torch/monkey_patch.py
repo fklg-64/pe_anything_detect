@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from open_clip.model import CustomTextCLIP
 from open_clip.timm_model import TimmModel
 
-from timm.models.eva import Eva
+from timm.models.eva import Eva, EvaBlock
 from timm.layers.attention import maybe_add_mask
 from timm.layers.attention_pool import AttentionPoolLatent
 
@@ -183,8 +183,33 @@ def attentionpoollatent_forward(
 #     return torch.cat(label_token_list, dim=0)
 
 
+def remove_cls_direction(features: torch.Tensor, alpha=1.0):
+    """
+    features: [B, P+1, C]
+    先頭トークンがCLS。
+    戻り値: [B, P+1, C]
+    """
+    cls = features[:, 0, :]       # [B, C]
+    patch = features[:, 1:, :]    # [B, P, C]
+
+    # CLSのノルムは任意でよい
+    denom = cls.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    # 各patchをCLS方向へ射影する係数
+    coeff = (
+        (patch * cls[:, None, :]).sum(dim=-1, keepdim=True)
+        / denom[:, None, :]
+    )
+
+    # CLS方向成分を除去
+    cls_component = coeff * cls[:, None, :]
+    residual = patch - alpha * cls_component
+
+    return torch.cat([cls[:, None, :], residual], dim=1)
+
+
 def custom_attentionpoollatent_forward(
-    self,
+    self: Eva,
     x: torch.Tensor,
     cluster_labels: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
@@ -223,6 +248,19 @@ def custom_attentionpoollatent_forward(
     )
     k, v = kv.unbind(0)  # [B, Heads, N, HeadDim]
     k = self.attn_pool.k_norm(k)
+
+    # k = F.linear(
+    #     remove_cls_direction(x),
+    #     self.attn_pool.kv.weight[:C, :],
+    #     self.attn_pool.kv.bias[:C] if self.attn_pool.kv.bias is not None else None,
+    # ).reshape(B, N, self.attn_pool.num_heads, self.attn_pool.head_dim).permute(0, 2, 1, 3)
+    # k = self.attn_pool.k_norm(k)
+
+    # v = F.linear(
+    #     remove_cls_direction(x),
+    #     self.attn_pool.kv.weight[C:, :],
+    #     self.attn_pool.kv.bias[C:] if self.attn_pool.kv.bias is not None else None,
+    # ).reshape(B, N, self.attn_pool.num_heads, self.attn_pool.head_dim).permute(0, 2, 1, 3)
 
     # 3. 動的な K (クラスタ数) に向けた Mask の一括作成
     # 0 ~ max(cluster_labels) までのラベルを動的生成 [K, 1]
@@ -340,6 +378,23 @@ def visualize_patch_norms(x: torch.Tensor, H: int, W: int, batch_idx: int = 0, s
     return norm_map
 
 
+def eva_block_forward(
+    self: EvaBlock,
+    x: torch.Tensor,
+    rope: Optional[torch.Tensor] = None,
+    attn_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    if self.gamma_1 is None:
+        y = self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal)
+        x = x + self.drop_path1(y)
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+    else:
+        x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
+        x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
+    return x, y
+
+
 def eva_forward_features(
     self: Eva,
     x: torch.Tensor,
@@ -353,9 +408,11 @@ def eva_forward_features(
     layer_features = []
 
     for i, blk in enumerate(self.blocks):
+        # x, y = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
         x = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
         if i + 1 in self.store_layers:
             # visualize_patch_norms(x, 32, 32, 0, f"outputs/experiment_results/norm/norm_heatmap_l{i+1:02}.png")
+            # layer_features += [F.normalize(y, dim=-1)]
             layer_features += [F.normalize(x, dim=-1)]
 
     x = self.norm(x)

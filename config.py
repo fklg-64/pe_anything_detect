@@ -12,3 +12,5 @@ PROMPTS_DIR: str="./prompts"
 OV_NUM_THREAD: int = 4
 # INT8で量子化されたモデルを使用するか？
 USE_INT8: bool = True
+# 前景と判断するための自信度合い
+FOREGROUND_THRESHOLD: float = 0.5

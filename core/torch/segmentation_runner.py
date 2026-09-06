@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 import cv2
 import faiss
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
@@ -21,12 +22,17 @@ class SegmentationRunner:
         extractor: TorchCLIPFeatureExtractor, 
         prompts_dir: str=f"./prompts", 
         k_clusters: Optional[int]=12, 
-        niter: int=10
+        niter: int=10, 
+        foreground_threshold: float=0.5
     ):
         self.extractor = extractor
         self.prompts_dir = prompts_dir
         self.k_clusters = k_clusters
         self.niter = niter
+        self.foreground_threshold = foreground_threshold
+
+        # 特徴マップのサイズ
+        self.feature_size: int = self.extractor.feature_size
 
         self.foreground_prompts: List[str] = []
         self.background_prompts: List[str] = []
@@ -82,26 +88,122 @@ class SegmentationRunner:
         color_map.putpalette(COLOR_PALETTE)
         return color_map
 
+    def save_patch_similarity_maps_numpy(
+        self, 
+        fused_layer_feature: np.ndarray,
+        feat_size: Tuple[int, int] = (32, 32), 
+        save_size: Tuple[int, int] = (512, 512), 
+        save_dir: Path = Path("similarity_maps")
+    ):
+        """fused_layer_feature: [B, H*W+1, C] の NumPy 配列 (B=1想定)"""
+        save_dir = save_dir / "conf1"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. CLSトークン (0番目) を除外して L2 正規化 -> [H*W, C]
+        patch_tokens = fused_layer_feature[0, 1:, :]
+        norms = np.linalg.norm(patch_tokens, axis=-1, keepdims=True)
+        patch_norm = patch_tokens / (norms + 1e-8)
+
+        # 2. 全パッチペアのコサイン類似度を一括計算 (行列積) -> [H*W, H*W]
+        sim_matrix = np.dot(patch_norm, patch_norm.T)
+
+        # 解析用に生の類似度行列データを .npy 形式で保存
+        np.save(save_dir / "similarity_matrix.npy", sim_matrix)
+
+        W, H = feat_size
+        SW, SH = save_size
+        N = H * W
+
+        # save_size に対する 1パッチあたりのスケール比率を算出
+        patch_w = SW / W
+        patch_h = SH / H
+
+        print(
+            f"全 {N} 個のパッチに対する類似度マップの生成を開始します... (保存先: {save_dir})"
+        )
+
+        # 3. 各パッチを基準（クエリ）として類似度マップを可視化・保存
+        for i in range(N):
+            y, x = divmod(i, W)
+
+            # i番目のパッチに対する全領域の類似度マップ -> [H, W]
+            sim_map = sim_matrix[i].reshape(H, W)
+
+            # 0.0 ~ 1.0 に Min-Max 正規化して 8bit 画像化
+            # sim_min, sim_max = sim_map.min(), sim_map.max()
+            # sim_normalized = (sim_map - sim_min) / (sim_max - sim_min + 1e-8)
+            sim_normalized = (sim_map + 1) / 2
+            sim_uint8 = (sim_normalized * 255).astype(np.uint8)
+
+            # JET カラーマップを適用 (類似度高: 赤, 低: 青)
+            heatmap = cv2.applyColorMap(sim_uint8, cv2.COLORMAP_JET)
+
+            # save_size (SW, SH) にサイズを変更 (ドット感を保持)
+            heatmap_large = cv2.resize(
+                heatmap,
+                (SW, SH),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+            # save_size 上の基準パッチ座標（x1, y1, x2, y2）を算出
+            x1 = int(round(x * patch_w))
+            y1 = int(round(y * patch_h))
+            x2 = int(round((x + 1) * patch_w)) - 1
+            y2 = int(round((y + 1) * patch_h)) - 1
+
+            # 基準（クエリ）となっているパッチの位置を白枠で強調表示
+            cv2.rectangle(
+                heatmap_large,
+                (x1, y1),
+                (x2, y2),
+                (255, 255, 255),
+                2,
+            )
+
+            # 画像出力
+            filename = f"sim_patch_y{y:02d}_x{x:02d}_idx{i:04d}.png"
+            cv2.imwrite(save_dir / filename, heatmap_large)
+
+        print("保存が完了しました。")
+
     def run(
         self,
         image_path: str,
         output_dir: str = "./outputs/cluster",
     ):
+        feature_size = self.extractor.feature_size
+
         img_path = Path(image_path)
+        mask_path = img_path.with_name(img_path.name.replace(".png", "_mask.png"))
+
         if img_path.exists():
+            # 画像読み込みと前処理
+            image_raw = Image.open(img_path).convert("RGB")
+            # dx, dy = 200, 200
+            # bg_color = (255, 255, 255)  # 余白の背景色 (RGB)
+            # shifted_img = Image.new(image_raw.mode, image_raw.size, bg_color)
+            # shifted_img.paste(image_raw, (dx, dy))
+            # image_raw = shifted_img
+            width, height = image_raw.size
             print(f"\n--- Processing Image: {img_path.name} ---")
         else:
             print(f"\n--- 存在しません: {img_path.name} ---")
             return
+        if mask_path.exists():
+            mask_raw = Image.open(mask_path).convert("L")
+            # mask_raw = mask_raw.resize((width, height), resample=Image.Resampling.NEAREST)
+            # white_bg = Image.open("/home/llm/datasets/val2017/val2017/000000000285.jpg").convert("RGB")
+            # white_bg = white_bg.resize((width, height), resample=Image.Resampling.BILINEAR)
+            # image_raw = Image.composite(image_raw, white_bg, mask_raw)
+            mask_tensor = np.array(mask_raw)
+            mask_tensor = cv2.resize(mask_tensor, (feature_size, feature_size), interpolation=cv2.INTER_NEAREST)
+            # mask_tensor = mask_tensor == 255
+            # mask_tensor = cv2.resize(mask_tensor, (self.extractor.force_image_size, self.extractor.force_image_size), interpolation=cv2.INTER_NEAREST)
+        else:
+            mask_tensor = None
         
         save_dir = Path(output_dir) / img_path.stem
         save_dir.mkdir(parents=True, exist_ok=True)
-        
-        feature_size = self.extractor.feature_size
-
-        # 1. 画像読み込みと前処理
-        image_raw = Image.open(img_path).convert("RGB")
-        width, height = image_raw.size
 
         start = time.time()
 
@@ -116,19 +218,52 @@ class SegmentationRunner:
 
         # 指定レイヤーの融合とクラスタリング
         fused_layer_feature = torch.cat(layer_features[7:10], dim=2)
-        fused_np = fused_layer_feature.numpy()[:, 1:, :]
-        fused_np = fused_np.reshape(feature_size * feature_size, -1)
-        fused_cluster_labels = self.fit_predict_kmeans(fused_np, k=self.k_clusters, niter=self.niter)
+        fused_layer_feature = F.normalize(fused_layer_feature, dim=-1)
+        fused_np = fused_layer_feature.numpy()
+        fused_np = fused_np.reshape(feature_size * feature_size + 1, -1)
+        fused_cluster_labels = self.fit_predict_kmeans(fused_np[1:, :].reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+        # fused_np[1:, :][mask_tensor.reshape(-1) == 255, :] = fused_np[1:, :][mask_tensor.reshape(-1) == 255, :] - fused_np[:1, :]
+        # fused_np_norm = (fused_np[1:, :] - fused_np[:1, :]) / np.linalg.norm(fused_np[1:, :] - fused_np[:1, :], axis=-1, keepdims=True)
+        # fused_cluster_labels = self.fit_predict_kmeans(fused_np_norm.reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+
+        # cls = fused_layer_feature[:, 0, :]       # [B, C]
+        # patch = fused_layer_feature[:, 1:, :]    # [B, P, C]
+        # denom = (cls * cls).sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        # coeff = (
+        #     patch * cls[:, None, :]
+        # ).sum(dim=-1, keepdim=True) / denom[:, None, :]
+        # residual = patch - coeff * cls[:, None, :]
+        # residual = F.normalize(residual, dim=-1)
+        # residual = residual.numpy()
+        # fused_cluster_labels = self.fit_predict_kmeans(residual.reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+
+        # bg_mask = torch.where(torch.from_numpy(mask_tensor).reshape(1, -1) < 127, 1, 0)
+        # residual = remove_background_direction(fused_layer_feature, bg_mask.bool()).numpy()
+        # fused_cluster_labels = self.fit_predict_kmeans(residual[:, 1:, :].reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+
+        # CLSトークンとパッチごとの類似度
+        fused_cls2patch_sim = fused_np[:1, :] @ fused_np[1:, :].T
+        fused_cls2patch_sim = (fused_cls2patch_sim + 1) / 2
+        fused_cls2patch_sim = fused_cls2patch_sim.reshape(-1)
+
+        # # クラスタごとの類似度
+        # for i in range(self.k_clusters):
+        #     fused_np_custom = fused_np[1:, :] - np.mean(fused_np[1:, :][fused_cluster_labels == i, :], axis=0, keepdims=True)
+        #     fused_cluster_labels_custom = self.fit_predict_kmeans(fused_np_custom, k=self.k_clusters, niter=self.niter)
+        #     fused_cluster_labels_2d = fused_cluster_labels_custom.reshape(feature_size, feature_size)
+        #     fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
+        #     fused_cluster_rgb = fused_cluster_rgb.resize(
+        #         (width, height), resample=Image.Resampling.NEAREST
+        #     )
+        #     fused_cluster_rgb.save(save_dir / f"kmeans_cluster{i:02d}.png")
 
         # クラスタごとの特徴量トークン取得
         label_token_list = self.extractor.extract_cluster_tokens(
             patch_features, torch.from_numpy(fused_cluster_labels).to(torch.int64)
         )
-        # print(label_token_list.shape)
 
         fg_prompts_num: int = len(self.foreground_prompts)
         bg_prompts_num: int = len(self.background_prompts)
-        foreground_threshold = 0.5
         foreground_mask = np.zeros_like(fused_cluster_labels, dtype=np.int32)
         foreground_map = np.zeros_like(fused_cluster_labels, dtype=np.float32)
         print("\n--- Cluster Probabilities ---")
@@ -142,8 +277,18 @@ class SegmentationRunner:
             # 前景度合いのマップ
             foreground_map[fused_cluster_labels == label_idx] = foreground_confidence
             # 閾値以上の場合は前景と判断
-            if foreground_confidence > foreground_threshold:
+            if foreground_confidence > self.foreground_threshold:
                 foreground_mask[fused_cluster_labels == label_idx] = 1
+
+        # 上位K個
+        K = 20
+        fused_cls2patch_mask = np.zeros_like(fused_cls2patch_sim)
+        fused_cls2patch_mask[np.argsort(fused_cls2patch_sim)[::-1][:K]] = 1
+        fused_np_2 = fused_np.copy()[1:, :]
+        fused_np_2[foreground_mask == 0, :] = \
+            fused_np_2[foreground_mask == 0, :] - np.mean(fused_np_2[fused_cls2patch_mask == 1, :], axis=0, keepdims=True) * 100
+        fused_np_2 = fused_np_2 / np.linalg.norm(fused_np_2, axis=-1, keepdims=True)
+        fused_cluster_labels2 = self.fit_predict_kmeans(fused_np_2, k=self.k_clusters, niter=self.niter)
 
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time:.3f} sec")
@@ -171,8 +316,45 @@ class SegmentationRunner:
         )
         fused_cluster_rgb.save(save_dir / f"layer_fused.png")
 
+        # レイヤー結合した特徴マップでもクラスタリング結果を保存
+        fused_cluster_labels2_2d = fused_cluster_labels2.reshape(feature_size, feature_size)
+        fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels2_2d)
+        fused_cluster_rgb = fused_cluster_rgb.resize(
+            (width, height), resample=Image.Resampling.NEAREST
+        )
+        fused_cluster_rgb.save(save_dir / f"layer_fused2.png")
+
+        # 
+        # self.save_patch_similarity_maps_numpy(
+        #     fused_layer_feature, 
+        #     (self.feature_size, self.feature_size), 
+        #     (width, height),
+        #     save_dir
+        # )
+
+        # fused特徴マップのCLSとパッチの類似度
+        fused_cls2patch_2d = (
+            (fused_cls2patch_sim * 255)
+            .astype(np.uint8)
+            .reshape(feature_size, feature_size)
+        )
+        fused_cls2patch_map_image = Image.fromarray(fused_cls2patch_2d).resize(
+            (width, height), resample=Image.Resampling.BILINEAR
+        )
+        fused_cls2patch_map_image.save(save_dir / "fused_cls2patch_image.png")
+
+        # fused特徴マップのCLSとパッチの上位K個のマスク
+        fused_cls2patch_mask_2d = (
+            (fused_cls2patch_mask * 255)
+            .astype(np.uint8)
+            .reshape(feature_size, feature_size)
+        )
+        fused_cls2patch_map_mask = Image.fromarray(fused_cls2patch_mask_2d).resize(
+            (width, height), resample=Image.Resampling.BILINEAR
+        )
+        fused_cls2patch_map_mask.save(save_dir / "fused_cls2patch_mask.png")
+
         # 前景度合いを保存
-        print(foreground_map.max(), foreground_map.min())
         foreground_map_2d = (
             (foreground_map * 255)
             .astype(np.uint8)
@@ -203,3 +385,153 @@ class SegmentationRunner:
         cv2.imwrite(str(save_dir / "foreground_overlay.png"), overlay)
 
         print("Save completed.")
+
+
+def make_background_prototype(
+    features: torch.Tensor,
+    bg_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    背景パッチ集合から、画像ごとの背景プロトタイプを作る。
+
+    Args:
+        features:
+            [B, P+1, C]
+            0番目がCLS、1番目以降がパッチ
+
+        bg_mask:
+            [B, P] のboolテンソル
+            True  = 背景パッチ
+            False = 前景パッチ
+
+    Returns:
+        bg_proto:
+            [B, C]
+    """
+    if features.ndim != 3:
+        raise ValueError(
+            f"features must be [B, P+1, C], got {features.shape}"
+        )
+
+    if bg_mask.ndim != 2:
+        raise ValueError(
+            f"bg_mask must be [B, P], got {bg_mask.shape}"
+        )
+
+    B, P_plus_1, C = features.shape
+    P = P_plus_1 - 1
+
+    if bg_mask.shape != (B, P):
+        raise ValueError(
+            f"bg_mask must have shape {(B, P)}, "
+            f"got {tuple(bg_mask.shape)}"
+        )
+
+    patch = features[:, 1:, :]  # [B, P, C]
+    bg_mask = bg_mask.bool()     # [B, P]
+
+    # 背景パッチ数: [B, 1]
+    bg_count = bg_mask.sum(dim=1, keepdim=True)
+
+    if (bg_count == 0).any():
+        raise ValueError(
+            "At least one sample has no background patch."
+        )
+
+    # 背景パッチを選択するための空間マスク
+    mask = bg_mask.unsqueeze(-1).to(dtype=patch.dtype)  # [B, P, 1]
+
+    # 各パッチを正規化してから平均する。
+    # 背景パッチの特徴方向の平均を求める。
+    patch_unit = F.normalize(
+        patch,
+        dim=-1,
+        eps=eps,
+    )  # [B, P, C]
+
+    bg_mean = (
+        (patch_unit * mask).sum(dim=1)
+        / bg_count.to(dtype=patch.dtype).clamp_min(1.0)
+    )  # [B, C]
+
+    # 背景プロトタイプを単位ベクトルにする
+    bg_proto = F.normalize(
+        bg_mean,
+        dim=-1,
+        eps=eps,
+    )  # [B, C]
+
+    return bg_proto
+
+
+def remove_background_direction(
+    features: torch.Tensor,
+    bg_mask: torch.Tensor,
+    alpha: float = 1.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    各パッチから、背景プロトタイプ方向の成分を除去する。
+
+    Args:
+        features:
+            [B, P+1, C]
+            0番目がCLS
+
+        bg_mask:
+            [B, P] のboolテンソル
+            True  = 背景パッチ
+
+        alpha:
+            背景方向の除去強度。
+            0.0: 補正なし
+            1.0: 背景方向を完全除去
+
+        eps:
+            数値安定化用
+
+    Returns:
+        corrected_features:
+            [B, P+1, C]
+
+            CLSは元のまま。
+            パッチのみ背景方向を補正。
+    """
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(
+            f"alpha must be in [0, 1], got {alpha}"
+        )
+
+    cls = features[:, :1, :]    # [B, 1, C]
+    patch = features[:, 1:, :]  # [B, P, C]
+
+    bg_proto = make_background_prototype(
+        features=features,
+        bg_mask=bg_mask,
+        eps=eps,
+    )  # [B, C]
+
+    # 背景プロトタイプ方向への射影係数
+    # bg_protoは正規化済みなので分母は不要
+    coeff = (
+        patch * bg_proto[:, None, :]
+    ).sum(dim=-1, keepdim=True)  # [B, P, 1]
+
+    # 背景方向成分
+    bg_component = (
+        coeff * bg_proto[:, None, :]
+    )  # [B, P, C]
+
+    # 背景方向を部分的、または完全に除去
+    corrected_patch = (
+        patch - alpha * bg_component
+    )  # [B, P, C]
+
+    # CLSは元のまま戻す
+    corrected_features = torch.cat(
+        [cls, corrected_patch],
+        dim=1,
+    )  # [B, P+1, C]
+
+    return corrected_features
