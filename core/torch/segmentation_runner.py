@@ -174,33 +174,13 @@ class SegmentationRunner:
         feature_size = self.extractor.feature_size
 
         img_path = Path(image_path)
-        mask_path = img_path.with_name(img_path.name.replace(".png", "_mask.png"))
-
         if img_path.exists():
-            # 画像読み込みと前処理
             image_raw = Image.open(img_path).convert("RGB")
-            # dx, dy = 200, 200
-            # bg_color = (255, 255, 255)  # 余白の背景色 (RGB)
-            # shifted_img = Image.new(image_raw.mode, image_raw.size, bg_color)
-            # shifted_img.paste(image_raw, (dx, dy))
-            # image_raw = shifted_img
             width, height = image_raw.size
             print(f"\n--- Processing Image: {img_path.name} ---")
         else:
             print(f"\n--- 存在しません: {img_path.name} ---")
             return
-        if mask_path.exists():
-            mask_raw = Image.open(mask_path).convert("L")
-            # mask_raw = mask_raw.resize((width, height), resample=Image.Resampling.NEAREST)
-            # white_bg = Image.open("/home/llm/datasets/val2017/val2017/000000000285.jpg").convert("RGB")
-            # white_bg = white_bg.resize((width, height), resample=Image.Resampling.BILINEAR)
-            # image_raw = Image.composite(image_raw, white_bg, mask_raw)
-            mask_tensor = np.array(mask_raw)
-            mask_tensor = cv2.resize(mask_tensor, (feature_size, feature_size), interpolation=cv2.INTER_NEAREST)
-            # mask_tensor = mask_tensor == 255
-            # mask_tensor = cv2.resize(mask_tensor, (self.extractor.force_image_size, self.extractor.force_image_size), interpolation=cv2.INTER_NEAREST)
-        else:
-            mask_tensor = None
         
         save_dir = Path(output_dir) / img_path.stem
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -216,59 +196,52 @@ class SegmentationRunner:
             )
         text_probs = (100.0 * image_features @ self.fgbg_text_features.T).softmax(dim=-1)
 
-        # 指定レイヤーの融合とクラスタリング
-        fused_layer_feature = torch.cat(layer_features[7:10], dim=2)
-        fused_layer_feature = F.normalize(fused_layer_feature, dim=-1)
-        fused_np = fused_layer_feature.numpy()
-        fused_np = fused_np.reshape(feature_size * feature_size + 1, -1)
-        fused_cluster_labels = self.fit_predict_kmeans(fused_np[1:, :].reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
-        # fused_np[1:, :][mask_tensor.reshape(-1) == 255, :] = fused_np[1:, :][mask_tensor.reshape(-1) == 255, :] - fused_np[:1, :]
-        # fused_np_norm = (fused_np[1:, :] - fused_np[:1, :]) / np.linalg.norm(fused_np[1:, :] - fused_np[:1, :], axis=-1, keepdims=True)
-        # fused_cluster_labels = self.fit_predict_kmeans(fused_np_norm.reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+        # 指定したレイヤーの特徴量をチャネル方向に結合
+        L_START, L_END = 7, 10
+        fused_features = torch.cat(layer_features[L_START:L_END], dim=2)
+        fused_features = F.normalize(fused_features, dim=-1)
 
-        # cls = fused_layer_feature[:, 0, :]       # [B, C]
-        # patch = fused_layer_feature[:, 1:, :]    # [B, P, C]
-        # denom = (cls * cls).sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        # coeff = (
-        #     patch * cls[:, None, :]
-        # ).sum(dim=-1, keepdim=True) / denom[:, None, :]
-        # residual = patch - coeff * cls[:, None, :]
-        # residual = F.normalize(residual, dim=-1)
-        # residual = residual.numpy()
-        # fused_cluster_labels = self.fit_predict_kmeans(residual.reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+        # NumPy配列に変換 (形状: [1 (CLS) + パッチ数, 特徴量次元])
+        features_np = fused_features.numpy().reshape(-1, fused_features.shape[-1])
+        # CLSトークンの特徴量
+        cls_token = features_np[:1, :]
+        # パッチごとの特徴量
+        patch_tokens = features_np[1:, :]
 
-        # bg_mask = torch.where(torch.from_numpy(mask_tensor).reshape(1, -1) < 127, 1, 0)
-        # residual = remove_background_direction(fused_layer_feature, bg_mask.bool()).numpy()
-        # fused_cluster_labels = self.fit_predict_kmeans(residual[:, 1:, :].reshape(feature_size * feature_size, -1), k=self.k_clusters, niter=self.niter)
+        # 行列積で類似度を計算し、[0, 1] の範囲に正規化
+        cls2patch_sim = (cls_token @ patch_tokens.T).squeeze(0)
+        cls2patch_sim = (cls2patch_sim + 1.0) / 2.0
 
-        # compute_trajectory_drift(layer_features, feature_size, feature_size)
-
-        # CLSトークンとパッチごとの類似度
-        fused_cls2patch_sim = fused_np[:1, :] @ fused_np[1:, :].T
-        fused_cls2patch_sim = (fused_cls2patch_sim + 1) / 2
-        fused_cls2patch_sim = fused_cls2patch_sim.reshape(-1)
-
-        # # クラスタごとの類似度
-        # for i in range(self.k_clusters):
-        #     fused_np_custom = fused_np[1:, :] - np.mean(fused_np[1:, :][fused_cluster_labels == i, :], axis=0, keepdims=True)
-        #     fused_cluster_labels_custom = self.fit_predict_kmeans(fused_np_custom, k=self.k_clusters, niter=self.niter)
-        #     fused_cluster_labels_2d = fused_cluster_labels_custom.reshape(feature_size, feature_size)
-        #     fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
-        #     fused_cluster_rgb = fused_cluster_rgb.resize(
-        #         (width, height), resample=Image.Resampling.NEAREST
-        #     )
-        #     fused_cluster_rgb.save(save_dir / f"kmeans_cluster{i:02d}.png")
-
-        # クラスタごとの特徴量トークン取得
-        label_token_list = self.extractor.extract_cluster_tokens(
-            patch_features, torch.from_numpy(fused_cluster_labels).to(torch.int64)
+        # 類似度上位K個のパッチ（背景バイアス）の平均を引いてセンタリング
+        K = 10
+        topk_indices = np.argsort(cls2patch_sim)[::-1][:K]
+        # 類似度上位K個のパッチの特徴量平均（背景成分）を算出
+        bg_bias = np.mean(patch_tokens[topk_indices, :], axis=0, keepdims=True)
+        # 全特徴量（CLS + 全パッチ）から背景バイアスを引いて再正規化
+        centered_features = patch_tokens - bg_bias
+        centered_features /= np.linalg.norm(centered_features, axis=-1, keepdims=True)
+        # クラスタリング
+        # centered_cluster_labels = self.fit_predict_kmeans(
+        #     centered_features, 
+        #     k=self.k_clusters, 
+        #     niter=self.niter
+        # )
+        centered_cluster_labels = self.fit_predict_kmeans(
+            patch_tokens, 
+            k=self.k_clusters, 
+            niter=self.niter
         )
 
+        # クラスタごとの特徴量トークン取得
+        label_token_list: List[torch.Tensor] = self.extractor.extract_cluster_tokens(
+            patch_features, torch.from_numpy(centered_cluster_labels).to(torch.int64)
+        )
+
+        # 前景マスクの抽出
         fg_prompts_num: int = len(self.foreground_prompts)
         bg_prompts_num: int = len(self.background_prompts)
-        foreground_mask = np.zeros_like(fused_cluster_labels, dtype=np.int32)
-        foreground_map = np.zeros_like(fused_cluster_labels, dtype=np.float32)
-        print("\n--- Cluster Probabilities ---")
+        foreground_mask = np.zeros_like(centered_cluster_labels, dtype=np.int32)
+        foreground_map = np.zeros_like(centered_cluster_labels, dtype=np.float32)
         for label_idx, label_features in enumerate(label_token_list):
             label2text_probs = (
                 100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T
@@ -277,20 +250,10 @@ class SegmentationRunner:
             # 前景度合い
             foreground_confidence = np.sum(probs_cpu[:fg_prompts_num])
             # 前景度合いのマップ
-            foreground_map[fused_cluster_labels == label_idx] = foreground_confidence
+            foreground_map[centered_cluster_labels == label_idx] = foreground_confidence
             # 閾値以上の場合は前景と判断
             if foreground_confidence > self.foreground_threshold:
-                foreground_mask[fused_cluster_labels == label_idx] = 1
-
-        # 上位K個
-        K = 20
-        fused_cls2patch_mask = np.zeros_like(fused_cls2patch_sim)
-        fused_cls2patch_mask[np.argsort(fused_cls2patch_sim)[::-1][:K]] = 1
-        fused_np_2 = fused_np.copy()[1:, :]
-        fused_np_2[foreground_mask == 0, :] = \
-            fused_np_2[foreground_mask == 0, :] - np.mean(fused_np_2[fused_cls2patch_mask == 1, :], axis=0, keepdims=True)
-        fused_np_2 = fused_np_2 / np.linalg.norm(fused_np_2, axis=-1, keepdims=True)
-        fused_cluster_labels2 = self.fit_predict_kmeans(fused_np_2, k=self.k_clusters, niter=self.niter)
+                foreground_mask[centered_cluster_labels == label_idx] = 1
 
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time:.3f} sec")
@@ -300,6 +263,7 @@ class SegmentationRunner:
 
         # 各層のクラスタリング結果の画像を保存
         for i, layer_feature in enumerate(layer_features):
+            layer_feature = F.normalize(layer_feature, dim=-1)
             lf_np = layer_feature.numpy()[:, 1:, :]
             lf_np = lf_np.reshape(feature_size * feature_size, -1)
             cluster_labels = self.fit_predict_kmeans(lf_np, k=self.k_clusters)
@@ -310,33 +274,38 @@ class SegmentationRunner:
             )
             cluster_rgb.save(save_dir / f"layer{i + 1:02d}.png")
 
+        # アーティファクトの影響調査（アテンション周りのノルムを調査）
+        # export_complete_vit_analysis_to_excel(layer_features, feature_size, feature_size, save_dir / "x_norm.xlsx")
+        # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_mlp"], feature_size, feature_size, save_dir / "x_mlp.xlsx")
+        # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_attn"], feature_size, feature_size, save_dir / "x_attn.xlsx")
+        # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_attn_logits_head1"], feature_size, feature_size, save_dir / "x_attn_logits_head1.xlsx")
+        # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_attn_logits_head2"], feature_size, feature_size, save_dir / "x_attn_logits_head2.xlsx")
+        # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_attn_logits_head3"], feature_size, feature_size, save_dir / "x_attn_logits_head3.xlsx")
+
         # レイヤー結合した特徴マップでもクラスタリング結果を保存
-        fused_cluster_labels_2d = fused_cluster_labels.reshape(feature_size, feature_size)
+        fused_cluster_labels_ori = self.fit_predict_kmeans(
+            features_np[1:, :].reshape(feature_size * feature_size, -1), 
+            k=self.k_clusters, 
+            niter=self.niter
+        )
+        fused_cluster_labels_2d = fused_cluster_labels_ori.reshape(feature_size, feature_size)
         fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
         fused_cluster_rgb = fused_cluster_rgb.resize(
             (width, height), resample=Image.Resampling.NEAREST
         )
-        fused_cluster_rgb.save(save_dir / f"layer_fused.png")
+        fused_cluster_rgb.save(save_dir / f"layer_fused_01_ori.png")
 
         # レイヤー結合した特徴マップでもクラスタリング結果を保存
-        fused_cluster_labels2_2d = fused_cluster_labels2.reshape(feature_size, feature_size)
-        fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels2_2d)
+        fused_cluster_labels_2d = centered_cluster_labels.reshape(feature_size, feature_size)
+        fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
         fused_cluster_rgb = fused_cluster_rgb.resize(
             (width, height), resample=Image.Resampling.NEAREST
         )
-        fused_cluster_rgb.save(save_dir / f"layer_fused2.png")
-
-        # 
-        # self.save_patch_similarity_maps_numpy(
-        #     fused_layer_feature, 
-        #     (self.feature_size, self.feature_size), 
-        #     (width, height),
-        #     save_dir
-        # )
+        fused_cluster_rgb.save(save_dir / f"layer_fused_02_center.png")
 
         # fused特徴マップのCLSとパッチの類似度
         fused_cls2patch_2d = (
-            (fused_cls2patch_sim * 255)
+            (cls2patch_sim * 255)
             .astype(np.uint8)
             .reshape(feature_size, feature_size)
         )
@@ -346,8 +315,9 @@ class SegmentationRunner:
         fused_cls2patch_map_image.save(save_dir / "fused_cls2patch_image.png")
 
         # fused特徴マップのCLSとパッチの上位K個のマスク
+        cls2patch_mask = cls2patch_sim >= topk_indices[K-1]
         fused_cls2patch_mask_2d = (
-            (fused_cls2patch_mask * 255)
+            (cls2patch_mask * 255)
             .astype(np.uint8)
             .reshape(feature_size, feature_size)
         )
@@ -389,182 +359,271 @@ class SegmentationRunner:
         print("Save completed.")
 
 
-def make_background_prototype(
-    features: torch.Tensor,
-    bg_mask: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    背景パッチ集合から、画像ごとの背景プロトタイプを作る。
+import io
+import matplotlib.pyplot as plt
+import numpy as np
+import openpyxl
+from openpyxl.chart import LineChart, Reference
+from openpyxl.drawing.image import Image as DrawImage
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+import seaborn as sns
+import torch
 
-    Args:
-        features:
-            [B, P+1, C]
-            0番目がCLS、1番目以降がパッチ
-
-        bg_mask:
-            [B, P] のboolテンソル
-            True  = 背景パッチ
-            False = 前景パッチ
-
-    Returns:
-        bg_proto:
-            [B, C]
-    """
-    if features.ndim != 3:
-        raise ValueError(
-            f"features must be [B, P+1, C], got {features.shape}"
-        )
-
-    if bg_mask.ndim != 2:
-        raise ValueError(
-            f"bg_mask must be [B, P], got {bg_mask.shape}"
-        )
-
-    B, P_plus_1, C = features.shape
-    P = P_plus_1 - 1
-
-    if bg_mask.shape != (B, P):
-        raise ValueError(
-            f"bg_mask must have shape {(B, P)}, "
-            f"got {tuple(bg_mask.shape)}"
-        )
-
-    patch = features[:, 1:, :]  # [B, P, C]
-    bg_mask = bg_mask.bool()     # [B, P]
-
-    # 背景パッチ数: [B, 1]
-    bg_count = bg_mask.sum(dim=1, keepdim=True)
-
-    if (bg_count == 0).any():
-        raise ValueError(
-            "At least one sample has no background patch."
-        )
-
-    # 背景パッチを選択するための空間マスク
-    mask = bg_mask.unsqueeze(-1).to(dtype=patch.dtype)  # [B, P, 1]
-
-    # 各パッチを正規化してから平均する。
-    # 背景パッチの特徴方向の平均を求める。
-    patch_unit = F.normalize(
-        patch,
-        dim=-1,
-        eps=eps,
-    )  # [B, P, C]
-
-    bg_mean = (
-        (patch_unit * mask).sum(dim=1)
-        / bg_count.to(dtype=patch.dtype).clamp_min(1.0)
-    )  # [B, C]
-
-    # 背景プロトタイプを単位ベクトルにする
-    bg_proto = F.normalize(
-        bg_mean,
-        dim=-1,
-        eps=eps,
-    )  # [B, C]
-
-    return bg_proto
-
-
-def remove_background_direction(
-    features: torch.Tensor,
-    bg_mask: torch.Tensor,
-    alpha: float = 1.0,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    各パッチから、背景プロトタイプ方向の成分を除去する。
-
-    Args:
-        features:
-            [B, P+1, C]
-            0番目がCLS
-
-        bg_mask:
-            [B, P] のboolテンソル
-            True  = 背景パッチ
-
-        alpha:
-            背景方向の除去強度。
-            0.0: 補正なし
-            1.0: 背景方向を完全除去
-
-        eps:
-            数値安定化用
-
-    Returns:
-        corrected_features:
-            [B, P+1, C]
-
-            CLSは元のまま。
-            パッチのみ背景方向を補正。
-    """
-    if not (0.0 <= alpha <= 1.0):
-        raise ValueError(
-            f"alpha must be in [0, 1], got {alpha}"
-        )
-
-    cls = features[:, :1, :]    # [B, 1, C]
-    patch = features[:, 1:, :]  # [B, P, C]
-
-    bg_proto = make_background_prototype(
-        features=features,
-        bg_mask=bg_mask,
-        eps=eps,
-    )  # [B, C]
-
-    # 背景プロトタイプ方向への射影係数
-    # bg_protoは正規化済みなので分母は不要
-    coeff = (
-        patch * bg_proto[:, None, :]
-    ).sum(dim=-1, keepdim=True)  # [B, P, 1]
-
-    # 背景方向成分
-    bg_component = (
-        coeff * bg_proto[:, None, :]
-    )  # [B, P, C]
-
-    # 背景方向を部分的、または完全に除去
-    corrected_patch = (
-        patch - alpha * bg_component
-    )  # [B, P, C]
-
-    # CLSは元のまま戻す
-    corrected_features = torch.cat(
-        [cls, corrected_patch],
-        dim=1,
-    )  # [B, P+1, C]
-
-    return corrected_features
-
-
-def compute_trajectory_drift(layer_features, H, W):
-    """layer_features: list of Tensors,各 [B, HW+1, C] (1~12層) H, W: パッチの縦横数 (例: 32, 32)
-
-    returns:
-        drifts: [11, H, W]  (層間 L_l -> L_{l+1} の急旋回量)
-    """
+def export_complete_vit_analysis_to_excel(
+    layer_features, H, W, output_filename="vit_layer_analysis_complete.xlsx"
+):
+    """バイオリンプロット画像、Excel純正折れ線グラフ、サマリー表、正方形2Dマップを1つの.xlsxに出力"""
     num_layers = len(layer_features)
+    num_patches = H * W
 
-    for l in range(num_layers - 1):
-        # 1. CLSトークン(idx=0)を除外してパッチ特徴量を抽出 -> [B, HW, C]
-        feat_curr = layer_features[l][0, 1:, :]  # [HW, C] (B=0として処理)
-        feat_next = layer_features[l + 1][0, 1:, :]  # [HW, C]
+    # --- 1. ノルム計算とパーセンタイル算出 ---
+    all_norms = []  # [12, HW+1] (CLS含む)
+    patch_norms_list = []  # [12, HW] (CLS除外)
 
-        # 2. L2 正規化 (方向ベクトルのみ抽出)
-        feat_curr_norm = F.normalize(feat_curr, p=2, dim=-1)
-        feat_next_norm = F.normalize(feat_next, p=2, dim=-1)
+    percentiles = {
+        "P50": [],
+        "P90": [],
+        "P99": [],
+        "P99.9": [],
+        "Max": [],
+    }
 
-        # 3. 層間のコサイン類似度を計算 -> [HW]
-        cos_sim = (feat_curr_norm * feat_next_norm).sum(dim=-1)
+    for feat in layer_features:
+        norms = torch.norm(feat[0], p=2, dim=-1).cpu().numpy()
+        all_norms.append(norms)
 
-        # 4. コサイン距離 (急旋回量 Δθ = 1 - CosSim) を算出
-        # 値が 0 に近いほど直線的・連続的変化 / 1 に近いほど急旋回
-        drift = (1.0 - cos_sim) / 2
+        p_norms = norms[1:]  # CLS除外
+        patch_norms_list.append(p_norms)
 
-        # 5. [H, W] の2Dグリッド形状に変形
-        drift_2d = drift.reshape(H, W).numpy()
+        percentiles["P50"].append(float(np.percentile(p_norms, 50)))
+        percentiles["P90"].append(float(np.percentile(p_norms, 90)))
+        percentiles["P99"].append(float(np.percentile(p_norms, 99)))
+        percentiles["P99.9"].append(float(np.percentile(p_norms, 99.9)))
+        percentiles["Max"].append(float(np.max(p_norms)))
 
-        cv2.imwrite(f"./outputs/experiment_results/trajectory/{l:02d}_{l+1:02d}.png", (drift_2d * 255).astype(np.uint8))
+    all_norms = np.array(all_norms)
 
+    # --- 2. Matplotlibでバイオリンプロットを作成しメモリ上に保存 ---
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=150)
+    sns.violinplot(
+        data=patch_norms_list,
+        inner=None,
+        color="#e0e0e0",
+        linewidth=1,
+        cut=0,
+        ax=ax,
+    )
+
+    x = np.arange(num_layers)
+    ax.plot(x, percentiles["P50"], marker="o", color="#1f77b4", label="P50")
+    ax.plot(x, percentiles["P90"], marker="s", color="#2ca02c", label="P90")
+    ax.plot(x, percentiles["P99"], marker="^", color="#ff7f0e", label="P99")
+    ax.plot(x, percentiles["P99.9"], marker="d", color="#d62728", label="P99.9")
+    ax.plot(
+        x,
+        percentiles["Max"],
+        marker="x",
+        color="#8c564b",
+        linestyle="--",
+        label="Max",
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"L{i+1}" for i in range(num_layers)])
+    ax.set_title(
+        "Layer-wise Patch Norm Distribution (Violin + Percentiles)",
+        fontweight="bold",
+    )
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Patch Norm")
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(loc="upper left")
+    plt.tight_layout()
+
+    # 画像をファイルに保存せずバイト列として取得
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format="png")
+    plt.close(fig)
+    img_buf.seek(0)
+
+    # --- 3. OpenPyXL Workbookの初期化 ---
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    font_small = Font(name="Segoe UI", size=8)
+    font_bold_small = Font(name="Segoe UI", size=8, bold=True)
+    font_header = Font(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+    fill_header = PatternFill(
+        start_color="366092", end_color="366092", fill_type="solid"
+    )
+    fill_cls = PatternFill(
+        start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
+    )
+    thin_border = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+
+    color_scale = ColorScaleRule(
+        start_type="min",
+        start_color="63BE7B",
+        mid_type="percentile",
+        mid_value=50,
+        mid_color="FFEB84",
+        end_type="max",
+        end_color="F8696B",
+    )
+
+    # ==========================================
+    # シート1: 分布・グラフシート (プロット1)
+    # ==========================================
+    ws_dist = wb.create_sheet(title="Norm_Distribution")
+    ws_dist.views.sheetView[0].showGridLines = True
+
+    # バイオリンプロット画像を挿入 (セル A1)
+    img = DrawImage(img_buf)
+    img.width = 650
+    img.height = 325
+    ws_dist.add_image(img, "A1")
+
+    # パーセンタイル集計表の書き込み (セル A18 から)
+    start_row_pct = 18
+    pct_headers = ["Layer"] + list(percentiles.keys())
+    for c_idx, h in enumerate(pct_headers, 1):
+        cell = ws_dist.cell(row=start_row_pct, column=c_idx, value=h)
+        cell.font = font_header
+        cell.fill = fill_header
+        cell.alignment = Alignment(horizontal="center")
+
+    for l_idx in range(num_layers):
+        r = start_row_pct + 1 + l_idx
+        ws_dist.cell(row=r, column=1, value=f"L{l_idx+1}")
+        for c_idx, key in enumerate(percentiles.keys(), 2):
+            val_cell = ws_dist.cell(
+                row=r, column=c_idx, value=percentiles[key][l_idx]
+            )
+            val_cell.number_format = "0.00"
+            val_cell.border = thin_border
+            val_cell.font = font_small
+
+    # Excel純正の折れ線グラフを追加 (集計表から動的生成)
+    chart = LineChart()
+    chart.title = "Percentile Spikes Across Layers (Excel Native Chart)"
+    chart.style = 13
+    chart.y_axis.title = "Patch Norm"
+    chart.x_axis.title = "Layer"
+
+    data_ref = Reference(
+        ws_dist,
+        min_col=2,
+        min_row=start_row_pct,
+        max_col=6,
+        max_row=start_row_pct + num_layers,
+    )
+    cats_ref = Reference(
+        ws_dist,
+        min_col=1,
+        min_row=start_row_pct + 1,
+        max_row=start_row_pct + num_layers,
+    )
+
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats_ref)
+    chart.width = 14
+    chart.height = 8
+
+    # 折れ線グラフを H1 に挿入
+    ws_dist.add_chart(chart, "H1")
+
+    # ==========================================
+    # シート2: 全層サマリー
+    # ==========================================
+    ws_summary = wb.create_sheet(title="Norm_Summary")
+    ws_summary.views.sheetView[0].showGridLines = True
+
+    headers = ["Index", "Type"] + [f"Layer_{i+1}" for i in range(num_layers)]
+    ws_summary.append(headers)
+
+    for col_num in range(1, len(headers) + 1):
+        cell = ws_summary.cell(row=1, column=col_num)
+        cell.font = font_header
+        cell.fill = fill_header
+
+    for p_idx in range(num_patches + 1):
+        row_num = p_idx + 2
+        token_type = "CLS" if p_idx == 0 else f"Patch_{p_idx-1}"
+        row_data = [p_idx, token_type] + [
+            float(all_norms[l, p_idx]) for l in range(num_layers)
+        ]
+        ws_summary.append(row_data)
+
+        if p_idx == 0:
+            for c in range(1, len(row_data) + 1):
+                cell = ws_summary.cell(row=row_num, column=c)
+                cell.fill = fill_cls
+                cell.font = font_bold_small
+
+    for r in range(2, num_patches + 3):
+        for c in range(3, num_layers + 3):
+            cell = ws_summary.cell(row=r, column=c)
+            cell.font = font_small
+            cell.number_format = "0.00"
+            cell.border = thin_border
+
+    for col in range(3, num_layers + 3):
+        col_letter = openpyxl.utils.get_column_letter(col)
+        ws_summary.conditional_formatting.add(
+            f"{col_letter}3:{col_letter}{num_patches+2}", color_scale
+        )
+
+    # ==========================================
+    # シート3: 各層 2D Map (正方形・小さめセル)
+    # ==========================================
+    SQUARE_ROW_HEIGHT = 20.0
+    SQUARE_COL_WIDTH = 5.2
+
+    for l in range(num_layers):
+        ws_2d = wb.create_sheet(title=f"L{l+1}_2D_Map")
+        ws_2d.views.sheetView[0].showGridLines = True
+
+        ws_2d.cell(
+            row=1, column=1, value=f"L{l+1} CLS Norm:"
+        ).font = font_bold_small
+        cls_cell = ws_2d.cell(row=1, column=3, value=float(all_norms[l, 0]))
+        cls_cell.font = font_bold_small
+        cls_cell.fill = fill_cls
+        cls_cell.number_format = "0.00"
+
+        patch_norms_2d = all_norms[l, 1:].reshape(H, W)
+        start_row = 3
+
+        for r in range(H):
+            current_row = start_row + r
+            ws_2d.row_dimensions[current_row].height = SQUARE_ROW_HEIGHT
+
+            for c in range(W):
+                col_letter = openpyxl.utils.get_column_letter(c + 1)
+                ws_2d.column_dimensions[col_letter].width = SQUARE_COL_WIDTH
+
+                cell = ws_2d.cell(
+                    row=current_row,
+                    column=c + 1,
+                    value=float(patch_norms_2d[r, c]),
+                )
+                cell.font = font_small
+                cell.number_format = "0.00"
+                cell.border = thin_border
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center"
+                )
+
+        end_col_letter = openpyxl.utils.get_column_letter(W)
+        ws_2d.conditional_formatting.add(
+            f"A{start_row}:{end_col_letter}{start_row + H - 1}", color_scale
+        )
+
+    wb.save(output_filename)
+    print(f"全解析データ集約Excelを出力しました: {output_filename}")

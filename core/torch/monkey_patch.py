@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from open_clip.model import CustomTextCLIP
 from open_clip.timm_model import TimmModel
 
-from timm.models.eva import Eva, EvaBlock
-from timm.layers.attention import maybe_add_mask
+from timm.models.eva import Eva, EvaBlock, AttentionRope
+from timm.layers.attention import maybe_add_mask, apply_rot_embed_cat, resolve_self_attn_mask
 from timm.layers.attention_pool import AttentionPoolLatent
 
 from typing import Optional, Tuple, List
@@ -18,7 +18,7 @@ import timm.layers.pos_embed as pos_embed_module
 
 _logger = logging.getLogger(__name__)
 
-# === パッチの適用 (モデル生成より前に必ず実行) ===
+# === パッチの適用: モデル生成より前に必ず実行 ===
 # OpenVINO変換時に動的な画像サイズに対応するため
 
 def resample_abs_pos_embed(
@@ -339,43 +339,68 @@ def custom_attentionpoollatent_forward(
     return cls_tokens  # [B*K, OutDim] (必要に応じて reshape(B, K, -1) や reshape(-1, OutDim) 可能)
 
 
-import cv2
-import numpy as np
+def attention_rope_forward(
+    self: AttentionRope,
+    x,
+    rope: Optional[torch.Tensor] = None,
+    attn_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+):
+    """Forward pass for the attention module.
 
-def visualize_patch_norms(x: torch.Tensor, H: int, W: int, batch_idx: int = 0, save_path: str = "outputs/experiment_results/norm/norm_heatmap.png"):
+    Args:
+        x: Input tensor of shape (batch_size, sequence_length, embedding_dim)
+        rope: Rotary position embeddings tensor for position-aware attention
+        attn_mask: Optional attention mask to apply during attention computation
+        is_causal: If True, use causal (autoregressive) masking
+
+    Returns:
+        Tensor of shape (batch_size, sequence_length, dim_out)
     """
-    x: [B, H*W + 1, C] (PyTorch Tensor)
-    H, W: パッチの縦横数 (例: 512x512画像で patch_size=16 なら H=32, W=32)
-    """
-    # 1. 0番目の CLS トークンを除外し、パッチ部分のみ抽出 [B, H*W, C]
-    patch_tokens = x[:, 1:, :]
+    B, N, C = x.shape
+    gate = self.gate(x).sigmoid() if self.gate is not None else None
 
-    # 2. チャネル方向 (dim=-1) で L2 ノルムを計算 -> [B, H*W]
-    norms = torch.norm(patch_tokens, p=2, dim=-1)
+    if self.qkv is not None:
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # B, num_heads, N, head_dim
+    else:
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-    # 3. 指定したバッチのノルムを取り出し、[H, W] の2Dグリッドに変形
-    norm_map = norms[batch_idx].reshape(H, W).detach().cpu().numpy()
+    q, k = self.q_norm(q), self.k_norm(k)
 
-    # 4. 可視化用に 0〜255 に Min-Max 正規化
-    norm_min = norm_map.min()
-    norm_max = norm_map.max()
-    norm_normalized = (norm_map - norm_min) / (norm_max - norm_min + 1e-8)
-    norm_uint8 = (norm_normalized * 255).astype(np.uint8)
+    if rope is not None:
+        npt = self.num_prefix_tokens
+        half = getattr(self, 'rotate_half', False)
+        q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope, half=half)], dim=2).type_as(v)
+        k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope, half=half)], dim=2).type_as(v)
 
-    # 5. ヒートマップ（COLORMAP_JET: 高いところが赤、低いところが青）を適用
-    heatmap = cv2.applyColorMap(norm_uint8, cv2.COLORMAP_JET)
+    if self.fused_attn and False:
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_drop.p if self.training else 0.,
+            is_causal=is_causal,
+        )
+    else:
+        q = q * self.scale
+        attn_logits = q @ k.transpose(-2, -1)
+        attn_bias = resolve_self_attn_mask(N, attn_logits, attn_mask, is_causal)
+        attn = maybe_add_mask(attn_logits, attn_bias)
+        attn = attn.softmax(dim=-1)
 
-    # パッチサイズ分拡大（ニアレストネイバーでドット感を保持）
-    scale_factor = 16  # 原画像サイズに合わせる倍率
-    heatmap_large = cv2.resize(
-        heatmap, (W * scale_factor, H * scale_factor), interpolation=cv2.INTER_NEAREST
-    )
+        attn = self.attn_drop(attn)
+        x = attn @ v
 
-    # 画像保存
-    cv2.imwrite(save_path, heatmap_large)
-    
-    print(f"Norm Min: {norm_min:.2f}, Max: {norm_max:.2f}")
-    return norm_map
+    x = x.transpose(1, 2).reshape(B, N, self.attn_dim)
+    x = self.norm(x)
+    if gate is not None:
+        x = x * gate
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x, attn_logits
 
 
 def eva_block_forward(
@@ -386,12 +411,19 @@ def eva_block_forward(
     is_causal: bool = False,
 ) -> torch.Tensor:
     if self.gamma_1 is None:
-        x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        x_in = x
+        x_norm1 = self.norm1(x_in)
+        x_attn, attn_logits = self.attn(x_norm1, rope=rope, attn_mask=attn_mask, is_causal=is_causal)
+        x_ap1 = x_in + self.drop_path1(x_attn)
+        x_norm2 = self.norm2(x_ap1)
+        x_mlp = self.mlp(x_norm2)
+        x = x_ap1 + self.drop_path2(x_mlp)
+        # x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
+        # x = x + self.drop_path2(self.mlp(self.norm2(x)))
     else:
         x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
         x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
-    return x
+    return x, x_attn, x_mlp, attn_logits
 
 
 def eva_forward_features(
@@ -405,12 +437,20 @@ def eva_forward_features(
     x = self.norm_pre(x)
 
     layer_features = []
+    self.forward_hook = {"x_attn": [], "x_mlp": [], "x_attn_logits_head1": [], "x_attn_logits_head2": [], "x_attn_logits_head3": []}
 
     for i, blk in enumerate(self.blocks):
-        x = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
+        x, x_attn, x_mlp, attn_logits = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
         if i + 1 in self.store_layers:
-            visualize_patch_norms(x, 32, 32, 0, f"outputs/experiment_results/norm/norm_heatmap_l{i+1:02}.png")
-            layer_features += [F.normalize(x, dim=-1)]
+            if self.is_norm:
+                layer_features += [F.normalize(x, dim=-1)]
+            else:
+                layer_features += [x]
+                self.forward_hook["x_attn_logits_head1"] += [attn_logits[:, 0, 0, :].reshape(1, -1, 1)]
+                self.forward_hook["x_attn_logits_head2"] += [attn_logits[:, 1, 0, :].reshape(1, -1, 1)]
+                self.forward_hook["x_attn_logits_head3"] += [attn_logits[:, 2, 0, :].reshape(1, -1, 1)]
+                self.forward_hook["x_attn"] += [x_attn]
+                self.forward_hook["x_mlp"] += [x_mlp]
 
     x = self.norm(x)
     return x, layer_features

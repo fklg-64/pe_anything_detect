@@ -19,6 +19,7 @@ from open_clip.model import CustomTextCLIP
 
 from core.torch.monkey_patch import *
 
+
 class TorchCLIPFeatureExtractor:
     """CLIPモデルの初期化、モンキーパッチ適用、および特徴量抽出を担当するクラス"""
 
@@ -49,13 +50,19 @@ class TorchCLIPFeatureExtractor:
         # モンキーパッチの適用
         model.encode_image = types.MethodType(encode_image, model)
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
-        # for i in range(12):
-        #     model.visual.trunk.blocks[i].forward = types.MethodType(eva_block_forward, model.visual.trunk.blocks[i])
+        for i in range(12):
+            model.visual.trunk.blocks[i].attn.forward = types.MethodType(attention_rope_forward, model.visual.trunk.blocks[i].attn)
+            model.visual.trunk.blocks[i].forward = types.MethodType(eva_block_forward, model.visual.trunk.blocks[i])
         model.visual.trunk.forward = types.MethodType(eva_forward, model.visual.trunk)
         model.visual.trunk.forward_head = types.MethodType(eva_forward_head, model.visual.trunk)
         model.visual.trunk.forward_features = types.MethodType(eva_forward_features, model.visual.trunk)
         model.visual.trunk.custom_forward = types.MethodType(custom_attentionpoollatent_forward, model.visual.trunk)
         model.visual.trunk.attn_pool.forward = types.MethodType(attentionpoollatent_forward, model.visual.trunk.attn_pool)
+
+        if self.to_openvino:
+            setattr(model.visual.trunk, "is_norm", True)
+        else:
+            setattr(model.visual.trunk, "is_norm", False)
 
         if self.to_openvino:
             setattr(model.visual, "to_openvino", True)
