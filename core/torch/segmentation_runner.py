@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
+from core.torch.edgetam_runner import EdgeTAMPredictor
 from core.utils import *
 
 class SegmentationRunner:
@@ -30,6 +31,8 @@ class SegmentationRunner:
         self.k_clusters = k_clusters
         self.niter = niter
         self.foreground_threshold = foreground_threshold
+
+        self.edgetam_predictor = EdgeTAMPredictor()
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
@@ -218,30 +221,32 @@ class SegmentationRunner:
         # 類似度上位K個のパッチの特徴量平均（背景成分）を算出
         bg_bias = np.mean(patch_tokens[topk_indices, :], axis=0, keepdims=True)
         # 全特徴量（CLS + 全パッチ）から背景バイアスを引いて再正規化
-        centered_features = patch_tokens - bg_bias
-        centered_features /= np.linalg.norm(centered_features, axis=-1, keepdims=True)
+        centered_features = patch_tokens - bg_bias * 0.5
+        centered_features = centered_features / np.linalg.norm(centered_features, axis=-1, keepdims=True)
         # クラスタリング
-        # centered_cluster_labels = self.fit_predict_kmeans(
-        #     centered_features, 
-        #     k=self.k_clusters, 
-        #     niter=self.niter
-        # )
         centered_cluster_labels = self.fit_predict_kmeans(
+            centered_features, 
+            k=self.k_clusters, 
+            niter=self.niter
+        )
+        fused_cluster_labels = self.fit_predict_kmeans(
             patch_tokens, 
             k=self.k_clusters, 
             niter=self.niter
         )
+        # 最終的に前景/背景の分離に使用するクラスタ画像
+        cluster_labels = fused_cluster_labels
 
         # クラスタごとの特徴量トークン取得
         label_token_list: List[torch.Tensor] = self.extractor.extract_cluster_tokens(
-            patch_features, torch.from_numpy(centered_cluster_labels).to(torch.int64)
+            patch_features, torch.from_numpy(cluster_labels).to(torch.int64)
         )
 
         # 前景マスクの抽出
         fg_prompts_num: int = len(self.foreground_prompts)
         bg_prompts_num: int = len(self.background_prompts)
-        foreground_mask = np.zeros_like(centered_cluster_labels, dtype=np.int32)
-        foreground_map = np.zeros_like(centered_cluster_labels, dtype=np.float32)
+        foreground_mask = np.zeros_like(cluster_labels, dtype=np.int32)
+        foreground_map = np.zeros_like(cluster_labels, dtype=np.float32)
         for label_idx, label_features in enumerate(label_token_list):
             label2text_probs = (
                 100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T
@@ -250,10 +255,13 @@ class SegmentationRunner:
             # 前景度合い
             foreground_confidence = np.sum(probs_cpu[:fg_prompts_num])
             # 前景度合いのマップ
-            foreground_map[centered_cluster_labels == label_idx] = foreground_confidence
+            foreground_map[cluster_labels == label_idx] = foreground_confidence
             # 閾値以上の場合は前景と判断
             if foreground_confidence > self.foreground_threshold:
-                foreground_mask[centered_cluster_labels == label_idx] = 1
+                foreground_mask[cluster_labels == label_idx] = 1
+
+        # # edgeTAMによるセグメンテーション
+        # masks, scores, logits = self.edgetam_predictor.predict(image_raw, point_coords=None, point_labels=None)
 
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time:.3f} sec")
@@ -283,12 +291,7 @@ class SegmentationRunner:
         # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_attn_logits_head3"], feature_size, feature_size, save_dir / "x_attn_logits_head3.xlsx")
 
         # レイヤー結合した特徴マップでもクラスタリング結果を保存
-        fused_cluster_labels_ori = self.fit_predict_kmeans(
-            features_np[1:, :].reshape(feature_size * feature_size, -1), 
-            k=self.k_clusters, 
-            niter=self.niter
-        )
-        fused_cluster_labels_2d = fused_cluster_labels_ori.reshape(feature_size, feature_size)
+        fused_cluster_labels_2d = fused_cluster_labels.reshape(feature_size, feature_size)
         fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
         fused_cluster_rgb = fused_cluster_rgb.resize(
             (width, height), resample=Image.Resampling.NEAREST
