@@ -10,6 +10,16 @@
         "a photo of a brown object.",
         "a photo of an orange object.",
         "a photo of a purple object.",
+        "a photo of a pink object.",
+        "a photo of a cyan object.",
+        "a photo of a beige object.",
+        "a photo of a gold object.",
+        "a photo of a silver object.",
+        "a photo of a clear object.",
+        "a photo of a transparent object.",
+        "a photo of a see-through object."
+    ], 
+    "temporary": [
         "a photo of a circular or round shape.",
         "a photo of a square or rectangular shape.",
         "a photo of a triangular or angular shape.",
@@ -35,8 +45,5 @@
         "a photo of a detailed intricate object.",
         "a photo of a sharp edge or detailed contour.",
         "a photo of a clear and red package."
-    ], 
-    "temporary": [
-        
     ]
 }

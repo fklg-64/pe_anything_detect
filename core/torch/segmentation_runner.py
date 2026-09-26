@@ -91,83 +91,9 @@ class SegmentationRunner:
         color_map.putpalette(COLOR_PALETTE)
         return color_map
 
-    def save_patch_similarity_maps_numpy(
-        self, 
-        fused_layer_feature: np.ndarray,
-        feat_size: Tuple[int, int] = (32, 32), 
-        save_size: Tuple[int, int] = (512, 512), 
-        save_dir: Path = Path("similarity_maps")
-    ):
-        """fused_layer_feature: [B, H*W+1, C] の NumPy 配列 (B=1想定)"""
-        save_dir = save_dir / "conf1"
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. CLSトークン (0番目) を除外して L2 正規化 -> [H*W, C]
-        patch_tokens = fused_layer_feature[0, 1:, :]
-        norms = np.linalg.norm(patch_tokens, axis=-1, keepdims=True)
-        patch_norm = patch_tokens / (norms + 1e-8)
-
-        # 2. 全パッチペアのコサイン類似度を一括計算 (行列積) -> [H*W, H*W]
-        sim_matrix = np.dot(patch_norm, patch_norm.T)
-
-        # 解析用に生の類似度行列データを .npy 形式で保存
-        np.save(save_dir / "similarity_matrix.npy", sim_matrix)
-
-        W, H = feat_size
-        SW, SH = save_size
-        N = H * W
-
-        # save_size に対する 1パッチあたりのスケール比率を算出
-        patch_w = SW / W
-        patch_h = SH / H
-
-        print(
-            f"全 {N} 個のパッチに対する類似度マップの生成を開始します... (保存先: {save_dir})"
-        )
-
-        # 3. 各パッチを基準（クエリ）として類似度マップを可視化・保存
-        for i in range(N):
-            y, x = divmod(i, W)
-
-            # i番目のパッチに対する全領域の類似度マップ -> [H, W]
-            sim_map = sim_matrix[i].reshape(H, W)
-
-            # 0.0 ~ 1.0 に Min-Max 正規化して 8bit 画像化
-            # sim_min, sim_max = sim_map.min(), sim_map.max()
-            # sim_normalized = (sim_map - sim_min) / (sim_max - sim_min + 1e-8)
-            sim_normalized = (sim_map + 1) / 2
-            sim_uint8 = (sim_normalized * 255).astype(np.uint8)
-
-            # JET カラーマップを適用 (類似度高: 赤, 低: 青)
-            heatmap = cv2.applyColorMap(sim_uint8, cv2.COLORMAP_JET)
-
-            # save_size (SW, SH) にサイズを変更 (ドット感を保持)
-            heatmap_large = cv2.resize(
-                heatmap,
-                (SW, SH),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-            # save_size 上の基準パッチ座標（x1, y1, x2, y2）を算出
-            x1 = int(round(x * patch_w))
-            y1 = int(round(y * patch_h))
-            x2 = int(round((x + 1) * patch_w)) - 1
-            y2 = int(round((y + 1) * patch_h)) - 1
-
-            # 基準（クエリ）となっているパッチの位置を白枠で強調表示
-            cv2.rectangle(
-                heatmap_large,
-                (x1, y1),
-                (x2, y2),
-                (255, 255, 255),
-                2,
-            )
-
-            # 画像出力
-            filename = f"sim_patch_y{y:02d}_x{x:02d}_idx{i:04d}.png"
-            cv2.imwrite(save_dir / filename, heatmap_large)
-
-        print("保存が完了しました。")
+    # 座標を元画像のピクセル位置に変換
+    def convert_coordinate(self, point: int, img_size: int, feat_size):
+        return point * img_size / feat_size
 
     def run(
         self,
@@ -211,63 +137,137 @@ class SegmentationRunner:
         # パッチごとの特徴量
         patch_tokens = features_np[1:, :]
 
-        # 行列積で類似度を計算し、[0, 1] の範囲に正規化
-        cls2patch_sim = (cls_token @ patch_tokens.T).squeeze(0)
-        cls2patch_sim = (cls2patch_sim + 1.0) / 2.0
-
-        # 類似度上位K個のパッチ（背景バイアス）の平均を引いてセンタリング
-        K = 10
-        topk_indices = np.argsort(cls2patch_sim)[::-1][:K]
-        # 類似度上位K個のパッチの特徴量平均（背景成分）を算出
-        bg_bias = np.mean(patch_tokens[topk_indices, :], axis=0, keepdims=True)
-        # 全特徴量（CLS + 全パッチ）から背景バイアスを引いて再正規化
-        centered_features = patch_tokens - bg_bias * 0.5
-        centered_features = centered_features / np.linalg.norm(centered_features, axis=-1, keepdims=True)
-        # クラスタリング
-        centered_cluster_labels = self.fit_predict_kmeans(
-            centered_features, 
-            k=self.k_clusters, 
-            niter=self.niter
-        )
-        fused_cluster_labels = self.fit_predict_kmeans(
-            patch_tokens, 
-            k=self.k_clusters, 
-            niter=self.niter
-        )
-        # 最終的に前景/背景の分離に使用するクラスタ画像
-        cluster_labels = fused_cluster_labels
-
-        # クラスタごとの特徴量トークン取得
-        label_token_list: List[torch.Tensor] = self.extractor.extract_cluster_tokens(
-            patch_features, torch.from_numpy(cluster_labels).to(torch.int64)
-        )
-
-        # 前景マスクの抽出
+        # 複数のクラスタ数で前景度合いの画像を作成
+        cluster_labels_list = []
+        K_CLUSTERS_LIST = [6, 12, 24]
         fg_prompts_num: int = len(self.foreground_prompts)
         bg_prompts_num: int = len(self.background_prompts)
-        foreground_mask = np.zeros_like(cluster_labels, dtype=np.int32)
-        foreground_map = np.zeros_like(cluster_labels, dtype=np.float32)
-        for label_idx, label_features in enumerate(label_token_list):
-            label2text_probs = (
-                100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T
-            ).softmax(dim=-1)
-            probs_cpu = label2text_probs[0].cpu().numpy()
-            # 前景度合い
-            foreground_confidence = np.sum(probs_cpu[:fg_prompts_num])
-            # 前景度合いのマップ
-            foreground_map[cluster_labels == label_idx] = foreground_confidence
-            # 閾値以上の場合は前景と判断
-            if foreground_confidence > self.foreground_threshold:
-                foreground_mask[cluster_labels == label_idx] = 1
+        foreground_map = np.zeros((feature_size * feature_size, ), dtype=np.float32)
+        for k_clusters in K_CLUSTERS_LIST:
+            cluster_labels = self.fit_predict_kmeans(
+                patch_tokens, 
+                k=k_clusters, 
+                niter=self.niter
+            )
+            cluster_labels_list += [cluster_labels]
 
-        # # edgeTAMによるセグメンテーション
-        # masks, scores, logits = self.edgetam_predictor.predict(image_raw, point_coords=None, point_labels=None)
+            # クラスタごとの特徴量トークン取得
+            label_token_list: List[torch.Tensor] = self.extractor.extract_cluster_tokens(
+                patch_features, torch.from_numpy(cluster_labels).to(torch.int64)
+            )
+
+            # 前景マスクの抽出
+            for label_idx, label_features in enumerate(label_token_list):
+                label2text_probs = (
+                    100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T
+                ).softmax(dim=-1)
+                probs_cpu = label2text_probs[0].cpu().numpy()
+                # 前景度合い
+                foreground_confidence = np.sum(probs_cpu[:fg_prompts_num])
+                # 前景度合いのマップ
+                foreground_map[cluster_labels == label_idx] += foreground_confidence
+
+        # 閾値以上の場合は前景と判断
+        foreground_map = foreground_map / len(K_CLUSTERS_LIST)
+        foreground_map = foreground_map.reshape(feature_size, feature_size)
+        foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
+
+        # 前景がある場合
+        if np.sum(foreground_mask == 1) > 0:
+            # topK個の前景、背景の候補点を取得
+            topK = 1
+
+            # 前景、背景の自信度合いが高い座標
+            # [[x1, y1], [x2, y2], ..., [xn, yn]]の形状で保持
+            # foreground_points = np.stack(np.where(foreground_map == np.amax(foreground_map))).T[:, ::-1]
+            # background_points = np.stack(np.where(foreground_map == np.amin(foreground_map))).T[:, ::-1]
+            # foreground_points = np.stack(np.where(foreground_map > 0.5)).T[:, ::-1]
+            # background_points = np.stack(np.where(foreground_map < 0.2)).T[:, ::-1]
+            foreground_points = np.stack(np.where(foreground_mask == 1)).T[:, ::-1]
+            background_points = np.stack(np.where(foreground_mask == 0)).T[:, ::-1]
+
+            # 前景の初期候補点は "foreground_points間で最も近い" かつ "background_points間と最も遠い" を満たす前景の座標
+            fg2fg_points_dist = np.sqrt(
+                np.sum(
+                    np.pow(
+                        foreground_points.reshape(-1, 1, 2) - foreground_points.reshape(1, -1, 2), 2
+                    ), 
+                    axis=-1
+                )
+            )
+            fg2bg_points_dist = np.sqrt(
+                np.sum(
+                    np.pow(
+                        foreground_points.reshape(-1, 1, 2) - background_points.reshape(1, -1, 2), 2
+                    ), 
+                    axis=-1
+                )
+            )
+            # 値が高いほど候補点、0から1に正規化
+            fg2fg_points_dist_sum = np.sum(fg2fg_points_dist, axis=-1)
+            fg2fg_points_dist_sum = 1 - fg2fg_points_dist_sum / np.amax(fg2fg_points_dist_sum)
+            fg2bg_points_dist_sum = np.sum(fg2bg_points_dist, axis=-1)
+            fg2bg_points_dist_sum = fg2bg_points_dist_sum / np.amax(fg2bg_points_dist_sum)
+            fg_points_dist_min = np.argmax(fg2fg_points_dist_sum * fg2bg_points_dist_sum)
+            max_x, max_y = foreground_points[fg_points_dist_min]
+
+            # 背景の初期候補点は "background_points間で最も近い" かつ "foreground_points間と最も遠い" を満たす前景の座標
+            bg2bg_points_dist = np.sqrt(
+                np.sum(
+                    np.pow(
+                        background_points.reshape(-1, 1, 2) - background_points.reshape(1, -1, 2), 2
+                    ), 
+                    axis=-1
+                )
+            )
+            bg2fg_points_dist = np.sqrt(
+                np.sum(
+                    np.pow(
+                        background_points.reshape(-1, 1, 2) - foreground_points.reshape(1, -1, 2), 2
+                    ), 
+                    axis=-1
+                )
+            )
+            bg2bg_points_dist_sum = np.sum(bg2bg_points_dist, axis=-1)
+            bg2bg_points_dist_sum = 1 - bg2bg_points_dist_sum / np.amax(bg2bg_points_dist_sum)
+            bg2fg_points_dist_sum = np.sum(bg2fg_points_dist, axis=-1)
+            bg2fg_points_dist_sum = bg2fg_points_dist_sum / np.amax(bg2fg_points_dist_sum)
+            bg_points_dist_min = np.argmax(bg2bg_points_dist_sum * bg2fg_points_dist_sum)
+            min_x, min_y = background_points[bg_points_dist_min]
+
+            # 前景、背景の初期候補点を保存
+            foreground_point_coords = [[
+                self.convert_coordinate(max_x + 0.5, width, feature_size), 
+                self.convert_coordinate(max_y + 0.5, height, feature_size)
+            ]]
+            background_point_coords = [[
+                self.convert_coordinate(min_x, width, feature_size), 
+                self.convert_coordinate(min_y, height, feature_size)
+            ]]
+            point_coords = foreground_point_coords + background_point_coords
+            # 前景、背景ラベル
+            point_labels = [1 for _ in range(topK)] + [0 for _ in range(topK)]
+
+            # edgeTAMによるセグメンテーション
+            self.edgetam_predictor.set_image(image_raw)
+            masks, scores, logits = self.edgetam_predictor.predict(
+                point_coords=point_coords, 
+                point_labels=point_labels, 
+                multimask_output=True
+            )
+        else:
+            masks = []
 
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time:.3f} sec")
 
         # --- 処理後の画像保存処理（カラー化とリサイズを保存時に実行） ---
         print(f"\n--- Saving results to {save_dir} ---")
+
+        # マスク画像を保存
+        for i, mask in enumerate(masks):
+            mask = (mask * 255).astype(np.uint8)
+            cv2.imwrite(str(save_dir / f"foreground_mask_n{i+1}.png"), mask)
 
         # 各層のクラスタリング結果の画像を保存
         for i, layer_feature in enumerate(layer_features):
@@ -291,43 +291,13 @@ class SegmentationRunner:
         # export_complete_vit_analysis_to_excel(self.extractor.model.visual.trunk.forward_hook["x_attn_logits_head3"], feature_size, feature_size, save_dir / "x_attn_logits_head3.xlsx")
 
         # レイヤー結合した特徴マップでもクラスタリング結果を保存
-        fused_cluster_labels_2d = fused_cluster_labels.reshape(feature_size, feature_size)
-        fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
-        fused_cluster_rgb = fused_cluster_rgb.resize(
-            (width, height), resample=Image.Resampling.NEAREST
-        )
-        fused_cluster_rgb.save(save_dir / f"layer_fused_01_ori.png")
-
-        # レイヤー結合した特徴マップでもクラスタリング結果を保存
-        fused_cluster_labels_2d = centered_cluster_labels.reshape(feature_size, feature_size)
-        fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
-        fused_cluster_rgb = fused_cluster_rgb.resize(
-            (width, height), resample=Image.Resampling.NEAREST
-        )
-        fused_cluster_rgb.save(save_dir / f"layer_fused_02_center.png")
-
-        # fused特徴マップのCLSとパッチの類似度
-        fused_cls2patch_2d = (
-            (cls2patch_sim * 255)
-            .astype(np.uint8)
-            .reshape(feature_size, feature_size)
-        )
-        fused_cls2patch_map_image = Image.fromarray(fused_cls2patch_2d).resize(
-            (width, height), resample=Image.Resampling.BILINEAR
-        )
-        fused_cls2patch_map_image.save(save_dir / "fused_cls2patch_image.png")
-
-        # fused特徴マップのCLSとパッチの上位K個のマスク
-        cls2patch_mask = cls2patch_sim >= topk_indices[K-1]
-        fused_cls2patch_mask_2d = (
-            (cls2patch_mask * 255)
-            .astype(np.uint8)
-            .reshape(feature_size, feature_size)
-        )
-        fused_cls2patch_map_mask = Image.fromarray(fused_cls2patch_mask_2d).resize(
-            (width, height), resample=Image.Resampling.BILINEAR
-        )
-        fused_cls2patch_map_mask.save(save_dir / "fused_cls2patch_mask.png")
+        for k_clusters, cluster_labels in zip(K_CLUSTERS_LIST, cluster_labels_list):
+            fused_cluster_labels_2d = cluster_labels.reshape(feature_size, feature_size)
+            fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
+            fused_cluster_rgb = fused_cluster_rgb.resize(
+                (width, height), resample=Image.Resampling.NEAREST
+            )
+            fused_cluster_rgb.save(save_dir / f"layer_fused_k{k_clusters}.png")
 
         # 前景度合いを保存
         foreground_map_2d = (
@@ -341,12 +311,12 @@ class SegmentationRunner:
         map_image.save(save_dir / "foreground_map.png")
 
         # マスク画像生成・保存
-        mask_2d = (
+        foreground_mask_2d = (
             (foreground_mask * 255)
             .astype(np.uint8)
             .reshape(feature_size, feature_size)
         )
-        mask_image = Image.fromarray(mask_2d).resize(
+        mask_image = Image.fromarray(foreground_mask_2d).resize(
             (width, height), resample=Image.Resampling.NEAREST
         )
         mask_image.save(save_dir / "foreground_mask.png")
@@ -357,6 +327,17 @@ class SegmentationRunner:
         colored_mask = np.zeros_like(image_cv)
         colored_mask[:, :, 2] = mask_cv
         overlay = cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0)
+        if np.sum(foreground_mask == 1) > 0:
+            cv2.circle(
+                overlay, 
+                (int(point_coords[0][0]), int(point_coords[0][1])), 
+                20, (0, 255, 0), -1
+            )
+            cv2.circle(
+                overlay, 
+                (int(point_coords[1][0]), int(point_coords[1][1])), 
+                20, (0, 0, 255), -1
+            )
         cv2.imwrite(str(save_dir / "foreground_overlay.png"), overlay)
 
         print("Save completed.")

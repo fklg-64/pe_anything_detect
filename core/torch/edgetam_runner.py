@@ -31,24 +31,10 @@ class EdgeTAMPredictor:
         sam_model = build_sam2(config_path, checkpoint_path, device=device)
         self.predictor = SAM2ImagePredictor(sam_model)
 
-    def predict(
+    def set_image(
         self, 
         image_input: Union[str, Path, np.ndarray, Image.Image], 
-        box: Union[List[float], np.ndarray] = None,
-        point_coords: Union[List[List[float]], np.ndarray] = None,
-        point_labels: Union[List[int], np.ndarray] = None,
-        multimask_output: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        画像パスとプロンプトを受け取り、マスクを予測して返します。
-        
-        :param image_input: 画像ファイルパス (str/Path) または NumPy配列 / PIL Image
-        :param box: バウンディングボックスプロンプト [x1, y1, x2, y2]
-        :param point_coords: ポイント座標 [[x1, y1], [x2, y2], ...]
-        :param point_labels: ポイントラベル [1, 0, ...] (1: 前景, 0: 背景)
-        :param multimask_output: 複数マスクを出力するかどうか
-        :return: (masks, scores, logits)
-        """
+    ) -> None:
         # 画像パスが渡された場合はNumPy配列（RGB）に変換
         if isinstance(image_input, (str, Path)):
             image = Image.open(image_input).convert("RGB")
@@ -61,6 +47,25 @@ class EdgeTAMPredictor:
         # 推論モードとAutocastを適用して推論
         with torch.inference_mode():
             self.predictor.set_image(image_np)
+
+    def predict(
+        self, 
+        box: Union[List[float], np.ndarray] = None,
+        point_coords: Union[List[List[float]], np.ndarray] = None,
+        point_labels: Union[List[int], np.ndarray] = None,
+        multimask_output: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        画像パスとプロンプトを受け取り、マスクを予測して返します。
+        
+        :param box: バウンディングボックスプロンプト [x1, y1, x2, y2]
+        :param point_coords: ポイント座標 [[x1, y1], [x2, y2], ...]
+        :param point_labels: ポイントラベル [1, 0, ...] (1: 前景, 0: 背景)
+        :param multimask_output: 複数マスクを出力するかどうか
+        :return: (masks, scores, logits)
+        """
+        # 推論モードとAutocastを適用して推論
+        with torch.inference_mode():
             masks, scores, logits = self.predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
