@@ -12,6 +12,7 @@ if __name__ == "__main__":
         "/home/llm/datasets/01_classification_sample/natural/011kumakichi0327_TP_V.jpg", 
         "/home/llm/datasets/02_object_detection/coin/001_crop.png", 
         "/home/llm/datasets/02_object_detection/clip/002_crop.png", 
+        "/home/llm/datasets/02_object_detection/syringe/001_syringe.jpg", 
         "/home/llm/datasets/01_classification_sample/noodle/noodle (1).png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (2).png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (3).png",

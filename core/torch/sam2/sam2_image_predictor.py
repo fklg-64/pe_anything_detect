@@ -60,9 +60,9 @@ class SAM2ImagePredictor:
 
         # Spatial dim for backbone feature maps
         self._bb_feat_sizes = [
-            (256, 256),
-            (128, 128),
-            (64, 64),
+            (self.model.image_size // 4, self.model.image_size // 4), 
+            (self.model.image_size // 8, self.model.image_size // 8), 
+            (self.model.image_size // 16, self.model.image_size // 16), 
         ]
 
     @classmethod

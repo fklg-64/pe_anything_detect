@@ -53,6 +53,7 @@ class EdgeTAMPredictor:
         box: Union[List[float], np.ndarray] = None,
         point_coords: Union[List[List[float]], np.ndarray] = None,
         point_labels: Union[List[int], np.ndarray] = None,
+        mask_input: Union[List[int], np.ndarray] = None,
         multimask_output: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -61,6 +62,7 @@ class EdgeTAMPredictor:
         :param box: バウンディングボックスプロンプト [x1, y1, x2, y2]
         :param point_coords: ポイント座標 [[x1, y1], [x2, y2], ...]
         :param point_labels: ポイントラベル [1, 0, ...] (1: 前景, 0: 背景)
+        :param mask_input: マスク画像
         :param multimask_output: 複数マスクを出力するかどうか
         :return: (masks, scores, logits)
         """
@@ -70,6 +72,7 @@ class EdgeTAMPredictor:
                 point_coords=point_coords,
                 point_labels=point_labels,
                 box=box,
+                mask_input=mask_input,
                 multimask_output=multimask_output,
             )
 

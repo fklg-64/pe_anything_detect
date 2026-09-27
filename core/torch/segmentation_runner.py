@@ -15,6 +15,8 @@ from core.torch.feature_extractor import TorchCLIPFeatureExtractor
 from core.torch.edgetam_runner import EdgeTAMPredictor
 from core.utils import *
 
+from scipy.ndimage import distance_transform_edt
+
 class SegmentationRunner:
     """抽出された特徴量・クラスタリングを用いた推論・マスク生成の実行クラス"""
 
@@ -91,9 +93,75 @@ class SegmentationRunner:
         color_map.putpalette(COLOR_PALETTE)
         return color_map
 
+    def select_n_prompt_points(
+        self, 
+        target_mask: np.ndarray, 
+        opponent_mask: np.ndarray, 
+        num_points: int = 1
+    ) -> np.ndarray:
+        """
+        対象領域（target_mask）の中から、以下の条件を満たす点を順に num_points 個抽出する:
+        1. 領域の内側に位置する（境界から遠い）
+        2. 対立領域（opponent_mask）から遠い
+        3. 既に選ばれている他のプロンプト点から遠い
+        
+        :return: 座標配列 shape: (num_points, 2) -> [[x1, y1], [x2, y2], ...]
+        """
+        if not np.any(target_mask) or num_points <= 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        # 1. 基本スコアマップの作成（領域の中心度 × 対立領域からの距離）
+        dist_target = distance_transform_edt(target_mask)
+        dist_opponent = distance_transform_edt(1 - opponent_mask)
+
+        norm_target = dist_target / (np.max(dist_target) + 1e-8)
+        norm_opponent = dist_opponent / (np.max(dist_opponent) + 1e-8)
+
+        base_score_map = norm_target * norm_opponent
+        base_score_map[target_mask == 0] = -1.0  # 対象領域外は除外
+
+        selected_points = []
+        
+        # 全ピクセルの y, x 座標格子をあらかじめ用意（距離計算の高速化用）
+        h, w = target_mask.shape
+        grid_y, grid_x = np.ogrid[:h, :w]
+
+        for i in range(num_points):
+            if i == 0:
+                # 1点目: 純粋に基本スコアが最も高い位置（初期候補点）
+                score_map = base_score_map.copy()
+            else:
+                # 2点目以降: 既存の選択済み点との「最小距離マップ」をスコアに乗算
+                # （＝どの選択済み点からも遠い場所のスコアが高くなる）
+                dist_to_selected = np.ones((h, w), dtype=np.float32) * np.inf
+                for py, px in selected_points:
+                    # 既存点とのユーグリッド距離
+                    d = np.sqrt((grid_y - py)**2 + (grid_x - px)**2)
+                    dist_to_selected = np.minimum(dist_to_selected, d)
+                
+                # 正規化して基本スコアと掛け合わせる
+                norm_dist_selected = dist_to_selected / (np.max(dist_to_selected) + 1e-8)
+                score_map = base_score_map * norm_dist_selected
+
+            # 最高スコアの座標を取得
+            best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
+            selected_points.append((best_y, best_x))
+
+        # (y, x) -> (x, y) に変換して返す
+        return np.array([(x, y) for y, x in selected_points], dtype=np.int32)
+
     # 座標を元画像のピクセル位置に変換
     def convert_coordinate(self, point: int, img_size: int, feat_size):
         return point * img_size / feat_size
+
+    def transform_coords(self, pts: np.ndarray, width: int, height: int, feature_size: int) -> List[List[float]]:
+        return [
+            [
+                self.convert_coordinate(x + 0.5, width, feature_size),
+                self.convert_coordinate(y + 0.5, height, feature_size)
+            ]
+            for x, y in pts
+        ]
 
     def run(
         self,
@@ -139,7 +207,7 @@ class SegmentationRunner:
 
         # 複数のクラスタ数で前景度合いの画像を作成
         cluster_labels_list = []
-        K_CLUSTERS_LIST = [6, 12, 24]
+        K_CLUSTERS_LIST = [8]
         fg_prompts_num: int = len(self.foreground_prompts)
         bg_prompts_num: int = len(self.background_prompts)
         foreground_map = np.zeros((feature_size * feature_size, ), dtype=np.float32)
@@ -167,105 +235,94 @@ class SegmentationRunner:
                 # 前景度合いのマップ
                 foreground_map[cluster_labels == label_idx] += foreground_confidence
 
-        # 閾値以上の場合は前景と判断
+        # 前景マスクを作成（閾値以上となっている箇所）
         foreground_map = foreground_map / len(K_CLUSTERS_LIST)
         foreground_map = foreground_map.reshape(feature_size, feature_size)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
 
         # 前景がある場合
         if np.sum(foreground_mask == 1) > 0:
-            # topK個の前景、背景の候補点を取得
-            topK = 1
+            # --- Step 1: 初期の最良点（前景5点 + 背景5点）でベースマスクを作成 ---
+            fg_mask = (foreground_mask == 1).astype(np.uint8)
+            bg_mask = (foreground_mask == 0).astype(np.uint8)
 
-            # 前景、背景の自信度合いが高い座標
-            # [[x1, y1], [x2, y2], ..., [xn, yn]]の形状で保持
-            # foreground_points = np.stack(np.where(foreground_map == np.amax(foreground_map))).T[:, ::-1]
-            # background_points = np.stack(np.where(foreground_map == np.amin(foreground_map))).T[:, ::-1]
-            # foreground_points = np.stack(np.where(foreground_map > 0.5)).T[:, ::-1]
-            # background_points = np.stack(np.where(foreground_map < 0.2)).T[:, ::-1]
-            foreground_points = np.stack(np.where(foreground_mask == 1)).T[:, ::-1]
-            background_points = np.stack(np.where(foreground_mask == 0)).T[:, ::-1]
+            init_n_points = 5
+            init_fg_pt = self.select_n_prompt_points(fg_mask, bg_mask, num_points=init_n_points)
+            init_bg_pt = self.select_n_prompt_points(bg_mask, fg_mask, num_points=init_n_points)
 
-            # 前景の初期候補点は "foreground_points間で最も近い" かつ "background_points間と最も遠い" を満たす前景の座標
-            fg2fg_points_dist = np.sqrt(
-                np.sum(
-                    np.pow(
-                        foreground_points.reshape(-1, 1, 2) - foreground_points.reshape(1, -1, 2), 2
-                    ), 
-                    axis=-1
+            # 初期プロンプト座標とラベルの作成
+            point_coords = self.transform_coords(init_fg_pt, width, height, feature_size) + self.transform_coords(init_bg_pt, width, height, feature_size)
+            point_labels = [1] * init_n_points + [0] * init_n_points
+
+            # 初回推論 (multimask_output=True で最大のスコアを選択)
+            with Timer(f"edgetam特徴量抽出"):
+                self.edgetam_predictor.set_image(image_raw)
+            with Timer(f"edgetam{1}回目マスク推定"):
+                masks, scores, logits = self.edgetam_predictor.predict(
+                    point_coords=np.array(point_coords),
+                    point_labels=np.array(point_labels),
+                    multimask_output=True
                 )
-            )
-            fg2bg_points_dist = np.sqrt(
-                np.sum(
-                    np.pow(
-                        foreground_points.reshape(-1, 1, 2) - background_points.reshape(1, -1, 2), 2
-                    ), 
-                    axis=-1
-                )
-            )
-            # 値が高いほど候補点、0から1に正規化
-            fg2fg_points_dist_sum = np.sum(fg2fg_points_dist, axis=-1)
-            fg2fg_points_dist_sum = 1 - fg2fg_points_dist_sum / np.amax(fg2fg_points_dist_sum)
-            fg2bg_points_dist_sum = np.sum(fg2bg_points_dist, axis=-1)
-            fg2bg_points_dist_sum = fg2bg_points_dist_sum / np.amax(fg2bg_points_dist_sum)
-            fg_points_dist_min = np.argmax(fg2fg_points_dist_sum * fg2bg_points_dist_sum)
-            max_x, max_y = foreground_points[fg_points_dist_min]
 
-            # 背景の初期候補点は "background_points間で最も近い" かつ "foreground_points間と最も遠い" を満たす前景の座標
-            bg2bg_points_dist = np.sqrt(
-                np.sum(
-                    np.pow(
-                        background_points.reshape(-1, 1, 2) - background_points.reshape(1, -1, 2), 2
-                    ), 
-                    axis=-1
-                )
-            )
-            bg2fg_points_dist = np.sqrt(
-                np.sum(
-                    np.pow(
-                        background_points.reshape(-1, 1, 2) - foreground_points.reshape(1, -1, 2), 2
-                    ), 
-                    axis=-1
-                )
-            )
-            bg2bg_points_dist_sum = np.sum(bg2bg_points_dist, axis=-1)
-            bg2bg_points_dist_sum = 1 - bg2bg_points_dist_sum / np.amax(bg2bg_points_dist_sum)
-            bg2fg_points_dist_sum = np.sum(bg2fg_points_dist, axis=-1)
-            bg2fg_points_dist_sum = bg2fg_points_dist_sum / np.amax(bg2fg_points_dist_sum)
-            bg_points_dist_min = np.argmax(bg2bg_points_dist_sum * bg2fg_points_dist_sum)
-            min_x, min_y = background_points[bg_points_dist_min]
+            best_idx = np.argmax(scores)
+            current_mask = masks[best_idx].astype(np.uint8)
+            low_res_logits = logits[best_idx:best_idx + 1]  # shape: (1, 256, 256)
 
-            # 前景、背景の初期候補点を保存
-            foreground_point_coords = [[
-                self.convert_coordinate(max_x + 0.5, width, feature_size), 
-                self.convert_coordinate(max_y + 0.5, height, feature_size)
-            ]]
-            background_point_coords = [[
-                self.convert_coordinate(min_x, width, feature_size), 
-                self.convert_coordinate(min_y, height, feature_size)
-            ]]
-            point_coords = foreground_point_coords + background_point_coords
-            # 前景、背景ラベル
-            point_labels = [1 for _ in range(topK)] + [0 for _ in range(topK)]
+            # --- Step 2: 誤差（差分領域）から動的にポイントを追加して精緻化 ---
+            max_refine_steps: int = 5
+            current_mask_list: List[np.ndarray] = [current_mask]
 
-            # edgeTAMによるセグメンテーション
-            self.edgetam_predictor.set_image(image_raw)
-            masks, scores, logits = self.edgetam_predictor.predict(
-                point_coords=point_coords, 
-                point_labels=point_labels, 
-                multimask_output=True
-            )
+            h_gt, w_gt = fg_mask.shape[:2]
+
+            for step in range(max_refine_steps):
+                # 1. current_mask を fg_mask と同じ画像サイズ (w_gt, h_gt) にリサイズ
+                current_mask_resized = cv2.resize(
+                    current_mask, 
+                    (w_gt, h_gt), 
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+                # 2. 差分領域の計算
+                fg_fn_mask = (fg_mask == 1) & (current_mask_resized == 0)  # 前景の未検出領域
+                fg_fp_mask = (fg_mask == 0) & (current_mask_resized == 1)  # 前景の誤検出領域
+                bg_fn_mask = (bg_mask == 1) & (current_mask_resized == 0)  # 背景の未検出領域
+
+                # 3. 未検出領域から修正ポイントを1点選出
+                new_pt = self.select_n_prompt_points(fg_fn_mask.astype(np.uint8), bg_mask, num_points=1)
+
+                if len(new_pt) == 0:
+                    break
+
+                # 4. 新しい座標を変換してプロンプトリストへ追加（蓄積）
+                new_coord = self.transform_coords(new_pt, width, height, feature_size)[0]
+                point_coords.append(new_coord)
+                point_labels.append(1)
+
+                # 5. 蓄積された全プロンプト + 前回の logits で再推論
+                with Timer(f"edgetam{step+2}回目マスク推定"):
+                    masks, scores, logits = self.edgetam_predictor.predict(
+                        point_coords=np.array(point_coords),
+                        point_labels=np.array(point_labels),
+                        mask_input=low_res_logits,
+                        multimask_output=False
+                    )
+
+                current_mask = masks[0].astype(np.uint8)
+                low_res_logits = logits
+
+                current_mask_list.append(current_mask)
         else:
-            masks = []
+            current_mask = np.zeros((height, width), dtype=np.uint8)
+            current_mask_list = []
 
         elapsed_time = time.time() - start
-        print(f"Inference Time: {elapsed_time:.3f} sec")
+        print(f"Inference Time: {elapsed_time * 1000:.2f} ms")
 
         # --- 処理後の画像保存処理（カラー化とリサイズを保存時に実行） ---
         print(f"\n--- Saving results to {save_dir} ---")
 
         # マスク画像を保存
-        for i, mask in enumerate(masks):
+        for i, mask in enumerate(current_mask_list):
             mask = (mask * 255).astype(np.uint8)
             cv2.imwrite(str(save_dir / f"foreground_mask_n{i+1}.png"), mask)
 
@@ -328,17 +385,27 @@ class SegmentationRunner:
         colored_mask[:, :, 2] = mask_cv
         overlay = cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0)
         if np.sum(foreground_mask == 1) > 0:
-            cv2.circle(
-                overlay, 
-                (int(point_coords[0][0]), int(point_coords[0][1])), 
-                20, (0, 255, 0), -1
-            )
-            cv2.circle(
-                overlay, 
-                (int(point_coords[1][0]), int(point_coords[1][1])), 
-                20, (0, 0, 255), -1
-            )
+            for point_label, point_coord in zip(point_labels, point_coords):
+                if point_label == 1:
+                    cv2.circle(
+                        overlay, 
+                        (int(point_coord[0]), int(point_coord[1])), 
+                        20, (0, 255, 0), -1
+                    )
+                elif point_label == 0:
+                    cv2.circle(
+                        overlay, 
+                        (int(point_coord[0]), int(point_coord[1])), 
+                        20, (0, 0, 255), -1
+                    )
         cv2.imwrite(str(save_dir / "foreground_overlay.png"), overlay)
+
+        # オーバーレイ画像（edgetam版）
+        image_cv = cv2.cvtColor(np.array(image_raw), cv2.COLOR_RGB2BGR)
+        colored_mask = np.zeros_like(image_cv)
+        colored_mask[:, :, 2] = (current_mask * 255).astype(np.uint8)
+        overlay = cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0)
+        cv2.imwrite(str(save_dir / "foreground_overlay_edgetam.png"), overlay)
 
         print("Save completed.")
 

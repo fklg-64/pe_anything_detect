@@ -8,6 +8,14 @@
         "a photo of a white object.",
         "a photo of a grey object.",
         "a photo of a brown object.",
+        "a photo of a brown round-shaped object.",
+        "a photo of a brown square-shaped object.", 
+        "a photo of a brown sphere object.", 
+        "a photo of a brown cone object.", 
+        "a photo of a brown pyramid-shaped object.", 
+        "a photo of a brown cylinder object.", 
+        "a photo of a brown crystalline object.", 
+        "a photo of a brown prismatic object.", 
         "a photo of an orange object.",
         "a photo of a purple object.",
         "a photo of a pink object.",
@@ -16,8 +24,7 @@
         "a photo of a gold object.",
         "a photo of a silver object.",
         "a photo of a clear object.",
-        "a photo of a transparent object.",
-        "a photo of a see-through object."
+        "a photo of a transparent object."
     ], 
     "temporary": [
         "a photo of a circular or round shape.",
