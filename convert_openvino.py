@@ -24,6 +24,7 @@ from timm.models.eva import Eva
 from transformers import AutoTokenizer
 
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
+from core.torch.edgetam_runner import EdgeTAMPredictor
 from config import *
 
 class CLIPOpenVINOExporter:
@@ -198,6 +199,73 @@ class CLIPOpenVINOExporter:
         print("=" * 60)
 
 
+class EdgeTAMOpenVINOExporter:
+    """モデルをOpenVINO形式に変換・保存するクラス"""
+
+    def __init__(self, edgetam_predictor: EdgeTAMPredictor, save_dir: str = "./weights/openvino"):
+        self.edgetam_predictor = edgetam_predictor
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+
+    def _save_and_compress(
+        self, 
+        ov_model: ov.Model, 
+        model_name: str
+    ):
+        """FP32モデルの保存およびINT8量子化/圧縮モデルの保存"""
+        # FP32 保存
+        fp32_path = self.save_dir / f"{model_name}.xml"
+        ov.save_model(ov_model, fp32_path)
+        print(f"  [OK] Saved FP32: {fp32_path.name}")
+
+        # INT8 量子化/圧縮
+        compressed_model = nncf.compress_weights(
+            ov_model, 
+            mode=nncf.CompressWeightsMode.INT8_ASYM
+        )
+
+        # INT8 保存
+        int8_path = self.save_dir / f"{model_name}_int8.xml"
+        ov.save_model(compressed_model, int8_path)
+        print(f"  [OK] Saved INT8: {int8_path.name}")
+
+        # 量子化モデルのINT8使用率を表示
+        self._visualize_quantization_stats(compressed_model)
+
+    # TODO: 出力は入力画像サイズによって固定される。動的にできない。
+    def export_visual_model(self):
+        """画像エンコーダ (Visual Model) の OpenVINO 変換"""      
+        image_size = self.edgetam_predictor.predictor.model.image_size
+        dummy_input = torch.randn(1, 3, image_size, image_size)
+
+        ov_visual = ov.convert_model(
+            self.edgetam_predictor.predictor.model.image_encoder,
+            example_input=dummy_input
+        )
+
+        # 可変バッチサイズに対応
+        ov_visual.reshape({0: ov.PartialShape([1, 3, -1, -1])})
+
+        # パッチサイズの情報を挿入
+        # ov_visual.rt_info["patch_size"] = str(self.edgetam_predictor.model.visual.trunk.patch_embed.patch_size[0])
+
+        self._save_and_compress(ov_visual, "edgetam_image_encoder")
+
+    def export_all(self):
+        """全モデルの変換を実行"""
+        print("=" * 60)
+        print(f" Starting OpenVINO Model Export -> {self.save_dir.resolve()}")
+        print("=" * 60)
+
+        print("\n[1/4] Exporting Visual Model...")
+        self.export_visual_model()
+
+        print("\n" + "=" * 60)
+        print(" All models exported successfully!")
+        print("=" * 60)
+
+
 if __name__ == "__main__":
     # Extractor の初期化
     extractor = TorchCLIPFeatureExtractor(
@@ -205,10 +273,19 @@ if __name__ == "__main__":
         to_openvino=True
     )
 
+    # EdgeTAM
+    edgetam_predictor = EdgeTAMPredictor()
+
     # Exporter の実行
     exporter = CLIPOpenVINOExporter(
         extractor, 
         save_dir="./weights/openvino_models"
     )
+
+    exporter_edgetam = EdgeTAMOpenVINOExporter(
+        edgetam_predictor, 
+        save_dir="./weights/openvino_models"
+    )
     
     exporter.export_all()
+    exporter_edgetam.export_all()
