@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
-from core.torch.edgetam_runner import EdgeTAMPredictor
+from core.torch.edgetam_runner import EdgeTAMPredictor, RepVitModel, DecodeModel
 from core.utils import *
 
 from scipy.ndimage import distance_transform_edt
@@ -33,8 +33,14 @@ class SegmentationRunner:
         self.k_clusters = k_clusters
         self.niter = niter
         self.foreground_threshold = foreground_threshold
+        self.device = "cpu"
 
-        self.edgetam_predictor = EdgeTAMPredictor()
+        self.is_custom = False
+        if self.is_custom:
+            self.edgetam_predictor = EdgeTAMPredictor()
+        else:
+            self.edgetam_encoder = RepVitModel()
+            self.edgetam_decoder = DecodeModel()
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
@@ -256,13 +262,27 @@ class SegmentationRunner:
 
             # 初回推論 (multimask_output=True で最大のスコアを選択)
             with Timer(f"edgetam特徴量抽出"):
-                self.edgetam_predictor.set_image(image_raw)
+                if self.is_custom:
+                    self.edgetam_predictor.set_image(image_raw)
+                else:
+                    orig_hw = torch.tensor([height, width], dtype=torch.int, device=self.device)
+                    high_res_feats0, high_res_feats1, image_embed = self.edgetam_encoder(self.edgetam_encoder.transform(image_raw))
             with Timer(f"edgetam{1}回目マスク推定"):
-                masks, scores, logits = self.edgetam_predictor.predict(
-                    point_coords=np.array(point_coords),
-                    point_labels=np.array(point_labels),
-                    multimask_output=True
-                )
+                if self.is_custom:
+                    masks, scores, logits = self.edgetam_predictor.predict(
+                        point_coords=np.array(point_coords),
+                        point_labels=np.array(point_labels),
+                        multimask_output=True
+                    )
+                else:
+                    masks, scores, logits = self.edgetam_decoder(
+                        high_res_feats0, high_res_feats1, image_embed, orig_hw, 
+                        point_coords=torch.tensor(point_coords, dtype=torch.float, device=self.device),
+                        point_labels=torch.tensor(point_labels, dtype=torch.int, device=self.device),
+                        multimask_output=True
+                    )
+                    masks = masks.detach().numpy()
+                    scores = scores.detach().numpy()
 
             best_idx = np.argmax(scores)
             current_mask = masks[best_idx].astype(np.uint8)
@@ -300,12 +320,23 @@ class SegmentationRunner:
 
                 # 5. 蓄積された全プロンプト + 前回の logits で再推論
                 with Timer(f"edgetam{step+2}回目マスク推定"):
-                    masks, scores, logits = self.edgetam_predictor.predict(
-                        point_coords=np.array(point_coords),
-                        point_labels=np.array(point_labels),
-                        mask_input=low_res_logits,
-                        multimask_output=False
-                    )
+                    if self.is_custom:
+                        masks, scores, logits = self.edgetam_predictor.predict(
+                            point_coords=np.array(point_coords),
+                            point_labels=np.array(point_labels),
+                            mask_input=low_res_logits,
+                            multimask_output=False
+                        )
+                    else:
+                        masks, scores, logits = self.edgetam_decoder(
+                            high_res_feats0, high_res_feats1, image_embed, orig_hw, 
+                            point_coords=torch.tensor(point_coords, dtype=torch.float, device=self.device),
+                            point_labels=torch.tensor(point_labels, dtype=torch.int, device=self.device),
+                            mask_input=low_res_logits,
+                            multimask_output=False
+                        )
+                        masks = masks.detach().numpy()
+                        scores = scores.detach().numpy()
 
                 current_mask = masks[0].astype(np.uint8)
                 low_res_logits = logits
