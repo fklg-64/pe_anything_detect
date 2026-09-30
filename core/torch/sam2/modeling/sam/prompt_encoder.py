@@ -92,13 +92,33 @@ class PromptEncoder(nn.Module):
         point_embedding = self.pe_layer.forward_with_coords(
             points, self.input_image_size
         )
-        point_embedding[labels == -1] = 0.0
-        point_embedding[labels == -1] += self.not_a_point_embed.weight
-        point_embedding[labels == 0] += self.point_embeddings[0].weight
-        point_embedding[labels == 1] += self.point_embeddings[1].weight
-        point_embedding[labels == 2] += self.point_embeddings[2].weight
-        point_embedding[labels == 3] += self.point_embeddings[3].weight
-        return point_embedding
+
+        # OpenVINO対応
+        if False:
+            point_embedding[labels == -1] = 0.0
+            point_embedding[labels == -1] += self.not_a_point_embed.weight
+            point_embedding[labels == 0] += self.point_embeddings[0].weight
+            point_embedding[labels == 1] += self.point_embeddings[1].weight
+            point_embedding[labels == 2] += self.point_embeddings[2].weight
+            point_embedding[labels == 3] += self.point_embeddings[3].weight
+            return point_embedding
+        else:
+            # labels の形状をブロードキャスト用に拡張: [B, N] -> [B, N, 1]
+            lbl = labels.unsqueeze(-1)
+
+            # インプレース代入 (aten::index_put_) を避けるため、各条件の重みを加算して非破壊的に合成
+            # labels == -1 の場合は位置エンコーディングをリセットして not_a_point_embed を割り当てる
+            is_not_point = (lbl == -1)
+            base_embed = torch.where(is_not_point, self.not_a_point_embed.weight, point_embedding)
+
+            # 各ラベル (0, 1, 2, 3) に対応する重みを条件分岐(torch.where)で加算
+            add_embed = torch.zeros_like(base_embed)
+            add_embed = torch.where(lbl == 0, add_embed + self.point_embeddings[0].weight, add_embed)
+            add_embed = torch.where(lbl == 1, add_embed + self.point_embeddings[1].weight, add_embed)
+            add_embed = torch.where(lbl == 2, add_embed + self.point_embeddings[2].weight, add_embed)
+            add_embed = torch.where(lbl == 3, add_embed + self.point_embeddings[3].weight, add_embed)
+
+            return base_embed + add_embed
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
         """Embeds box prompts."""

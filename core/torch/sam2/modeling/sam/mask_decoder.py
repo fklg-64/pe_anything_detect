@@ -197,11 +197,16 @@ class MaskDecoder(nn.Module):
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
         # Expand per-image data in batch direction to be per-mask
-        if repeat_image:
-            src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        # OpenVINO対応
+        if False:
+            if repeat_image:
+                src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+            else:
+                assert image_embeddings.shape[0] == tokens.shape[0]
+                src = image_embeddings
         else:
-            assert image_embeddings.shape[0] == tokens.shape[0]
-            src = image_embeddings
+            repeats = tokens.shape[0] // image_embeddings.shape[0]
+            src = image_embeddings.repeat(repeats, 1, 1, 1)
         src = src + dense_prompt_embeddings
         assert (
             image_pe.size(0) == 1
