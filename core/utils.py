@@ -1,5 +1,9 @@
+import cv2
 import time
-from typing import List, Optional, Tuple
+import numpy as np
+from PIL import Image
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
 
 COLOR_PALETTE: List[int] = [
     0, 0, 0,
@@ -60,3 +64,41 @@ class Timer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.elapsed_ms = (time.perf_counter() - self.start) * 1000
         print(f"{self.name:<{self.width}} : {self.elapsed_ms:6.2f} ms")
+
+
+def load_image(data: Union[str, Path, Image.Image, np.ndarray]) -> Tuple[np.ndarray, bool]:
+    """
+    data:
+        str or Path : パス
+        Image       : Image型のRGB画像
+        ndarray     : ndarray型のRGB画像 (BGRで入力しないこと)
+    """
+    if isinstance(data, (str, Path)):
+        img_cv = np.array(Image.open(data).convert("RGB"))
+    elif isinstance(data, Image.Image):
+        img_cv = np.array(data.convert("RGB"))
+    elif isinstance(data, np.ndarray):
+        img_cv = data
+    else:
+        raise TypeError(f"未対応の画像形式です: {type(data)}")
+    return img_cv
+
+
+def preprocess_image(img_cv: np.ndarray, target_size: int, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """
+    NNに入力するための前処理
+
+    img_cv: ndarray型のRGB画像
+    """
+    resized_cv = cv2.resize(
+        img_cv, 
+        (target_size, target_size), 
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    img_float = resized_cv.astype(np.float32) / 255.0
+    img_chw = np.transpose(img_float, (2, 0, 1))
+
+    img_chw = (img_chw - mean) / std
+
+    return np.expand_dims(img_chw, axis=0)

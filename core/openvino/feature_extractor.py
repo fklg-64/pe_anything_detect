@@ -12,7 +12,6 @@ if "PYTHONPATH" in os.environ:
 
 import cv2
 import numpy as np
-from PIL import Image
 from typing import Union, Tuple, List
 from pathlib import Path
 
@@ -92,43 +91,6 @@ class OVCLIPFeatureExtractor:
     def _forward_once(self):
         input_tensor = np.zeros((1, 3, self.target_size, self.target_size), dtype=np.float32)
         _ = self.compiled_visual_model([input_tensor])
-
-    def load_image(self, data: Union[str, Path, Image.Image, np.ndarray]) -> Tuple[np.ndarray, bool]:
-        if isinstance(data, (str, Path)):
-            img_cv = cv2.imread(str(data), cv2.IMREAD_COLOR)
-            if img_cv is None:
-                raise ValueError(f"画像の読み込みに失敗しました: {data}")
-            is_bgr = True
-        elif isinstance(data, Image.Image):
-            img_cv = np.array(data.convert("RGB"))
-            is_bgr = False
-        elif isinstance(data, np.ndarray):
-            img_cv = data
-            is_bgr = data.ndim == 3 and data.shape[2] == 3
-        else:
-            raise TypeError(f"未対応の画像形式です: {type(data)}")
-        return img_cv, is_bgr
-
-    def preprocess_image(self, img_cv: np.ndarray, is_bgr: bool) -> np.ndarray:
-        if img_cv.ndim == 2:
-            img_cv = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2BGR)
-            is_bgr = True
-
-        resized_cv = cv2.resize(
-            img_cv, 
-            (self.target_size, self.target_size), 
-            interpolation=cv2.INTER_LINEAR
-        )
-
-        if is_bgr:
-            resized_cv = cv2.cvtColor(resized_cv, cv2.COLOR_BGR2RGB)
-
-        img_float = resized_cv.astype(np.float32) / 255.0
-        img_chw = np.transpose(img_float, (2, 0, 1))
-
-        img_chw = (img_chw - self.mean) / self.std
-
-        return np.expand_dims(img_chw, axis=0)
 
     def extract_image_features(self, image_tensor: np.ndarray, normalize=True):
         outs = self.compiled_visual_model([image_tensor])

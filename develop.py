@@ -1,5 +1,6 @@
 from core.utils import *
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
+from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.segmentation_runner import SegmentationRunner
 
 from config import *
@@ -32,12 +33,23 @@ if __name__ == "__main__":
         num_threads = OV_NUM_THREAD
     )
 
+    edgetam = OVEdgeTamRunner(
+        model_dir = MODEL_DIR,
+        target_size=IMAGE_SIZE,
+        use_int8 = USE_INT8, 
+        device = "CPU", 
+        num_threads = OV_NUM_THREAD
+    )
+
     runner = SegmentationRunner(
         extractor, 
+        edgetam, 
         prompts_dir=PROMPTS_DIR, 
         k_clusters=K_CLUSTERS,
         niter=N_ITER
     )
+
+    exit()
 
     for path in image_paths:
         runner.run(

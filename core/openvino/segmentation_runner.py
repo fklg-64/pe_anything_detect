@@ -10,6 +10,7 @@ from PIL import Image
 
 from core.utils import *
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
+from core.openvino.edgetam_runner import OVEdgeTamRunner
 
 class SegmentationRunner:
     """抽出された特徴量・クラスタリングを用いた推論・マスク生成の実行クラス"""
@@ -17,6 +18,7 @@ class SegmentationRunner:
     def __init__(
         self, 
         extractor: OVCLIPFeatureExtractor, 
+        edgetam: OVEdgeTamRunner, 
         prompts_dir: str=f"./prompts", 
         k_clusters: Optional[int]=12, 
         niter: int=10
@@ -112,84 +114,6 @@ class SegmentationRunner:
         result[band] = mask_refined[band]
         return result
 
-    def save_patch_similarity_maps_numpy(
-        self, 
-        fused_layer_feature: np.ndarray,
-        feat_size: Tuple[int, int] = (32, 32), 
-        save_size: Tuple[int, int] = (512, 512), 
-        save_dir: Path = Path("similarity_maps")
-    ):
-        """fused_layer_feature: [B, H*W+1, C] の NumPy 配列 (B=1想定)"""
-        save_dir = save_dir / "conf1"
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. CLSトークン (0番目) を除外して L2 正規化 -> [H*W, C]
-        patch_tokens = fused_layer_feature[0, 1:, :]
-        norms = np.linalg.norm(patch_tokens, axis=-1, keepdims=True)
-        patch_norm = patch_tokens / (norms + 1e-8)
-
-        # 2. 全パッチペアのコサイン類似度を一括計算 (行列積) -> [H*W, H*W]
-        sim_matrix = np.dot(patch_norm, patch_norm.T)
-
-        # 解析用に生の類似度行列データを .npy 形式で保存
-        np.save(save_dir / "similarity_matrix.npy", sim_matrix)
-
-        W, H = feat_size
-        SW, SH = save_size
-        N = H * W
-
-        # save_size に対する 1パッチあたりのスケール比率を算出
-        patch_w = SW / W
-        patch_h = SH / H
-
-        print(
-            f"全 {N} 個のパッチに対する類似度マップの生成を開始します... (保存先: {save_dir})"
-        )
-
-        # 3. 各パッチを基準（クエリ）として類似度マップを可視化・保存
-        for i in range(N):
-            y, x = divmod(i, W)
-
-            # i番目のパッチに対する全領域の類似度マップ -> [H, W]
-            sim_map = sim_matrix[i].reshape(H, W)
-
-            # 0.0 ~ 1.0 に Min-Max 正規化して 8bit 画像化
-            # sim_min, sim_max = sim_map.min(), sim_map.max()
-            # sim_normalized = (sim_map - sim_min) / (sim_max - sim_min + 1e-8)
-            sim_normalized = (sim_map + 1) / 2
-            sim_uint8 = (sim_normalized * 255).astype(np.uint8)
-
-            # JET カラーマップを適用 (類似度高: 赤, 低: 青)
-            heatmap = cv2.applyColorMap(sim_uint8, cv2.COLORMAP_JET)
-
-            # save_size (SW, SH) にサイズを変更 (ドット感を保持)
-            heatmap_large = cv2.resize(
-                heatmap,
-                (SW, SH),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-            # save_size 上の基準パッチ座標（x1, y1, x2, y2）を算出
-            x1 = int(round(x * patch_w))
-            y1 = int(round(y * patch_h))
-            x2 = int(round((x + 1) * patch_w)) - 1
-            y2 = int(round((y + 1) * patch_h)) - 1
-
-            # 基準（クエリ）となっているパッチの位置を白枠で強調表示
-            cv2.rectangle(
-                heatmap_large,
-                (x1, y1),
-                (x2, y2),
-                (255, 255, 255),
-                2,
-            )
-
-            # 画像出力
-            filename = f"sim_patch_y{y:02d}_x{x:02d}_idx{i:04d}.png"
-            cv2.imwrite(save_dir / filename, heatmap_large)
-
-        print("保存が完了しました。")
-
     def run(
         self,
         image_path: str,
@@ -206,14 +130,14 @@ class SegmentationRunner:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # 画像読み込み
-        image_raw, is_bgr = self.extractor.load_image(image_path)
+        image_raw, is_bgr = load_image(image_path)
         height, width = image_raw.shape[:2]
 
         # 計測開始
         start = time.time()
 
         # 前処理
-        image_tensor = self.extractor.preprocess_image(image_raw, is_bgr)
+        image_tensor = preprocess_image(image_raw, self.extractor.target_size, self.extractor.mean, self.extractor.std)
 
         # 特徴量抽出
         with Timer("特徴量抽出処理時間"):
@@ -296,14 +220,6 @@ class SegmentationRunner:
             (width, height), resample=Image.Resampling.NEAREST
         )
         mask_image.save(save_dir / "foreground_mask.png")
-
-        # 
-        # self.save_patch_similarity_maps_numpy(
-        #     fused_layer_feature, 
-        #     (self.feature_size, self.feature_size), 
-        #     (width, height),
-        #     save_dir
-        # )
 
         # アテンション画像を保存
         attn_2d = (
