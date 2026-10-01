@@ -356,10 +356,7 @@ class SegmentationRunner:
                         )
                         masks = masks.detach().numpy()
                         scores = scores.detach().numpy()
-
-                # current_mask = masks[0].astype(np.uint8)
-                # low_res_logits = logits
-
+                        
                 best_idx = np.argmax(scores)
                 current_mask = masks[best_idx].astype(np.uint8)
                 low_res_logits = logits[best_idx:best_idx + 1]

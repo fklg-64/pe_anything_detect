@@ -437,12 +437,16 @@ def eva_forward_features(
     x = self.norm_pre(x)
 
     layer_features = []
-    self.forward_hook = {"x_attn": [], "x_mlp": [], "x_attn_logits_head1": [], "x_attn_logits_head2": [], "x_attn_logits_head3": []}
+    if not self.to_openvino:
+        self.forward_hook = {"x_attn": [], "x_mlp": [], "x_attn_logits_head1": [], "x_attn_logits_head2": [], "x_attn_logits_head3": []}
 
     for i, blk in enumerate(self.blocks):
-        x, x_attn, x_mlp, attn_logits = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
+        if self.to_openvino:
+            x = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
+        else:
+            x, x_attn, x_mlp, attn_logits = blk(x, rope=rot_pos_embed, attn_mask=attn_mask, is_causal=is_causal)
         if i + 1 in self.store_layers:
-            if self.is_norm:
+            if self.to_openvino:
                 layer_features += [F.normalize(x, dim=-1)]
             else:
                 layer_features += [x]

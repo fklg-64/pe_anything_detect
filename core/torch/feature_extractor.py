@@ -50,29 +50,29 @@ class TorchCLIPFeatureExtractor:
         # モンキーパッチの適用
         model.encode_image = types.MethodType(encode_image, model)
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
-        for i in range(12):
-            model.visual.trunk.blocks[i].attn.forward = types.MethodType(attention_rope_forward, model.visual.trunk.blocks[i].attn)
-            model.visual.trunk.blocks[i].forward = types.MethodType(eva_block_forward, model.visual.trunk.blocks[i])
+        # OpenVINO化の有無で設定変更（openvino化しない場合は結果を詳細に取得）
+        if not self.to_openvino:
+            for i in range(12):
+                model.visual.trunk.blocks[i].attn.forward = types.MethodType(attention_rope_forward, model.visual.trunk.blocks[i].attn)
+                model.visual.trunk.blocks[i].forward = types.MethodType(eva_block_forward, model.visual.trunk.blocks[i])
         model.visual.trunk.forward = types.MethodType(eva_forward, model.visual.trunk)
         model.visual.trunk.forward_head = types.MethodType(eva_forward_head, model.visual.trunk)
         model.visual.trunk.forward_features = types.MethodType(eva_forward_features, model.visual.trunk)
         model.visual.trunk.custom_forward = types.MethodType(custom_attentionpoollatent_forward, model.visual.trunk)
         model.visual.trunk.attn_pool.forward = types.MethodType(attentionpoollatent_forward, model.visual.trunk.attn_pool)
 
-        if self.to_openvino:
-            setattr(model.visual.trunk, "is_norm", True)
-        else:
-            setattr(model.visual.trunk, "is_norm", False)
-
+        # OpenVINO化の有無で設定変更
         if self.to_openvino:
             setattr(model.visual, "to_openvino", True)
+            setattr(model.visual.trunk, "to_openvino", True)
             setattr(
                 model.visual.trunk, 
                 "store_layers", 
-                [3, 6, 9, 12]
+                [8, 9, 10]
             )
         else:
             setattr(model.visual, "to_openvino", False)
+            setattr(model.visual.trunk, "to_openvino", False)
             setattr(
                 model.visual.trunk, 
                 "store_layers", 
