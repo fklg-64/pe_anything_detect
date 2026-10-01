@@ -234,7 +234,7 @@ class EdgeTAMOpenVINOExporter(BaseOpenVINOExporter):
 
         _, _, h0, w0 = high_res_feats0.shape
         mask_input = torch.zeros((1, 1, h0, w0), dtype=torch.float32, device=self.device)
-        has_mask = torch.tensor([[0.0]], dtype=torch.float32, device=self.device)
+        has_mask = torch.tensor([0.0], dtype=torch.float32, device=self.device)
 
         example_inputs = (
             high_res_feats0,
@@ -258,7 +258,7 @@ class EdgeTAMOpenVINOExporter(BaseOpenVINOExporter):
             3: ov.PartialShape([-1, -1, 2]),        # point_coords:    [B, N_points, 2]
             4: ov.PartialShape([-1, -1]),           # point_labels:    [B, N_points]
             5: ov.PartialShape([-1, 1, -1, -1]),    # mask_input:      [B, 1, H/4, W/4]
-            6: ov.PartialShape([-1]),               # has_mask:        [B, 1]
+            6: ov.PartialShape([-1]),               # has_mask:        [B]
         })
 
         self._save_and_compress(ov_decoder, "edgetam_decoder")
