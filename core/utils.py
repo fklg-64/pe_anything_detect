@@ -66,12 +66,14 @@ class Timer:
         print(f"{self.name:<{self.width}} : {self.elapsed_ms:6.2f} ms")
 
 
-def load_image(data: Union[str, Path, Image.Image, np.ndarray]) -> Tuple[np.ndarray, bool]:
-    """
-    data:
-        str or Path : パス
-        Image       : Image型のRGB画像
-        ndarray     : ndarray型のRGB画像 (BGRで入力しないこと)
+def load_image(data: Union[str, Path, Image.Image, np.ndarray]) -> np.ndarray:
+    """入力データをRGB順序のnumpy.ndarray(uint8)に統一して読み込みます。
+
+    Args:
+        data: 画像ファイルパス(str/Path)、PIL Image、またはRGB配列(ndarray)
+
+    Returns:
+        np.ndarray: HWC形式・RGB順序の画像配列 (uint8)
     """
     if isinstance(data, (str, Path)):
         img_cv = np.array(Image.open(data).convert("RGB"))
@@ -81,24 +83,51 @@ def load_image(data: Union[str, Path, Image.Image, np.ndarray]) -> Tuple[np.ndar
         img_cv = data
     else:
         raise TypeError(f"未対応の画像形式です: {type(data)}")
+
     return img_cv
 
 
-def preprocess_image(img_cv: np.ndarray, target_size: int, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    """
-    NNに入力するための前処理
+def preprocess_image(
+    img_cv: np.ndarray, 
+    target_size: int, 
+    mean: np.ndarray, 
+    std: np.ndarray
+) -> np.ndarray:
+    """ニューラルネットワーク入力用の前処理 (リサイズ, [0,1]正規化, 標準化, NCHW化)
 
-    img_cv: ndarray型のRGB画像
+    Args:
+        img_cv (np.ndarray): HWC形式・RGB順序の画像配列 (uint8)
+        target_size (int): リサイズ後の正方形サイズ (幅・高さ)
+        mean (np.ndarray): チャンネルごとの平均値
+        std (np.ndarray): チャンネルごとの標準偏差
+
+    Returns:
+        np.ndarray: NCHW形式 (1, C, H, W) の float32 配列
     """
+    # 1. リサイズ (H, W, C)
     resized_cv = cv2.resize(
         img_cv, 
         (target_size, target_size), 
         interpolation=cv2.INTER_LINEAR
     )
 
+    # 2. float32化および [0, 1] 範囲への正規化
     img_float = resized_cv.astype(np.float32) / 255.0
+
+    # 3. 軸の入れ替え (H, W, C) -> (C, H, W)
     img_chw = np.transpose(img_float, (2, 0, 1))
 
-    img_chw = (img_chw - mean) / std
+    # 4. mean / std のブロードキャスト対応 (1D配列(C,)の場合、(C, 1, 1)に変形)
+    mean_arr = np.asarray(mean, dtype=np.float32)
+    std_arr = np.asarray(std, dtype=np.float32)
 
-    return np.expand_dims(img_chw, axis=0)
+    if mean_arr.ndim == 1:
+        mean_arr = mean_arr[:, None, None]
+    if std_arr.ndim == 1:
+        std_arr = std_arr[:, None, None]
+
+    # 5. 標準化
+    img_norm = (img_chw - mean_arr) / std_arr
+
+    # 6. バッチ次元の追加 (C, H, W) -> (1, C, H, W)
+    return np.expand_dims(img_norm, axis=0)

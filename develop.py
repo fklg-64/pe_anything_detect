@@ -9,7 +9,7 @@ if __name__ == "__main__":
     image_paths = [
         "/home/llm/datasets/mvtec_anomaly_detection/capsule/test/good/000.png",
         "/home/llm/datasets/mvtec_anomaly_detection/hazelnut/test/good/001.png",
-        "/home/llm/datasets/mvtec_anomaly_detection/grid/test/bent/002.png",
+        # "/home/llm/datasets/mvtec_anomaly_detection/grid/test/bent/002.png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (1).png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (2).png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (3).png",
@@ -46,9 +46,10 @@ if __name__ == "__main__":
         edgetam, 
         prompts_dir=PROMPTS_DIR, 
         k_clusters=K_CLUSTERS,
-        niter=N_ITER
+        niter=N_ITER,
+        foreground_threshold=FOREGROUND_THRESHOLD
     )
-    
+
     for path in image_paths:
         runner.run(
             image_path=path,

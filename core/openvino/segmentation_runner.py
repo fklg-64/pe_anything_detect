@@ -177,8 +177,7 @@ class SegmentationRunner:
         feats: Optional[Tuple],
         height: int,
         width: int,
-        mask_input: Optional[np.ndarray] = None,
-        multimask_output: bool = True,
+        mask_input: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """EdgeTAM Decoder の実行（PyTorch / Custom / 将来のOpenVINOの違いをカプセル化）"""
         if mask_input is None:
@@ -248,8 +247,7 @@ class SegmentationRunner:
 
             for label_idx, label_features in enumerate(label_token_list):
                 label2text_probs = self._softmax(100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T, axis=-1)
-                probs_cpu = label2text_probs[0]
-                foreground_confidence = np.sum(probs_cpu[:fg_prompts_num])
+                foreground_confidence = np.sum(label2text_probs[0, :fg_prompts_num])
                 foreground_map[cluster_labels == label_idx] += foreground_confidence
 
         foreground_map = foreground_map / len(k_clusters_list)
@@ -290,8 +288,7 @@ class SegmentationRunner:
                 point_labels=point_labels,
                 feats=feats,
                 height=height,
-                width=width,
-                multimask_output=True
+                width=width
             )
 
         best_idx = np.argmax(scores)
@@ -324,8 +321,7 @@ class SegmentationRunner:
                     feats=feats,
                     height=height,
                     width=width,
-                    mask_input=low_res_logits,
-                    multimask_output=False
+                    mask_input=low_res_logits
                 )
 
             best_idx = np.argmax(scores)

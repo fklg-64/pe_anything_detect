@@ -33,8 +33,8 @@ class OVCLIPFeatureExtractor:
         self.target_size: int = target_size
 
         # 画像の正規化に使用する変数
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3,1,1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3,1,1)
+        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
 
         # OpenCVの処理に使用するスレッド数
         cv2.setNumThreads(2)
