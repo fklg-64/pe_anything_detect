@@ -179,7 +179,7 @@ class OVEdgeTamRunner(OVEdgeTamHelper):
         device: str = "CPU",
         num_threads: int = 0
     ):
-        super.__init__(target_size)
+        super().__init__(target_size)
         # 画像サイズ関係
         self.target_size: int = target_size
 

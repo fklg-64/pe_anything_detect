@@ -48,9 +48,7 @@ if __name__ == "__main__":
         k_clusters=K_CLUSTERS,
         niter=N_ITER
     )
-
-    exit()
-
+    
     for path in image_paths:
         runner.run(
             image_path=path,

@@ -12,6 +12,6 @@ PROMPTS_DIR: str="./prompts"
 # OpenVINOの処理に使用するスレッド数
 OV_NUM_THREAD: int = 4
 # INT8で量子化されたモデルを使用するか？
-USE_INT8: bool = True
+USE_INT8: bool = False
 # 前景と判断するための自信度合い
 FOREGROUND_THRESHOLD: float = 0.5
