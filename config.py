@@ -5,7 +5,6 @@ K_CLUSTERS: int = 12
 # Kmeansのループ回数（多いほどクラスタは整う）
 N_ITER: int = 10
 # モデルのディレクトリ
-# MODEL_DIR: str = "./weights/openvino_models_8_9_10"
 MODEL_DIR: str = "./weights/openvino_models"
 # プロンプトが保存されているディレクトリ
 PROMPTS_DIR: str="./prompts"

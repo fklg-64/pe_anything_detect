@@ -146,9 +146,9 @@ class SegmentationRunner:
                 score_map = base_score_map * norm_dist_selected
 
             best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
-            selected_points.append((best_y, best_x))
+            selected_points.append([int(best_y), int(best_x)])
 
-        return np.array([(x, y) for y, x in selected_points], dtype=np.int32)
+        return [[x, y] for y, x in selected_points]
 
     def convert_coordinate(self, point: int, img_size: int, feat_size: int) -> float:
         return point * img_size / feat_size
@@ -202,7 +202,7 @@ class SegmentationRunner:
         )
 
         masks, scores, logits = self.edgetam.postprocess(
-            low_res_masks, iou_predictions, (height, width)
+            low_res_masks, iou_predictions, (height // 8, width // 8)
         )
 
         return masks, scores, logits
@@ -225,7 +225,6 @@ class SegmentationRunner:
         # クラス分類
         text_probs = (100.0 * image_features @ self.fgbg_text_features.T)
         text_probs = self._softmax(text_probs, axis=-1)
-
         
         # パッチレベルの特徴量を取得（バッチは0固定）
         patch_tokens = fused_layer_feature[0, 1:, :]
@@ -304,10 +303,12 @@ class SegmentationRunner:
 
         for step in range(max_refine_steps):
             current_mask_resized = cv2.resize(
-                current_mask, (w_gt, h_gt), interpolation=cv2.INTER_NEAREST
+                current_mask, 
+                (w_gt, h_gt), 
+                interpolation=cv2.INTER_NEAREST
             )
 
-            fg_fn_mask = (fg_mask == 1) & (current_mask_resized == 0)
+            fg_fn_mask: np.ndarray = (fg_mask == 1) & (current_mask_resized == 0)
             new_pt = self.select_n_prompt_points(fg_fn_mask.astype(np.uint8), bg_mask, num_points=1)
 
             if len(new_pt) == 0:
@@ -333,7 +334,14 @@ class SegmentationRunner:
 
             current_mask_list.append(current_mask)
 
-        return current_mask, current_mask_list, point_coords, point_labels
+        # マスク画像を元画像サイズにリサイズ
+        resized_masks: np.ndarray = cv2.resize(
+            current_mask,
+            (width, height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        return resized_masks, current_mask_list, point_coords, point_labels
 
     def _save_results(
         self,

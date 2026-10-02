@@ -52,7 +52,9 @@ class OVEdgeTamHelper:
         return boxes
 
     def postprocess_masks(
-        self, masks: np.ndarray, orig_hw: Tuple[int, int]
+        self, 
+        masks: np.ndarray, 
+        orig_hw: Tuple[int, int]
     ) -> np.ndarray:
         """出力マスクを元画像の解像度 (orig_hw) にリサイズします (NumPy/OpenCV版)。"""
         masks = masks.astype(np.float32)
@@ -148,17 +150,16 @@ class OVEdgeTamHelper:
     def postprocess(
         self,
         low_res_masks: np.ndarray,
-        iou_predictions: np.ndarray,
-        orig_hw: Tuple[int, int],
-        return_logits: bool = False,
+        iou_predictions: np.ndarray, 
+        orig_hw: Tuple[int, int]
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います (NumPy版)。"""
         # マスクを元画像の解像度にリサイズ
         masks = self.postprocess_masks(low_res_masks, orig_hw)
         low_res_masks = np.clip(low_res_masks, -32.0, 32.0)
 
-        if not return_logits:
-            masks = masks > self.mask_threshold
+        # masks = low_res_masks > self.mask_threshold
+        masks = masks > self.mask_threshold
 
         # 不要なバッチ次元を削除して float 型へキャスト
         masks = np.squeeze(masks, axis=0).astype(np.float32)
