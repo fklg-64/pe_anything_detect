@@ -225,7 +225,7 @@ class SegmentationRunner:
             )
 
             masks, scores, logits = self.edgetam_decoder.postprocess(
-                low_res_masks, iou_predictions, (height, width)
+                low_res_masks, iou_predictions
             )
 
             return masks.detach().numpy(), scores.detach().numpy(), logits
@@ -356,7 +356,14 @@ class SegmentationRunner:
 
             current_mask_list.append(current_mask)
 
-        return current_mask, current_mask_list, point_coords, point_labels
+        # マスク画像を元画像サイズにリサイズ
+        resized_masks: np.ndarray = cv2.resize(
+            current_mask,
+            (width, height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        return resized_masks, current_mask_list, point_coords, point_labels
 
     def _save_results(
         self,

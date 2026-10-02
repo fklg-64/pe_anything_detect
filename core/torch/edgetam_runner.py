@@ -19,6 +19,7 @@ from sam2.utils.transforms import SAM2Transforms
 
 from timm.models.repvit import RepVit
 
+
 class EdgeTAMPredictor:
     def __init__(
         self, 
@@ -107,60 +108,6 @@ class EdgeTamModel:
         return cls._sam_model, cls._transforms
 
 
-# class RepVitModel(nn.Module):
-#     def __init__(self, config_path: str = "./configs/edgetam.yaml", checkpoint_path: str = "weights/edgetam.pt", device: str = "cpu"):
-#         super().__init__()
-#         # クラス経由で共有インスタンスを取得（初回のみロードされる）
-#         self.edgetam_model, self._transforms = EdgeTamModel.get_model(config_path, checkpoint_path, device)
-#         # エンコーダー部分のみを抽出
-#         self.trunk: RepVit = self.edgetam_model.image_encoder.trunk
-#         self.neck: FpnNeck = self.edgetam_model.image_encoder.neck
-#         self.scalp: int = self.edgetam_model.image_encoder.scalp
-
-#         # Spatial dim for backbone feature maps
-#         self._bb_feat_sizes = [
-#             (self.edgetam_model.image_size // 4, self.edgetam_model.image_size // 4), 
-#             (self.edgetam_model.image_size // 8, self.edgetam_model.image_size // 8), 
-#             (self.edgetam_model.image_size // 16, self.edgetam_model.image_size // 16), 
-#         ]
-
-#     def transform(self, x):
-#         return self._transforms(x)[None, ...]
-
-#     @torch.no_grad()
-#     def forward(self, x: torch.Tensor):
-#         # Forward through backbone
-#         features, pos = self.neck(self.trunk(x))
-#         if self.scalp > 0:
-#             # Discard the lowest resolution features
-#             features, pos = features[: -self.scalp], pos[: -self.scalp]
-
-#         # precompute projected level 0 and level 1 features in SAM decoder
-#         # to avoid running it again on every SAM click
-#         features[0] = self.edgetam_model.sam_mask_decoder.conv_s0(
-#             features[0]
-#         )
-#         features[1] = self.edgetam_model.sam_mask_decoder.conv_s1(
-#             features[1]
-#         )
-
-#         feature_maps = features[-self.edgetam_model.num_feature_levels :]
-
-#         # flatten NxCxHxW to HWxNxC
-#         vision_feats = [x.flatten(2).permute(2, 0, 1) for x in feature_maps]
-
-#         if self.edgetam_model.directly_add_no_mem_embed:
-#             vision_feats[-1] = vision_feats[-1] + self.edgetam_model.no_mem_embed
-
-#         feats = [
-#             feat.permute(1, 2, 0).view(1, -1, *feat_size)
-#             for feat, feat_size in zip(vision_feats[::-1], self._bb_feat_sizes[::-1])
-#         ][::-1]
-
-#         # high_res_feats[0], high_res_feats[1], image_embed
-#         return feats[0], feats[1], feats[2]
-
-
 class RepVitModel(nn.Module):
 
     def __init__(
@@ -205,132 +152,6 @@ class RepVitModel(nn.Module):
 
         # high_res_feats[0], high_res_feats[1], image_embed
         return feature_maps[0], feature_maps[1], feature_maps[2]
-
-
-# class DecodeModel(nn.Module):
-#     def __init__(self, config_path: str = "./configs/edgetam.yaml", checkpoint_path: str = "weights/edgetam.pt", device: str = "cpu"):
-#         # nn.Module の初期化
-#         super().__init__()
-#         # クラス経由で共有インスタンスを取得（初回のみロードされる）
-#         self.edgetam_model, self._transforms = EdgeTamModel.get_model(config_path, checkpoint_path, device)
-#         # 閾値
-#         self.mask_threshold = self._transforms.mask_threshold
-#         # 重み
-#         self.no_mask_embed = self.edgetam_model.sam_prompt_encoder.no_mask_embed
-
-#     def _embed_masks(self, masks: torch.Tensor) -> torch.Tensor:
-#         """Embeds mask inputs."""
-#         mask_embedding = self.edgetam_model.sam_prompt_encoder.mask_downscaling(masks)
-#         return mask_embedding
-
-#     @torch.no_grad()
-#     def forward(
-#         self, 
-#         high_res_feats0: torch.Tensor, 
-#         high_res_feats1: torch.Tensor, 
-#         image_embed: torch.Tensor, 
-#         point_coords: torch.Tensor, 
-#         point_labels: torch.Tensor, 
-#         mask_input: torch.Tensor, 
-#         has_mask: torch.Tensor,
-#     ):
-#         concat_points = (point_coords, point_labels)
-
-#         sparse_embeddings, _ = self.edgetam_model.sam_prompt_encoder(
-#             points=concat_points,
-#             boxes=None,
-#             masks=None,
-#         )
-
-#         # dense_embeddingsのパッチ処理（OpenVINO対応）
-#         has_mask_b = has_mask.reshape(-1, 1, 1, 1)
-#         masks_gated = mask_input * has_mask_b
-#         mask_embeds = self._embed_masks(masks_gated)
-#         no_mask_embeds = self.no_mask_embed.weight.reshape(1, -1, 1, 1)
-#         dense_embeddings = mask_embeds * has_mask_b + no_mask_embeds * (1.0 - has_mask_b)
-
-#         # Predict masks
-#         batched_mode = (
-#             concat_points is not None and concat_points[0].shape[0] > 1
-#         )  # multi object prediction
-#         low_res_masks, iou_predictions, _, _ = self.edgetam_model.sam_mask_decoder(
-#             image_embeddings=image_embed,
-#             image_pe=self.edgetam_model.sam_prompt_encoder.get_dense_pe(),
-#             sparse_prompt_embeddings=sparse_embeddings,
-#             dense_prompt_embeddings=dense_embeddings,
-#             multimask_output=True,
-#             repeat_image=batched_mode,
-#             high_res_features=[high_res_feats0, high_res_feats1],
-#         )
-
-#         return low_res_masks, iou_predictions
-
-#     def preprocess(
-#         self, 
-#         orig_hw: Tuple[int, int], 
-#         point_coords: Optional[torch.Tensor] = None, 
-#         point_labels: Optional[torch.Tensor] = None, 
-#         box: Optional[torch.Tensor] = None, 
-#         mask_logits: Optional[torch.Tensor] = None, 
-#         normalize_coords: bool = True
-#     ):
-#         unnorm_coords, labels, unnorm_box, mask_input = None, None, None, None
-#         if point_coords is not None:
-#             assert (
-#                 point_labels is not None
-#             ), "point_labels must be supplied if point_coords is supplied."
-#             unnorm_coords = self._transforms.transform_coords(
-#                 point_coords, normalize=normalize_coords, orig_hw=orig_hw
-#             )
-#             if len(unnorm_coords.shape) == 2:
-#                 unnorm_coords, labels = unnorm_coords[None, ...], point_labels[None, ...]
-#         if box is not None:
-#             unnorm_box = self._transforms.transform_boxes(
-#                 box, normalize=normalize_coords, orig_hw=orig_hw
-#             )  # Bx2x2
-#         if mask_logits is not None:
-#             if len(mask_logits.shape) == 3:
-#                 mask_input = mask_logits[None, :, :, :]
-#             elif len(mask_logits.shape) == 1:
-#                 bs = mask_logits.shape[0]
-#                 mask_input = mask_logits.reshape(-1, 1, 1, 1) * \
-#                     torch.zeros((bs, 1, self.edgetam_model.image_size // 4, self.edgetam_model.image_size // 4), dtype=torch.float32)
-
-#         if unnorm_coords is not None:
-#             concat_points = (unnorm_coords, labels)
-#         else:
-#             concat_points = None
-
-#         # Embed prompts
-#         if unnorm_box is not None:
-#             box_coords = unnorm_box.reshape(-1, 2, 2)
-#             box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=unnorm_box.device)
-#             box_labels = box_labels.repeat(unnorm_box.size(0), 1)
-#             # we merge "boxes" and "points" into a single "concat_points" input (where
-#             # boxes are added at the beginning) to sam_prompt_encoder
-#             if concat_points is not None:
-#                 concat_coords = torch.cat([box_coords, concat_points[0]], dim=1)
-#                 concat_labels = torch.cat([box_labels, concat_points[1]], dim=1)
-#                 concat_points = (concat_coords, concat_labels)
-#             else:
-#                 concat_points = (box_coords, box_labels)
-
-#         return mask_input, concat_points[0], concat_points[1]
-
-#     def postprocess(self, low_res_masks: torch.Tensor, iou_predictions: torch.Tensor, orig_hw: Tuple[int, int], return_logits: bool = False):
-#         # Upscale the masks to the original image resolution
-#         masks = self._transforms.postprocess_masks(
-#             low_res_masks, orig_hw
-#         )
-#         low_res_masks = torch.clamp(low_res_masks, -32.0, 32.0)
-#         if not return_logits:
-#             masks = masks > self.mask_threshold
-
-#         masks = masks.squeeze(0).float()
-#         iou_predictions = iou_predictions.squeeze(0).float()
-#         low_res_masks = low_res_masks.squeeze(0)
-
-#         return masks, iou_predictions, low_res_masks
 
 
 class DecodeModel(nn.Module):
@@ -482,17 +303,15 @@ class DecodeModel(nn.Module):
     def postprocess(
         self,
         low_res_masks: torch.Tensor,
-        iou_predictions: torch.Tensor,
-        orig_hw: Tuple[int, int],
-        return_logits: bool = False,
+        iou_predictions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います。"""
         # マスクを元画像の解像度にリサイズ
-        masks = self._transforms.postprocess_masks(low_res_masks, orig_hw)
+        # masks = self._transforms.postprocess_masks(low_res_masks, orig_hw)
         low_res_masks = torch.clamp(low_res_masks, -32.0, 32.0)
 
-        if not return_logits:
-            masks = masks > self.mask_threshold
+        # マスク画像を作成
+        masks = low_res_masks > self.mask_threshold
 
         # 不要なバッチ次元を削除して float 型へキャスト
         masks = masks.squeeze(0).float()
