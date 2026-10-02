@@ -1,4 +1,3 @@
-from core.utils import *
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.segmentation_runner import SegmentationRunner
@@ -6,7 +5,8 @@ from core.openvino.segmentation_runner import SegmentationRunner
 from config import *
 
 if __name__ == "__main__":
-    image_paths = [
+    # 画像リスト
+    image_paths: list[str] = [
         "/home/llm/datasets/mvtec_anomaly_detection/capsule/test/good/000.png",
         "/home/llm/datasets/mvtec_anomaly_detection/hazelnut/test/good/001.png",
         # "/home/llm/datasets/mvtec_anomaly_detection/grid/test/bent/002.png",
@@ -25,6 +25,7 @@ if __name__ == "__main__":
         "/home/llm/datasets/02_object_detection/clip/002_crop.png", 
     ]
 
+    # 特徴量抽出モデル
     extractor = OVCLIPFeatureExtractor(
         model_dir = MODEL_DIR,
         target_size=IMAGE_SIZE,
@@ -33,6 +34,7 @@ if __name__ == "__main__":
         num_threads = OV_NUM_THREAD
     )
 
+    # プロンプトセグメンテーションモデル
     edgetam = OVEdgeTamRunner(
         model_dir = MODEL_DIR,
         target_size=IMAGE_SIZE,
@@ -41,6 +43,7 @@ if __name__ == "__main__":
         num_threads = OV_NUM_THREAD
     )
 
+    # セグメンテーション実行処理インスタンス
     runner = SegmentationRunner(
         extractor, 
         edgetam, 
@@ -50,6 +53,7 @@ if __name__ == "__main__":
         foreground_threshold=FOREGROUND_THRESHOLD
     )
 
+    # セグメンテーション実行
     for path in image_paths:
         runner.run(
             image_path=path,

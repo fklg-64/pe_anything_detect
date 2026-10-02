@@ -246,7 +246,10 @@ class SegmentationRunner:
                 )
 
             for label_idx, label_features in enumerate(label_token_list):
-                label2text_probs = self._softmax(100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T, axis=-1)
+                label2text_probs = self._softmax(
+                    100.0 * label_features.reshape(1, -1) @ self.fgbg_text_features.T, 
+                    axis=-1
+                )
                 foreground_confidence = np.sum(label2text_probs[0, :fg_prompts_num])
                 foreground_map[cluster_labels == label_idx] += foreground_confidence
 
