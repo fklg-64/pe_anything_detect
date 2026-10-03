@@ -23,7 +23,6 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from timm.models.eva import Eva
 
-from config import *
 from core.utils import load_config
 from core.torch.edgetam_runner import DecodeModel, EdgeTAMPredictor, RepVitModel
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
