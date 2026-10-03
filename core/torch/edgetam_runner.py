@@ -4,7 +4,8 @@ from pathlib import Path
 core_dir = Path(__file__).resolve().parent
 if str(core_dir) not in sys.path:
     sys.path.insert(0, str(core_dir))
-    
+
+import yaml
 from typing import Union, List, Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
@@ -19,24 +20,28 @@ from sam2.utils.transforms import SAM2Transforms
 
 from timm.models.repvit import RepVit
 
-
+# ベースとした実装（使わない）
 class EdgeTAMPredictor:
     def __init__(
         self, 
-        checkpoint_path: str = "./weights/edgetam.pt", 
-        config_path: str = "configs/edgetam.yaml",
-        device: str = "cpu",
-        dtype: torch.dtype = torch.float32
+        config: yaml
     ):
         """
         モデルの初期化と重みのロードを行います。
         """
-        self.device = device
-        self.dtype = dtype
+        # 設定値の初期化
+        self.init_value(config)
         
         # モデルとPredictorの構築
-        sam_model = build_sam2(config_path, checkpoint_path, device=device)
+        sam_model = build_sam2(self.onfig_path, self.checkpoint_path, device=self.device)
         self.predictor = SAM2ImagePredictor(sam_model)
+
+    def init_value(self, config: yaml):
+        # config関係
+        self.checkpoint_path = config["edgetam_model_path"]
+        self.config_path = config["edgetam_model_config"]
+        self.device = config["device"]
+        self.dtype = getattr(torch, config["dtype"])
 
     def set_image(
         self, 
@@ -86,6 +91,61 @@ class EdgeTAMPredictor:
         return masks, scores, logits
 
 
+class EdgeTamRunner:
+    def __init__(self, config: yaml):
+        self.edgetam_encoder = RepVitModel(config)
+        self.edgetam_decoder = DecodeModel(config)
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return self.edgetam_encoder.transform(x)
+
+    def encode(
+        self, 
+        image_tensor: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.edgetam_encoder(image_tensor)
+
+    def decode(
+        self, 
+        high_res_feats0: torch.Tensor,
+        high_res_feats1: torch.Tensor,
+        image_embed: torch.Tensor,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        mask_input: torch.Tensor,
+        has_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.edgetam_decoder(
+            high_res_feats0, high_res_feats1, image_embed,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            mask_input=mask_input,
+            has_mask=has_mask,
+        )
+
+    def preprocess(
+        self,
+        orig_hw: Tuple[int, int],
+        point_coords: Optional[torch.Tensor] = None,
+        point_labels: Optional[torch.Tensor] = None,
+        box: Optional[torch.Tensor] = None,
+        mask_logits: Optional[torch.Tensor] = None,
+        normalize_coords: bool = True,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        return self.edgetam_decoder.preprocess(
+            orig_hw, point_coords, point_labels, box, mask_logits, normalize_coords
+        )
+
+    def postprocess(
+        self,
+        low_res_masks: torch.Tensor,
+        iou_predictions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.edgetam_decoder.postprocess(
+            low_res_masks, iou_predictions
+        )
+
+
 class EdgeTamModel:
     """SAM2モデルの読み込みと保持を担うクラス"""
     _sam_model = None
@@ -108,18 +168,32 @@ class EdgeTamModel:
         return cls._sam_model, cls._transforms
 
 
-class RepVitModel(nn.Module):
+class BaseModel(nn.Module):
+    def __init__(
+        self, 
+        config: yaml
+    ):
+        super().__init__()
+        self.init_value(config)
+
+    def init_value(self, config: yaml):
+        # config関係
+        self.checkpoint_path = config["edgetam_model_path"]
+        self.config_path = config["edgetam_model_config"]
+        self.device = config["device"]
+        self.dtype = getattr(torch, config["dtype"])
+
+
+class RepVitModel(BaseModel):
 
     def __init__(
         self,
-        config_path: str = "./configs/edgetam.yaml",
-        checkpoint_path: str = "weights/edgetam.pt",
-        device: str = "cpu",
+        config: yaml
     ):
-        super().__init__()
+        super().__init__(config)
         # クラス経由で共有インスタンスを取得（初回のみロードされる）
         self.edgetam_model, self._transforms = EdgeTamModel.get_model(
-            config_path, checkpoint_path, device
+            self.config_path, self.checkpoint_path, self.device
         )
         # エンコーダー部分のみを抽出
         self.trunk: RepVit = self.edgetam_model.image_encoder.trunk
@@ -132,7 +206,7 @@ class RepVitModel(nn.Module):
     @torch.no_grad()
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Backbone & FPN 推論
         features, pos = self.neck(self.trunk(x))
         if self.scalp > 0:
@@ -154,7 +228,7 @@ class RepVitModel(nn.Module):
         return feature_maps[0], feature_maps[1], feature_maps[2]
 
 
-class DecodeModel(nn.Module):
+class DecodeModel(BaseModel):
     """EdgeTAM モデルのデコード処理用 PyTorch モジュール。
     
     OpenVINO 変換に対応するためのインターフェースおよびグラフ構造を保持しています。
@@ -162,14 +236,12 @@ class DecodeModel(nn.Module):
 
     def __init__(
         self,
-        config_path: str = "./configs/edgetam.yaml",
-        checkpoint_path: str = "weights/edgetam.pt",
-        device: str = "cpu",
+        config: yaml
     ):
-        super().__init__()
+        super().__init__(config)
         # モデルと画像変換器の共有インスタンスを取得
         self.edgetam_model, self._transforms = EdgeTamModel.get_model(
-            config_path, checkpoint_path, device
+            self.config_path, self.checkpoint_path, self.device
         )
         self.mask_threshold: float = self._transforms.mask_threshold
         self.no_mask_embed = self.edgetam_model.sam_prompt_encoder.no_mask_embed

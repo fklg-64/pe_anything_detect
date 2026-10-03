@@ -11,7 +11,7 @@ from timm.models.eva import Eva, EvaBlock, AttentionRope
 from timm.layers.attention import maybe_add_mask, apply_rot_embed_cat, resolve_self_attn_mask
 from timm.layers.attention_pool import AttentionPoolLatent
 
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 
 import timm.models.eva as eva_module
 import timm.layers.pos_embed as pos_embed_module

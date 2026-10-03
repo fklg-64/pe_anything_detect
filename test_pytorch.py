@@ -1,11 +1,11 @@
-from core.utils import *
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
+from core.torch.edgetam_runner import EdgeTamRunner
 from core.torch.segmentation_runner import SegmentationRunner
-
-from config import *
+from core.utils import load_config
 
 if __name__ == "__main__":
-    image_paths = [
+    # 画像リスト
+    image_paths: list[str] = [
         "/home/llm/datasets/mvtec_anomaly_detection/capsule/test/good/000.png",
         "/home/llm/datasets/mvtec_anomaly_detection/hazelnut/test/good/001.png",
         "/home/llm/datasets/01_classification_sample/natural/pexels-rohit-george-1141376880-32113857.jpg",
@@ -24,19 +24,18 @@ if __name__ == "__main__":
         "/home/llm/datasets/01_classification_sample/bredboard/OK/cable1 (1).jpg", 
     ]
 
-    extractor = TorchCLIPFeatureExtractor(
-        force_image_size=IMAGE_SIZE
-    )
-    runner = SegmentationRunner(
-        extractor, 
-        prompts_dir=PROMPTS_DIR, 
-        k_clusters=K_CLUSTERS,
-        niter=N_ITER, 
-        foreground_threshold=FOREGROUND_THRESHOLD
-    )
+    # 設定データ
+    config = load_config("./configs/torch_config.yaml")
+    
+    # 特徴量抽出モデル
+    extractor = TorchCLIPFeatureExtractor(config)
 
+    # プロンプトセグメンテーションモデル
+    edgetam = EdgeTamRunner(config)
+
+    # セグメンテーション実行処理インスタンス
+    runner = SegmentationRunner(extractor, edgetam, config)
+
+    # セグメンテーション実行
     for path in image_paths:
-        runner.run(
-            image_path=path,
-            output_dir="./outputs/experiment_results",
-        )
+        runner.run(image_path=path)

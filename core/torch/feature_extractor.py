@@ -1,15 +1,7 @@
 import os
 import sys
 
-# /opt/intel/openvino 関連のパスを sys.path から削除
-sys.path = [p for p in sys.path if not p.startswith("/opt/intel/openvino")]
-
-# (任意) 環境変数からも削除しておく
-if "PYTHONPATH" in os.environ:
-    paths = os.environ["PYTHONPATH"].split(os.pathsep)
-    new_paths = [p for p in paths if not p.startswith("/opt/intel/openvino")]
-    os.environ["PYTHONPATH"] = os.pathsep.join(new_paths)
-
+import yaml
 import types
 import numpy as np
 
@@ -25,20 +17,25 @@ class TorchCLIPFeatureExtractor:
 
     def __init__(
         self,
-        model_id: str = "hf-hub:timm/PE-Core-T-16-384",
-        force_image_size: int = 512,
-        to_openvino: bool = False
+        config: yaml
     ):
-        self.model_id = model_id
-        self.force_image_size = force_image_size
-        self.to_openvino = to_openvino
+        self.init_value(config)
 
         self.model, self.preprocess = self._setup_model()
+        self.tokenizer = open_clip.get_tokenizer(self.model_id)
 
+        # パッチサイズ、特徴マップサイズ
         self.patch_size = self.model.visual.trunk.patch_embed.patch_size[0]
-        self.feature_size = force_image_size // self.patch_size
+        self.feature_size = self.force_image_size // self.patch_size
 
-        self.tokenizer = open_clip.get_tokenizer(model_id)
+    def init_value(self, config: yaml):
+        self.model_id = config["pe_model_id"]
+        self.force_image_size = config["image_size"]
+        self.to_openvino = config["to_openvino"]
+
+        # パッチサイズ、特徴マップサイズ
+        self.patch_size: Union[int, None] = None
+        self.feature_size: Union[int, None] = None
 
     def _setup_model(self):
         # モデルの読み込み
@@ -50,7 +47,7 @@ class TorchCLIPFeatureExtractor:
         # モンキーパッチの適用
         model.encode_image = types.MethodType(encode_image, model)
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
-        # OpenVINO化の有無で設定変更（openvino化しない場合は結果を詳細に取得）
+        # OpenVINO化の有無で設定変更（pytorchで処理する場合は、詳細な特徴量も取得）
         if not self.to_openvino:
             for i in range(12):
                 model.visual.trunk.blocks[i].attn.forward = types.MethodType(attention_rope_forward, model.visual.trunk.blocks[i].attn)

@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
-from core.torch.edgetam_runner import EdgeTAMPredictor, RepVitModel, DecodeModel
+from core.torch.edgetam_runner import EdgeTamRunner
 from core.torch.analysis_function import export_complete_vit_analysis_to_excel
 from core.utils import *
 
@@ -24,34 +24,35 @@ class SegmentationRunner:
     def __init__(
         self, 
         extractor: TorchCLIPFeatureExtractor, 
-        prompts_dir: str = "./prompts", 
-        k_clusters: Optional[int] = 12, 
-        niter: int = 10, 
-        foreground_threshold: float = 0.5
+        edgetam: EdgeTamRunner, 
+        config: yaml
     ):
+        # モデル
         self.extractor = extractor
-        self.prompts_dir = prompts_dir
-        self.k_clusters = k_clusters
-        self.niter = niter
-        self.foreground_threshold = foreground_threshold
-        self.device = "cpu"
+        self.edgetam = edgetam
 
-        # 推論バックエンドのフラグ（将来的に 'pytorch' | 'custom' | 'openvino' などで分岐拡張可能）
-        self.is_custom = False
-        if self.is_custom:
-            self.edgetam_predictor = EdgeTAMPredictor()
-        else:
-            self.edgetam_encoder = RepVitModel()
-            self.edgetam_decoder = DecodeModel()
+        # 設定値の初期化
+        self.init_value(config)
+
+        self.register_fgbg_text_features()
+
+    def init_value(self, config: yaml):
+        # config関係
+        self.prompts_dir = config["prompts_dir"]
+        self.k_clusters = config["k_clusters"]
+        self.niter = config["n_iter"]
+        self.foreground_threshold = config["foreground_threshold"]
+        self.device = config["device"]
+        self.output_dir = config["output_dir"]
+        self.color_palette = config["color_palette"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
 
+        # プロンプトとプロンプトのテキスト特徴量
         self.foreground_prompts: List[str] = []
         self.background_prompts: List[str] = []
         self.fgbg_text_features: Optional[torch.Tensor] = None
-
-        self.register_fgbg_text_features()
 
     # =========================================================================
     # 1. テキストプロンプト & 特徴量準備
@@ -107,7 +108,7 @@ class SegmentationRunner:
 
     def colorize_clusters_PIL(self, cluster_labels: np.ndarray) -> Image.Image:
         color_map = Image.fromarray(cluster_labels.astype(np.uint8))
-        color_map.putpalette(COLOR_PALETTE)
+        color_map.putpalette(self.color_palette)
         return color_map
 
     # =========================================================================
@@ -175,13 +176,8 @@ class SegmentationRunner:
     # 4. EdgeTAM 推論バックエンド共通インターフェース (OpenVINO対応化用)
     # =========================================================================
 
-    def _predict_edgetam_encoder(self, image_raw: Image.Image) -> Optional[Tuple]:
-        """EdgeTAM Encoder の実行（PyTorch / Custom / 将来のOpenVINOの違いをカプセル化）"""
-        if self.is_custom:
-            self.edgetam_predictor.set_image(image_raw)
-            return None
-        else:
-            return self.edgetam_encoder(self.edgetam_encoder.transform(image_raw))
+    def _predict_edgetam_encoder(self, image_raw: Image.Image) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.edgetam.encode(self.edgetam.transform(image_raw))
 
     def _predict_edgetam_decoder(
         self,
@@ -193,42 +189,32 @@ class SegmentationRunner:
         mask_input: Optional[Union[np.ndarray, torch.Tensor]] = None,
         multimask_output: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """EdgeTAM Decoder の実行（PyTorch / Custom / 将来のOpenVINOの違いをカプセル化）"""
-        if self.is_custom:
-            masks, scores, logits = self.edgetam_predictor.predict(
-                point_coords=np.array(point_coords),
-                point_labels=np.array(point_labels),
-                mask_input=mask_input,
-                multimask_output=multimask_output,
-            )
-            return masks, scores, logits
+        if mask_input is None:
+            mask_logits_tensor = torch.tensor([0], dtype=torch.float32, device=self.device)
         else:
-            if mask_input is None:
-                mask_logits_tensor = torch.tensor([0], dtype=torch.float32, device=self.device)
-            else:
-                mask_logits_tensor = mask_input
+            mask_logits_tensor = mask_input
 
-            mask_input_tensor, point_coords_norm, point_labels_norm, has_mask = self.edgetam_decoder.preprocess(
-                (height, width),
-                point_coords=torch.tensor(point_coords, dtype=torch.float32, device=self.device),
-                point_labels=torch.tensor(point_labels, dtype=torch.int64, device=self.device),
-                mask_logits=mask_logits_tensor,
-            )
+        mask_input_tensor, point_coords_norm, point_labels_norm, has_mask = self.edgetam.preprocess(
+            (height, width),
+            point_coords=torch.tensor(point_coords, dtype=torch.float32, device=self.device),
+            point_labels=torch.tensor(point_labels, dtype=torch.int64, device=self.device),
+            mask_logits=mask_logits_tensor,
+        )
 
-            high_res_feats0, high_res_feats1, image_embed = feats
-            low_res_masks, iou_predictions = self.edgetam_decoder(
-                high_res_feats0, high_res_feats1, image_embed,
-                point_coords=point_coords_norm,
-                point_labels=point_labels_norm,
-                mask_input=mask_input_tensor,
-                has_mask=has_mask,
-            )
+        high_res_feats0, high_res_feats1, image_embed = feats
+        low_res_masks, iou_predictions = self.edgetam.decode(
+            high_res_feats0, high_res_feats1, image_embed,
+            point_coords=point_coords_norm,
+            point_labels=point_labels_norm,
+            mask_input=mask_input_tensor,
+            has_mask=has_mask,
+        )
 
-            masks, scores, logits = self.edgetam_decoder.postprocess(
-                low_res_masks, iou_predictions
-            )
+        masks, scores, logits = self.edgetam.postprocess(
+            low_res_masks, iou_predictions
+        )
 
-            return masks.detach().numpy(), scores.detach().numpy(), logits
+        return masks.detach().numpy(), scores.detach().numpy(), logits
 
     # =========================================================================
     # 5. 各パイプライン・サブタスク処理
@@ -236,8 +222,7 @@ class SegmentationRunner:
 
     def _generate_foreground_map(
         self,
-        image_tensor: torch.Tensor,
-        k_clusters_list: List[int]
+        image_tensor: torch.Tensor
     ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[torch.Tensor]]:
         """CLIP特徴量とKMeansによるベース前景マップの抽出"""
         image_features, patch_features, cls2patch_attn, layer_features = (
@@ -256,7 +241,7 @@ class SegmentationRunner:
         fg_prompts_num = len(self.foreground_prompts)
         foreground_map = np.zeros((self.feature_size * self.feature_size,), dtype=np.float32)
 
-        for k_clusters in k_clusters_list:
+        for k_clusters in self.k_clusters:
             cluster_labels = self.fit_predict_kmeans(
                 patch_tokens, k=k_clusters, niter=self.niter
             )
@@ -274,7 +259,7 @@ class SegmentationRunner:
                 foreground_confidence = np.sum(probs_cpu[:fg_prompts_num])
                 foreground_map[cluster_labels == label_idx] += foreground_confidence
 
-        foreground_map = foreground_map / len(k_clusters_list)
+        foreground_map = foreground_map / len(self.k_clusters)
         foreground_map = foreground_map.reshape(self.feature_size, self.feature_size)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
 
@@ -367,7 +352,7 @@ class SegmentationRunner:
 
     def _save_results(
         self,
-        save_dir: Path,
+        image_path: Path, 
         image_raw: Image.Image,
         width: int,
         height: int,
@@ -378,10 +363,11 @@ class SegmentationRunner:
         point_coords: List[List[float]],
         point_labels: List[int],
         layer_features: List[torch.Tensor],
-        cluster_labels_list: List[np.ndarray],
-        k_clusters_list: List[int]
+        cluster_labels_list: List[np.ndarray]
     ) -> None:
         """処理結果の画像・マスク・オーバーレイの書き出し"""
+        save_dir = Path(self.output_dir) / image_path.stem
+        save_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n--- Saving results to {save_dir} ---")
 
         # マスク画像を保存
@@ -394,16 +380,17 @@ class SegmentationRunner:
             layer_feature = F.normalize(layer_feature, dim=-1)
             lf_np = layer_feature.numpy()[:, 1:, :]
             lf_np = lf_np.reshape(self.feature_size * self.feature_size, -1)
-            cluster_labels = self.fit_predict_kmeans(lf_np, k=self.k_clusters)
-            cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
-            cluster_rgb = self.colorize_clusters_PIL(cluster_labels_2d)
-            cluster_rgb = cluster_rgb.resize(
-                (width, height), resample=Image.Resampling.NEAREST
-            )
-            cluster_rgb.save(save_dir / f"layer{i + 1:02d}.png")
+            for k_clusters in self.k_clusters:
+                cluster_labels = self.fit_predict_kmeans(lf_np, k=k_clusters)
+                cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
+                cluster_rgb = self.colorize_clusters_PIL(cluster_labels_2d)
+                cluster_rgb = cluster_rgb.resize(
+                    (width, height), resample=Image.Resampling.NEAREST
+                )
+                cluster_rgb.save(save_dir / f"layer{i + 1:02d}_k{k_clusters}.png")
 
         # レイヤー結合した特徴マップでのクラスタリング結果
-        for k_clusters, cluster_labels in zip(k_clusters_list, cluster_labels_list):
+        for k_clusters, cluster_labels in zip(self.k_clusters, cluster_labels_list):
             fused_cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
             fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
             fused_cluster_rgb = fused_cluster_rgb.resize(
@@ -463,20 +450,15 @@ class SegmentationRunner:
     # 6. メイン実行エントリーポイント
     # =========================================================================
 
-    def run(
-        self,
-        image_path: str,
-        output_dir: str = "./outputs/cluster",
-    ) -> None:
-        img_path = Path(image_path)
-        if img_path.exists():
-            print(f"====== Processing Image: {img_path.name} ======")
-        else:
-            print(f"====== 存在しません: {img_path.name} ======")
-            return
+    def run(self, image_path: Union[str, Path]) -> None:
+        if isinstance(image_path, str):
+            image_path = Path(image_path)
 
-        save_dir = Path(output_dir) / img_path.stem
-        save_dir.mkdir(parents=True, exist_ok=True)
+        if image_path.exists():
+            print(f"====== 画像パス: {image_path.name} ======")
+        else:
+            print(f"====== 存在しません: {image_path.name} ======")
+            return
 
         # 画像読み込み
         image_raw = load_image(image_path)
@@ -489,11 +471,8 @@ class SegmentationRunner:
         image_tensor = self.extractor.preprocess(Image.fromarray(image_raw)).unsqueeze(0)
 
         # 1. CLIP + KMeans による初期前景マップの推定
-        K_CLUSTERS_LIST = [8]
         with Timer("特徴量抽出"):
-            foreground_map, foreground_mask, cluster_labels_list, layer_features = self._generate_foreground_map(
-                image_tensor, K_CLUSTERS_LIST
-            )
+            foreground_map, foreground_mask, cluster_labels_list, layer_features = self._generate_foreground_map(image_tensor)
 
         # 2. 前景が存在する場合は EdgeTAM による精緻化
         point_coords: List[List[float]] = []
@@ -517,7 +496,7 @@ class SegmentationRunner:
 
         # 3. 処理結果の保存
         self._save_results(
-            save_dir=save_dir,
+            image_path=image_path,
             image_raw=image_raw,
             width=width,
             height=height,
@@ -528,6 +507,5 @@ class SegmentationRunner:
             point_coords=point_coords,
             point_labels=point_labels,
             layer_features=layer_features,
-            cluster_labels_list=cluster_labels_list,
-            k_clusters_list=K_CLUSTERS_LIST,
+            cluster_labels_list=cluster_labels_list
         )
