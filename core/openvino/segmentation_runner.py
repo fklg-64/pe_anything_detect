@@ -21,26 +21,32 @@ class SegmentationRunner:
         self, 
         extractor: OVCLIPFeatureExtractor, 
         edgetam: OVEdgeTamRunner, 
-        prompts_dir: str = f"./prompts", 
-        k_clusters: Optional[int] = 12, 
-        niter: int = 10, 
-        foreground_threshold: float = 0.5
+        config: yaml
     ):
+        # モデル
         self.extractor = extractor
         self.edgetam = edgetam
-        self.prompts_dir = prompts_dir
-        self.k_clusters = k_clusters
-        self.niter = niter
-        self.foreground_threshold = foreground_threshold
+
+        # 設定値の初期化
+        self.init_value(config)
+        
+        self.register_fgbg_text_features()
+
+    def init_value(self, config: yaml):
+        # config関係
+        self.prompts_dir = config["prompts_dir"]
+        self.k_clusters = config["k_clusters"]
+        self.niter = config["n_iter"]
+        self.foreground_threshold = config["foreground_threshold"]
+        self.output_dir = config["output_dir"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
 
+        # プロンプトとプロンプトのテキスト特徴量
         self.foreground_prompts: List[str] = []
         self.background_prompts: List[str] = []
         self.fgbg_text_features: Optional[np.ndarray] = None
-
-        self.register_fgbg_text_features()
 
     @staticmethod
     def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -52,9 +58,9 @@ class SegmentationRunner:
     # =========================================================================
 
     def load_prompts(self, path: str) -> List[str]:
-            with open(path, mode="r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data["prompts"]
+        with open(path, mode="r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data["prompts"]
     
     def common_process(self, prompts: List[str]) -> np.ndarray:
         text_features = self.extractor.extract_text_features(prompts)
@@ -168,7 +174,13 @@ class SegmentationRunner:
 
     def _predict_edgetam_encoder(self, image_raw: Image.Image) -> Optional[Tuple]:
         """EdgeTAM Encoder の実行（PyTorch / Custom / 将来のOpenVINOの違いをカプセル化）"""
-        return self.edgetam.encode(preprocess_image(image_raw, self.edgetam.target_size, self.edgetam.mean, self.edgetam.std))
+        return self.edgetam.encode(
+            preprocess_image(
+                image_raw, 
+                self.edgetam.target_size, 
+                self.edgetam.mean, self.edgetam.std
+            )
+        )
 
     def _predict_edgetam_decoder(
         self,
@@ -211,29 +223,38 @@ class SegmentationRunner:
     # 5. 各パイプライン・サブタスク処理
     # =========================================================================
 
-    def _generate_foreground_map(
-        self,
-        image_tensor: np.ndarray,
-        k_clusters_list: List[int]
-    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
-        """CLIP特徴量とKMeansによるベース前景マップの抽出"""
+    def _feature_extraction(
+        self, 
+        image_tensor: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         with Timer("特徴量抽出処理時間"):
-            image_features, patch_features, cls2patch_attn, fused_layer_feature = (
+            image_features, patch_features, cls2patch_attn, fused_patch_features = (
                 self.extractor.extract_image_features(image_tensor)
             )
+        return image_features, patch_features, fused_patch_features
 
+    def _image_classification(
+        self, 
+        image_features: np.ndarray
+    ):
         # クラス分類
-        text_probs = (100.0 * image_features @ self.fgbg_text_features.T)
+        text_probs = 100.0 * image_features @ self.fgbg_text_features.T
         text_probs = self._softmax(text_probs, axis=-1)
-        
-        # パッチレベルの特徴量を取得（バッチは0固定）
-        patch_tokens = fused_layer_feature[0, 1:, :]
+
+    def _generate_foreground_map(
+        self,
+        patch_features: np.ndarray, 
+        fused_patch_features: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+        """CLIP特徴量とKMeansによるベース前景マップの抽出"""
+        # パッチレベルの特徴量を取得
+        patch_tokens = fused_patch_features[0, 1:, :]
 
         cluster_labels_list = []
         fg_prompts_num = len(self.foreground_prompts)
         foreground_map = np.zeros((self.feature_size * self.feature_size,), dtype=np.float32)
 
-        for k_clusters in k_clusters_list:
+        for k_clusters in self.k_clusters:
             cluster_labels = self.fit_predict_kmeans(
                 patch_tokens, k=k_clusters, niter=self.niter
             )
@@ -252,11 +273,11 @@ class SegmentationRunner:
                 foreground_confidence = np.sum(label2text_probs[0, :fg_prompts_num])
                 foreground_map[cluster_labels == label_idx] += foreground_confidence
 
-        foreground_map = foreground_map / len(k_clusters_list)
+        foreground_map = foreground_map / len(self.k_clusters)
         foreground_map = foreground_map.reshape(self.feature_size, self.feature_size)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
 
-        return foreground_map, foreground_mask, cluster_labels_list, fused_layer_feature
+        return foreground_map, foreground_mask, cluster_labels_list
 
     def _run_edgetam_refinement(
         self,
@@ -345,7 +366,7 @@ class SegmentationRunner:
 
     def _save_results(
         self,
-        save_dir: Path,
+        image_path: Path, 
         image_raw: Image.Image,
         width: int,
         height: int,
@@ -355,11 +376,12 @@ class SegmentationRunner:
         foreground_mask: np.ndarray,
         point_coords: List[List[float]],
         point_labels: List[int],
-        layer_features: List[np.ndarray],
-        cluster_labels_list: List[np.ndarray],
-        k_clusters_list: List[int]
+        cluster_labels_list: List[np.ndarray]
     ) -> None:
         """処理結果の画像・マスク・オーバーレイの書き出し"""
+        save_dir = Path(self.output_dir) / image_path.stem
+        save_dir.mkdir(parents=True, exist_ok=True)
+
         print(f"\n--- Saving results to {save_dir} ---")
 
         # マスク画像を保存
@@ -368,7 +390,7 @@ class SegmentationRunner:
             cv2.imwrite(str(save_dir / f"foreground_mask_n{i+1}.png"), mask_img)
 
         # レイヤー結合した特徴マップでのクラスタリング結果
-        for k_clusters, cluster_labels in zip(k_clusters_list, cluster_labels_list):
+        for k_clusters, cluster_labels in zip(self.k_clusters, cluster_labels_list):
             fused_cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
             fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
             fused_cluster_rgb = fused_cluster_rgb.resize(
@@ -428,20 +450,15 @@ class SegmentationRunner:
     # 6. メイン実行エントリーポイント
     # =========================================================================
 
-    def run(
-        self,
-        image_path: str,
-        output_dir: str = "./outputs/cluster",
-    ) -> None:
-        img_path = Path(image_path)
-        if img_path.exists():
-            print(f"====== Processing Image: {img_path.name} ======")
-        else:
-            print(f"====== 存在しません: {img_path.name} ======")
-            return
+    def run(self, image_path: Union[str, Path]) -> None:
+        if isinstance(image_path, str):
+            image_path = Path(image_path)
 
-        save_dir = Path(output_dir) / img_path.stem
-        save_dir.mkdir(parents=True, exist_ok=True)
+        if image_path.exists():
+            print(f"====== 画像パス: {image_path.name} ======")
+        else:
+            print(f"====== 存在しません: {image_path.name} ======")
+            return
 
         # 画像読み込み
         image_raw = load_image(image_path)
@@ -453,13 +470,16 @@ class SegmentationRunner:
         # 画像前処理
         image_tensor = preprocess_image(image_raw, self.extractor.target_size, self.extractor.mean, self.extractor.std)
 
-        # 1. CLIP + KMeans による初期前景マップの推定
-        K_CLUSTERS_LIST = [8]
-        foreground_map, foreground_mask, cluster_labels_list, layer_features = self._generate_foreground_map(
-            image_tensor, K_CLUSTERS_LIST
-        )
+        # 特徴量抽出
+        image_features, patch_features, fused_patch_features = self._feature_extraction(image_tensor)
 
-        # 2. 前景が存在する場合は EdgeTAM による精緻化
+        # 画像分類
+        self._image_classification(image_features)
+
+        # CLIP + KMeans による初期前景マップの推定
+        foreground_map, foreground_mask, cluster_labels_list = self._generate_foreground_map(patch_features, fused_patch_features)
+
+        # 前景が存在する場合は EdgeTAM による精緻化
         point_coords: List[List[float]] = []
         point_labels: List[int] = []
 
@@ -479,9 +499,9 @@ class SegmentationRunner:
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time * 1000:.2f} ms")
 
-        # 3. 処理結果の保存
+        # 処理結果の保存
         self._save_results(
-            save_dir=save_dir,
+            image_path=image_path,
             image_raw=image_raw,
             width=width,
             height=height,
@@ -491,7 +511,5 @@ class SegmentationRunner:
             foreground_mask=foreground_mask,
             point_coords=point_coords,
             point_labels=point_labels,
-            layer_features=layer_features,
-            cluster_labels_list=cluster_labels_list,
-            k_clusters_list=K_CLUSTERS_LIST,
+            cluster_labels_list=cluster_labels_list
         )

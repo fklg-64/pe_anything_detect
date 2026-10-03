@@ -11,17 +11,32 @@ if "PYTHONPATH" in os.environ:
     os.environ["PYTHONPATH"] = os.pathsep.join(new_paths)
 
 import cv2
+import yaml
 import numpy as np
 from typing import Union, Tuple, List, Optional
 from pathlib import Path
 
 import openvino as ov
 
-
 class OVEdgeTamHelper:
-    def __init__(self, target_size: int):
+    def __init__(self, config: yaml):
+        # 設定値の初期化
+        self.init_value(config)
+
+    def init_value(self, config: yaml):
+        # config関係
+        self.target_size = config["image_size"]
+        self.model_dir = config["model_dir"]
+        self.use_int8 = config["use_int8"]
+        self.device = config["device"].upper()
+        self.num_threads = config["ov_num_thread"]
+
+        # マスク閾値
         self.mask_threshold = 0.0
-        self.target_size = target_size
+
+        # 画像の正規化に使用する変数
+        self.mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        self.std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
 
     def transform_coords(
         self,
@@ -174,49 +189,33 @@ class OVEdgeTamRunner(OVEdgeTamHelper):
 
     def __init__(
         self,
-        model_dir: Union[str, Path] = "./weights/openvino_models",
-        target_size: int = 512, 
-        use_int8: bool = False,
-        device: str = "CPU",
-        num_threads: int = 0
+        config: yaml
     ):
-        super().__init__(target_size)
-        # 画像サイズ関係
-        self.target_size: int = target_size
-
-        # 画像の正規化に使用する変数
-        self.mean = np.array([0.485, 0.456, 0.406]).reshape(3,1,1)
-        self.std = np.array([0.229, 0.224, 0.225]).reshape(3,1,1)
+        super().__init__(config)
 
         # OpenCVの処理に使用するスレッド数
         cv2.setNumThreads(2)
 
         # OpenVINOのモデルを読み込み
-        self.load_ov_model(model_dir, use_int8, device, num_threads)
+        self.load_ov_model()
 
         # 初期実行時の遅延を回避
         self._forward_once()
 
-    def load_ov_model(
-        self, 
-        model_dir: Union[str, Path],
-        use_int8: bool = False,
-        device: str = "CPU",
-        num_threads: int = 0
-    ) -> None:
+    def load_ov_model(self) -> None:
         core = ov.Core()
 
         # 実行時の設定
         config = {
-            "INFERENCE_NUM_THREADS": str(num_threads),
+            "INFERENCE_NUM_THREADS": str(self.num_threads),
             "PERFORMANCE_HINT": "LATENCY", 
             "ENABLE_CPU_PINNING": "YES", 
             "NUM_STREAMS": "1",
         }
 
         # モデルパス
-        model_dir = Path(model_dir)
-        suffix = "_int8.xml" if use_int8 else ".xml"
+        model_dir = Path(self.model_dir)
+        suffix = "_int8.xml" if self.use_int8 else ".xml"
         encoder_path = model_dir / f"edgetam_encoder{suffix}"
         decoder_path = model_dir / f"edgetam_decoder{suffix}"
 
@@ -224,8 +223,8 @@ class OVEdgeTamRunner(OVEdgeTamHelper):
         decoder_model = core.read_model(decoder_path)
 
         # コンパイルモデル
-        self.compiled_encoder_model = core.compile_model(encoder_model, device, config)
-        self.compiled_decoder_model = core.compile_model(decoder_model, device, config)
+        self.compiled_encoder_model = core.compile_model(encoder_model, self.device, config)
+        self.compiled_decoder_model = core.compile_model(decoder_model, self.device, config)
 
     def _forward_once(self):
         # エンコーダモデル

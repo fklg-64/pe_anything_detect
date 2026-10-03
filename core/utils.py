@@ -1,5 +1,6 @@
 import cv2
 import time
+import yaml
 import numpy as np
 from PIL import Image
 from pathlib import Path
@@ -131,3 +132,9 @@ def preprocess_image(
 
     # 6. バッチ次元の追加 (C, H, W) -> (1, C, H, W)
     return np.expand_dims(img_norm, axis=0)
+
+# yaml設定データの読み込み
+def load_config(config_path: str = "config.yaml"):
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    return config

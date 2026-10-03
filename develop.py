@@ -1,6 +1,7 @@
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.segmentation_runner import SegmentationRunner
+from core.utils import load_config
 
 from config import *
 
@@ -25,37 +26,18 @@ if __name__ == "__main__":
         "/home/llm/datasets/02_object_detection/clip/002_crop.png", 
     ]
 
+    # 設定データ
+    config = load_config()
+
     # 特徴量抽出モデル
-    extractor = OVCLIPFeatureExtractor(
-        model_dir = MODEL_DIR,
-        target_size=IMAGE_SIZE,
-        use_int8 = USE_INT8, 
-        device = "CPU", 
-        num_threads = OV_NUM_THREAD
-    )
+    extractor = OVCLIPFeatureExtractor(config)
 
     # プロンプトセグメンテーションモデル
-    edgetam = OVEdgeTamRunner(
-        model_dir = MODEL_DIR,
-        target_size=IMAGE_SIZE,
-        use_int8 = USE_INT8, 
-        device = "CPU", 
-        num_threads = OV_NUM_THREAD
-    )
+    edgetam = OVEdgeTamRunner(config)
 
     # セグメンテーション実行処理インスタンス
-    runner = SegmentationRunner(
-        extractor, 
-        edgetam, 
-        prompts_dir=PROMPTS_DIR, 
-        k_clusters=K_CLUSTERS,
-        niter=N_ITER,
-        foreground_threshold=FOREGROUND_THRESHOLD
-    )
+    runner = SegmentationRunner(extractor, edgetam, config)
 
     # セグメンテーション実行
     for path in image_paths:
-        runner.run(
-            image_path=path,
-            output_dir="./outputs/experiment_results",
-        )
+        runner.run(image_path=path)

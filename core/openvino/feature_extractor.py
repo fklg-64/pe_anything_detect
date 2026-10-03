@@ -11,6 +11,7 @@ if "PYTHONPATH" in os.environ:
     os.environ["PYTHONPATH"] = os.pathsep.join(new_paths)
 
 import cv2
+import yaml
 import numpy as np
 from typing import Union, Tuple, List
 from pathlib import Path
@@ -23,49 +24,47 @@ class OVCLIPFeatureExtractor:
 
     def __init__(
         self,
-        model_dir: Union[str, Path] = "./weights/openvino_models",
-        target_size: int = 512, 
-        use_int8: bool = False,
-        device: str = "CPU",
-        num_threads: int = 0
+        config: yaml
     ):
-        # 画像サイズ関係
-        self.target_size: int = target_size
-
-        # 画像の正規化に使用する変数
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        # 設定値の初期化
+        self.init_value(config)
 
         # OpenCVの処理に使用するスレッド数
         cv2.setNumThreads(2)
 
         # OpenVINOのモデルを読み込み
-        self.load_ov_model(model_dir, use_int8, device, num_threads)
+        self.load_ov_model()
 
         # 初期実行時の遅延を回避
         self._forward_once()
 
-    def load_ov_model(
-        self, 
-        model_dir: Union[str, Path],
-        use_int8: bool = False,
-        device: str = "CPU",
-        num_threads: int = 0
-    ) -> None:
+    def init_value(self, config: yaml):
+        # config関係
+        self.target_size = config["image_size"]
+        self.model_dir = config["model_dir"]
+        self.use_int8 = config["use_int8"]
+        self.device = config["device"].upper()
+        self.num_threads = config["ov_num_thread"]
+
+        # 画像の正規化に使用する変数
+        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+
+    def load_ov_model(self) -> None:
         core = ov.Core()
         core.add_extension(openvino_tokenizers._ext_path)
 
         # 実行時の設定
         config = {
-            "INFERENCE_NUM_THREADS": str(num_threads),
+            "INFERENCE_NUM_THREADS": str(self.num_threads),
             "PERFORMANCE_HINT": "LATENCY", 
             "ENABLE_CPU_PINNING": "YES", 
             "NUM_STREAMS": "1",
         }
 
         # モデルパス
-        model_dir = Path(model_dir)
-        suffix = "_int8.xml" if use_int8 else ".xml"
+        model_dir = Path(self.model_dir)
+        suffix = "_int8.xml" if self.use_int8 else ".xml"
         visual_path = model_dir / f"pe_visual_model{suffix}"
         text_path = model_dir / f"pe_text_model{suffix}"
         patch_logits_path = model_dir / f"pe_patch_logits_model{suffix}"
@@ -83,10 +82,10 @@ class OVCLIPFeatureExtractor:
         self.feature_size = self.target_size // self.patch_size
 
         # コンパイルモデル
-        self.compiled_visual_model = core.compile_model(visual_model, device, config)
-        self.compiled_text_model = core.compile_model(text_model, device, config)
-        self.compiled_patch_logits_model = core.compile_model(patch_logits_model, device, config)
-        self.compiled_tokenizer = core.compile_model(tokenizer_model, device, config)
+        self.compiled_visual_model = core.compile_model(visual_model, self.device, config)
+        self.compiled_text_model = core.compile_model(text_model, self.device, config)
+        self.compiled_patch_logits_model = core.compile_model(patch_logits_model, self.device, config)
+        self.compiled_tokenizer = core.compile_model(tokenizer_model, self.device, config)
 
     def _forward_once(self):
         input_tensor = np.zeros((1, 3, self.target_size, self.target_size), dtype=np.float32)
@@ -99,8 +98,8 @@ class OVCLIPFeatureExtractor:
             raw_image_features = raw_image_features / np.linalg.norm(raw_image_features, axis=-1, keepdims=True)
         raw_patch_features = outs[self.compiled_visual_model.output(1)]
         cls2patch_attention = outs[self.compiled_visual_model.output(2)]
-        fused_layer_features = outs[self.compiled_visual_model.output(3)]
-        return raw_image_features, raw_patch_features, cls2patch_attention, fused_layer_features
+        fused_patch_features = outs[self.compiled_visual_model.output(3)]
+        return raw_image_features, raw_patch_features, cls2patch_attention, fused_patch_features
 
     def extract_text_features(self, prompts: List[str], normalize=True):
         tokenizer_outputs = self.compiled_tokenizer(prompts)
