@@ -5,16 +5,27 @@
 - OpenVINOやfaissなども活用して、CPUで高速に動作する基盤モデルを目指す
 
 ## 使い方
-1. OpenVINOモデルを生成
+
+### OpenVINOモデル
+
+1. PyTorch -> OpenVINOモデルに変換
 
     ```bash
     python convert_openvino.py
     ```
 
-2. 検査実行
+2. モデル実行
 
     ```bash
     python develop.py
+    ```
+
+### PyTorchモデル
+
+1. モデル実行
+
+    ```bash
+    python test_pytorch.py
     ```
 
 ## 予定、checkpoint
@@ -25,6 +36,4 @@
 - [ ] 処理時間の高速化（～200ms）
 
 ## 補足
-- 現在はセグメンテーションモデルを開発中
-- Pytorch もしくは OpenVINOでモデルを動作
-- Pytorchでの動作は、基本的に確認程度とするため、実行しても処理が最新とは限らない
+- PyTorchでの動作は、基本的に確認程度とするため、実行しても処理が最新とは限らない
