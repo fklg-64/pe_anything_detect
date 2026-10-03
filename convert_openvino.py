@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 from timm.models.eva import Eva
 
 from config import *
+from core.utils import load_config
 from core.torch.edgetam_runner import DecodeModel, EdgeTAMPredictor, RepVitModel
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
 
@@ -273,22 +274,20 @@ class EdgeTAMOpenVINOExporter(BaseOpenVINOExporter):
 
 
 if __name__ == "__main__":
-    save_directory = "./weights/openvino_models"
+    # 設定データ
+    config = load_config("./configs/torch_config.yaml")
+    # OpenVINOモデルに変換するモードに強制変更
+    config["to_openvino"] = True
 
     # Extractor / EdgeTAM モデルの初期化
-    extractor = TorchCLIPFeatureExtractor(
-        force_image_size=IMAGE_SIZE,
-        to_openvino=True,
-    )
-    edgetam_encoder = RepVitModel()
-    edgetam_decoder = DecodeModel()
+    extractor = TorchCLIPFeatureExtractor(config)
+    edgetam_encoder = RepVitModel(config)
+    edgetam_decoder = DecodeModel(config)
 
     # CLIP モデルのエクスポート
-    exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=save_directory)
+    exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=config["ov_model_dir"])
     exporter_pe.export_all()
 
     # EdgeTAM モデルのエクスポート
-    exporter_edgetam = EdgeTAMOpenVINOExporter(
-        edgetam_encoder, edgetam_decoder, save_dir=save_directory
-    )
+    exporter_edgetam = EdgeTAMOpenVINOExporter(edgetam_encoder, edgetam_decoder, save_dir=config["ov_model_dir"])
     exporter_edgetam.export_all()

@@ -22,6 +22,9 @@ prompts_dir: "./prompts"
 # OpenVINO変換を実施するか
 to_openvino: false
 
+# OpenVINO変換に使用するモデルのディレクトリ
+ov_model_dir: "./weights/openvino_models"
+
 # 使用するデバイス
 device: "cpu"
 
