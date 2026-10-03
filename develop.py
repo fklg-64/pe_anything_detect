@@ -3,8 +3,6 @@ from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.segmentation_runner import SegmentationRunner
 from core.utils import load_config
 
-from config import *
-
 if __name__ == "__main__":
     # 画像リスト
     image_paths: list[str] = [
