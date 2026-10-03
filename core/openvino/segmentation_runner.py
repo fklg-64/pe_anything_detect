@@ -39,6 +39,7 @@ class SegmentationRunner:
         self.niter = config["n_iter"]
         self.foreground_threshold = config["foreground_threshold"]
         self.output_dir = config["output_dir"]
+        self.color_palette = config["color_palette"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
@@ -104,7 +105,7 @@ class SegmentationRunner:
 
     def colorize_clusters_PIL(self, cluster_labels: np.ndarray) -> Image.Image:
         color_map = Image.fromarray(cluster_labels.astype(np.uint8))
-        color_map.putpalette(COLOR_PALETTE)
+        color_map.putpalette(self.color_palette)
         return color_map
 
     # =========================================================================
