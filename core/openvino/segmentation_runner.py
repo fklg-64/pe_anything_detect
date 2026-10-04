@@ -40,6 +40,8 @@ class SegmentationRunner:
         self.foreground_threshold = config["foreground_threshold"]
         self.output_dir = config["output_dir"]
         self.color_palette = config["color_palette"]
+        self.init_n_points = config["init_n_points"]
+        self.max_refine_steps = config["max_refine_steps"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
@@ -112,50 +114,242 @@ class SegmentationRunner:
     # 3. プロンプトポイント選出 & 座標変換 (ロジック不変)
     # =========================================================================
 
-    def select_n_prompt_points(
+    # def select_n_prompt_points(
+    #     self, 
+    #     target_mask: np.ndarray, 
+    #     opponent_mask: np.ndarray, 
+    #     num_points: int = 1
+    # ) -> np.ndarray:
+    #     """
+    #     対象領域（target_mask）の中から、条件を満たす点を順に num_points 個抽出する:
+    #     1. 領域の内側に位置する（境界から遠い）
+    #     2. 対立領域（opponent_mask）から遠い
+    #     3. 既に選ばれている他のプロンプト点から遠い
+    #     """
+    #     if not np.any(target_mask) or num_points <= 0:
+    #         return np.empty((0, 2), dtype=np.int32)
+
+    #     dist_target = distance_transform_edt(target_mask)
+    #     dist_opponent = distance_transform_edt(1 - opponent_mask)
+
+    #     norm_target = dist_target / (np.max(dist_target) + 1e-8)
+    #     norm_opponent = dist_opponent / (np.max(dist_opponent) + 1e-8)
+
+    #     base_score_map = norm_target * norm_opponent
+    #     base_score_map[target_mask == 0] = -1.0  # 対象領域外は除外
+
+    #     selected_points = []
+    #     h, w = target_mask.shape
+    #     grid_y, grid_x = np.ogrid[:h, :w]
+
+    #     for i in range(num_points):
+    #         if i == 0:
+    #             score_map = base_score_map.copy()
+    #         else:
+    #             dist_to_selected = np.ones((h, w), dtype=np.float32) * np.inf
+    #             for py, px in selected_points:
+    #                 d = np.sqrt((grid_y - py)**2 + (grid_x - px)**2)
+    #                 dist_to_selected = np.minimum(dist_to_selected, d)
+                
+    #             norm_dist_selected = dist_to_selected / (np.max(dist_to_selected) + 1e-8)
+    #             score_map = base_score_map * norm_dist_selected
+
+    #         best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
+    #         selected_points.append([int(best_y), int(best_x)])
+
+    #     return [[x, y] for y, x in selected_points]
+
+    # def select_n_prompt_points(
+    #     self, 
+    #     target_mask: np.ndarray, 
+    #     opponent_mask: Optional[np.ndarray] = None, 
+    #     num_points: int = 1,
+    #     min_area_ratio: float = 0.001  # 全体解像度に対する最小領域面積の割合 (0.1%)
+    # ) -> np.ndarray:
+    #     """
+    #     粗いマスクからノイズを除去し、主要領域の中心付近から分散したプロンプト点 [x, y] を抽出する。
+
+    #     Parameters:
+    #         target_mask (np.ndarray): 抽出対象の二値マスク (H, W)
+    #         opponent_mask (np.ndarray, optional): 対立領域の二値マスク (H, W)
+    #         num_points (int): 抽出するポイント数
+    #         min_area_ratio (float): ノイズとして除元する最小面積の割合
+
+    #     Returns:
+    #         np.ndarray: 選択された座標のリスト [[x1, y1], [x2, y2], ...] (shape: N x 2)
+    #     """
+    #     if target_mask is None or not np.any(target_mask) or num_points <= 0:
+    #         return np.empty((0, 2), dtype=np.int32)
+
+    #     # 1. 前処理（二値化）
+    #     binary_mask = (target_mask > 0).astype(np.uint8)
+    #     h, w = binary_mask.shape
+    #     total_pixels = h * w
+
+    #     # 2. 連結成分解析によるノイズ（小さな孤立領域）の除去
+    #     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+    #         binary_mask, connectivity=8
+    #     )
+
+    #     min_area = max(1, int(total_pixels * min_area_ratio))
+    #     cleaned_mask = np.zeros_like(binary_mask)
+    #     area_weights = np.zeros_like(binary_mask, dtype=np.float32)
+    #     max_area = 0
+
+    #     for label in range(1, num_labels):  # 0は背景
+    #         area = stats[label, cv2.CC_STAT_AREA]
+    #         if area >= min_area:
+    #             cleaned_mask[labels == label] = 1
+    #             area_weights[labels == label] = area
+    #             if area > max_area:
+    #                 max_area = area
+
+    #     # 万が一すべての領域がノイズ除去で消えた場合は、最も大きい1つの領域を復元
+    #     if not np.any(cleaned_mask) and num_labels > 1:
+    #         max_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    #         cleaned_mask[labels == max_label] = 1
+    #         area_weights[labels == max_label] = stats[max_label, cv2.CC_STAT_AREA]
+    #         max_area = stats[max_label, cv2.CC_STAT_AREA]
+
+    #     if not np.any(cleaned_mask):
+    #         return np.empty((0, 2), dtype=np.int32)
+
+    #     # 面積スコアの正規化 (0 ~ 1)
+    #     norm_area_map = area_weights / (max_area + 1e-8)
+
+    #     # 3. 距離変換（境界からの距離算出）
+    #     dist_target = distance_transform_edt(cleaned_mask)
+    #     norm_dist_target = dist_target / (np.max(dist_target) + 1e-8)
+
+    #     # 4. ベーススコアマップの算出 (中心度 × 領域の大きさ)
+    #     base_score_map = norm_dist_target * np.sqrt(norm_area_map)
+
+    #     # 対立領域からの距離を考慮する場合
+    #     if opponent_mask is not None and np.any(opponent_mask):
+    #         dist_opponent = distance_transform_edt(1 - (opponent_mask > 0).astype(np.uint8))
+    #         norm_opponent = dist_opponent / (np.max(dist_opponent) + 1e-8)
+    #         base_score_map *= norm_opponent
+
+    #     # 対象領域外はスコアを負の値にして無効化
+    #     base_score_map[cleaned_mask == 0] = -1.0
+
+    #     # 5. ポイントの順次選出（複数点の場合、既出点から離れた点を選ぶ）
+    #     selected_points = []
+    #     grid_y, grid_x = np.ogrid[:h, :w]
+
+    #     for i in range(num_points):
+    #         if i == 0:
+    #             score_map = base_score_map.copy()
+    #         else:
+    #             # 既存選択点からの最小ユークリッド距離
+    #             dist_to_selected = np.ones((h, w), dtype=np.float32) * np.inf
+    #             for py, px in selected_points:
+    #                 d = np.sqrt((grid_y - py) ** 2 + (grid_x - px) ** 2)
+    #                 dist_to_selected = np.minimum(dist_to_selected, d)
+
+    #             norm_dist_selected = dist_to_selected / (np.max(dist_to_selected) + 1e-8)
+    #             score_map = base_score_map * norm_dist_selected
+
+    #         best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
+
+    #         # 候補となる有効なピクセルがない場合は終了
+    #         if score_map[best_y, best_x] < 0:
+    #             break
+
+    #         selected_points.append([int(best_y), int(best_x)])
+
+    #     # [x, y] (列, 行) の順で N x 2 の numpy 配列を返す
+    #     return [[x, y] for y, x in selected_points]
+
+    def select_prompt_points(
         self, 
-        target_mask: np.ndarray, 
-        opponent_mask: np.ndarray, 
-        num_points: int = 1
-    ) -> np.ndarray:
+        fg_mask: np.ndarray, 
+        num_fg_points: int = 5, 
+        num_bg_points: int = 5,
+        dilate_kernel_size: int = 31  # 麺や周囲をカバーするための膨張サイズ
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """粗い前景マスクから、最適な前景点(緑)と近傍背景点(赤)を選出する。
+
+        Args:
+            fg_mask (np.ndarray): 粗い前景マスク (H, W), uint8 (0 or 255) または bool
+            num_fg_points (int): 前景ポイント数
+            num_bg_points (int): 背景ポイント数
+            dilate_kernel_size (int): 近傍背景を定義するための膨張カーネルサイズ (奇数)
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: (fg_points, bg_points) 各 shape: (N, 2) [x, y]
         """
-        対象領域（target_mask）の中から、条件を満たす点を順に num_points 個抽出する:
-        1. 領域の内側に位置する（境界から遠い）
-        2. 対立領域（opponent_mask）から遠い
-        3. 既に選ばれている他のプロンプト点から遠い
-        """
-        if not np.any(target_mask) or num_points <= 0:
-            return np.empty((0, 2), dtype=np.int32)
-
-        dist_target = distance_transform_edt(target_mask)
-        dist_opponent = distance_transform_edt(1 - opponent_mask)
-
-        norm_target = dist_target / (np.max(dist_target) + 1e-8)
-        norm_opponent = dist_opponent / (np.max(dist_opponent) + 1e-8)
-
-        base_score_map = norm_target * norm_opponent
-        base_score_map[target_mask == 0] = -1.0  # 対象領域外は除外
-
-        selected_points = []
-        h, w = target_mask.shape
+        binary_fg = (fg_mask > 0).astype(np.uint8)
+        h, w = binary_fg.shape
         grid_y, grid_x = np.ogrid[:h, :w]
 
-        for i in range(num_points):
-            if i == 0:
-                score_map = base_score_map.copy()
-            else:
-                dist_to_selected = np.ones((h, w), dtype=np.float32) * np.inf
-                for py, px in selected_points:
-                    d = np.sqrt((grid_y - py)**2 + (grid_x - px)**2)
-                    dist_to_selected = np.minimum(dist_to_selected, d)
-                
-                norm_dist_selected = dist_to_selected / (np.max(dist_to_selected) + 1e-8)
-                score_map = base_score_map * norm_dist_selected
+        # ==========================================
+        # 1. 前景ポイント（緑点）の選出
+        # ==========================================
+        fg_points = []
+        if np.any(binary_fg) and num_fg_points > 0:
+            dist_fg = distance_transform_edt(binary_fg)
+            base_fg_score = dist_fg / (np.max(dist_fg) + 1e-8)
+            
+            for i in range(num_fg_points):
+                if i == 0:
+                    score_map = base_fg_score.copy()
+                else:
+                    dist_to_selected = np.ones((h, w), dtype=np.float32) * np.inf
+                    for py, px in fg_points:
+                        d = np.sqrt((grid_y - py)**2 + (grid_x - px)**2)
+                        dist_to_selected = np.minimum(dist_to_selected, d)
+                    score_map = base_fg_score * (dist_to_selected / (np.max(dist_to_selected) + 1e-8))
 
-            best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
-            selected_points.append([int(best_y), int(best_x)])
+                best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
+                if score_map[best_y, best_x] <= 0:
+                    break
+                fg_points.append((best_y, best_x))
 
-        return [[x, y] for y, x in selected_points]
+        # ==========================================
+        # 2. 背景ポイント（赤点）の選出（近傍エリアに限定）
+        # ==========================================
+        bg_points = []
+        if np.any(binary_fg) and num_bg_points > 0:
+            # モルフォロジー膨張で「対象の周囲領域」を作成
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel_size, dilate_kernel_size))
+            dilated_fg = cv2.dilate(binary_fg, kernel, iterations=1)
+            
+            # 「近傍背景」＝ 膨張領域 から 元の前景 を引いたリング状領域
+            near_bg_mask = (dilated_fg == 1) & (binary_fg == 0)
+
+            # 万が一近傍エリアが狭すぎる場合は画像全体をバックアップとする
+            if not np.any(near_bg_mask):
+                near_bg_mask = (binary_fg == 0)
+
+            # 近傍背景領域内での中心（境界から遠い場所）を特定
+            dist_bg = distance_transform_edt(near_bg_mask)
+            base_bg_score = dist_bg / (np.max(dist_bg) + 1e-8)
+            base_bg_score[near_bg_mask == 0] = -1.0  # 候補領域外は除外
+
+            for i in range(num_bg_points):
+                if i == 0:
+                    score_map = base_bg_score.copy()
+                else:
+                    dist_to_selected = np.ones((h, w), dtype=np.float32) * np.inf
+                    for py, px in bg_points:
+                        d = np.sqrt((grid_y - py)**2 + (grid_x - px)**2)
+                        dist_to_selected = np.minimum(dist_to_selected, d)
+                    
+                    # 既出点から離れた位置を優先
+                    norm_dist = dist_to_selected / (np.max(dist_to_selected) + 1e-8)
+                    score_map = base_bg_score * norm_dist
+
+                best_y, best_x = np.unravel_index(np.argmax(score_map), score_map.shape)
+                if score_map[best_y, best_x] < 0:
+                    break
+                bg_points.append((best_y, best_x))
+
+        # [x, y] 形式に変換して返却
+        fg_res = np.array([[x, y] for y, x in fg_points], dtype=np.int32) if fg_points else np.empty((0, 2), dtype=np.int32)
+        bg_res = np.array([[x, y] for y, x in bg_points], dtype=np.int32) if bg_points else np.empty((0, 2), dtype=np.int32)
+
+        return fg_res, bg_res
 
     def convert_coordinate(self, point: int, img_size: int, feat_size: int) -> float:
         return point * img_size / feat_size
@@ -285,23 +479,22 @@ class SegmentationRunner:
         foreground_mask: np.ndarray,
         image_raw: Image.Image,
         width: int,
-        height: int,
-        init_n_points: int = 5,
-        max_refine_steps: int = 5
+        height: int
     ) -> Tuple[np.ndarray, List[np.ndarray], List[List[float]], List[int]]:
         """EdgeTAM による初期プロンプト設定および繰り返しマスク精緻化"""
         fg_mask = (foreground_mask == 1).astype(np.uint8)
         bg_mask = (foreground_mask == 0).astype(np.uint8)
 
         # --- Step 1: 初期の最良点（前景5点 + 背景5点）でベースマスクを作成 ---
-        init_fg_pt = self.select_n_prompt_points(fg_mask, bg_mask, num_points=init_n_points)
-        init_bg_pt = self.select_n_prompt_points(bg_mask, fg_mask, num_points=init_n_points)
+        # init_fg_pt = self.select_n_prompt_points(fg_mask, bg_mask, num_points=self.init_n_points)
+        # init_bg_pt = self.select_n_prompt_points(bg_mask, fg_mask, num_points=self.init_n_points)
+        init_fg_pt, init_bg_pt = self.select_prompt_points(fg_mask, self.init_n_points, self.init_n_points, 9)
 
         point_coords = (
             self.transform_coords(init_fg_pt, width, height, self.feature_size) +
             self.transform_coords(init_bg_pt, width, height, self.feature_size)
         )
-        point_labels = [1] * init_n_points + [0] * init_n_points
+        point_labels = [1] * self.init_n_points + [0] * self.init_n_points
 
         with Timer("edgetam特徴量抽出"):
             feats = self._predict_edgetam_encoder(image_raw)
@@ -323,7 +516,7 @@ class SegmentationRunner:
         current_mask_list = [current_mask]
         h_gt, w_gt = fg_mask.shape[:2]
 
-        for step in range(max_refine_steps):
+        for step in range(self.max_refine_steps):
             current_mask_resized = cv2.resize(
                 current_mask, 
                 (w_gt, h_gt), 
@@ -357,13 +550,13 @@ class SegmentationRunner:
             current_mask_list.append(current_mask)
 
         # マスク画像を元画像サイズにリサイズ
-        resized_masks: np.ndarray = cv2.resize(
+        resized_mask: np.ndarray = cv2.resize(
             current_mask,
             (width, height),
             interpolation=cv2.INTER_LINEAR,
         )
 
-        return resized_masks, current_mask_list, point_coords, point_labels
+        return resized_mask, current_mask_list, point_coords, point_labels
 
     def _save_results(
         self,
@@ -489,9 +682,7 @@ class SegmentationRunner:
                 foreground_mask=foreground_mask,
                 image_raw=image_raw,
                 width=width,
-                height=height,
-                init_n_points=5,
-                max_refine_steps=5
+                height=height
             )
         else:
             current_mask = np.zeros((height, width), dtype=np.uint8)

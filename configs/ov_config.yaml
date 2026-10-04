@@ -7,6 +7,12 @@ k_clusters: [8]
 # Kmeansのループ回数（多いほどクラスタは整う）
 n_iter: 10
 
+# プロンプト数（初回）
+init_n_points: 5
+
+# リファイン繰り返し数
+max_refine_steps: 0
+
 # モデルのディレクトリ
 model_dir: "./weights/openvino_models"
 
