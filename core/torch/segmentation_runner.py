@@ -176,7 +176,10 @@ class SegmentationRunner:
     # 4. EdgeTAM 推論バックエンド共通インターフェース (OpenVINO対応化用)
     # =========================================================================
 
-    def _predict_edgetam_encoder(self, image_raw: Image.Image) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _predict_edgetam_encoder(
+        self, 
+        image_raw: Image.Image
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.edgetam.encode(self.edgetam.transform(image_raw))
 
     def _predict_edgetam_decoder(
@@ -342,13 +345,13 @@ class SegmentationRunner:
             current_mask_list.append(current_mask)
 
         # マスク画像を元画像サイズにリサイズ
-        resized_masks: np.ndarray = cv2.resize(
+        resized_mask: np.ndarray = cv2.resize(
             current_mask,
             (width, height),
             interpolation=cv2.INTER_LINEAR,
         )
 
-        return resized_masks, current_mask_list, point_coords, point_labels
+        return resized_mask, current_mask_list, point_coords, point_labels
 
     def _save_results(
         self,
