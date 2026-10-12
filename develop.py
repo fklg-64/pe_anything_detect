@@ -20,8 +20,10 @@ if __name__ == "__main__":
         "/home/llm/datasets/01_classification_sample/bredboard/OK/cable1 (1).jpg", 
         "/home/llm/datasets/01_classification_sample/natural/pexels-rohit-george-1141376880-32113857.jpg",
         "/home/llm/datasets/01_classification_sample/natural/011kumakichi0327_TP_V.jpg", 
+        "/home/llm/datasets/02_object_detection/syringe/006_syringe.png",
         "/home/llm/datasets/02_object_detection/coin/001_crop.png", 
         "/home/llm/datasets/02_object_detection/clip/002_crop.png", 
+        "/home/llm/datasets/02_object_detection/clip/003_crop.png", 
     ]
 
     # 設定データ

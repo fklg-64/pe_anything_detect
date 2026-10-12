@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, Union
 
 class Timer:
     """ミリ秒単位で処理時間を計測し表示するコンテキストマネージャー"""
-    def __init__(self, name: str, width: int = 12):
+    def __init__(self, name: str, width: int = 20):
         self.name = name
         self.width = width
         self.elapsed_ms = 0.0
@@ -21,72 +21,49 @@ class Timer:
         self.elapsed_ms = (time.perf_counter() - self.start) * 1000
         print(f"{self.name:<{self.width}} : {self.elapsed_ms:6.2f} ms")
 
-
+# 画像読み込み
 def load_image(data: Union[str, Path, Image.Image, np.ndarray]) -> np.ndarray:
-    """入力データをRGB順序のnumpy.ndarray(uint8)に統一して読み込みます。
+    """画像をRGB形式のnumpy配列に変換する。"""
+    if isinstance(data, np.ndarray):
+        return data
 
-    Args:
-        data: 画像ファイルパス(str/Path)、PIL Image、またはRGB配列(ndarray)
-
-    Returns:
-        np.ndarray: HWC形式・RGB順序の画像配列 (uint8)
-    """
     if isinstance(data, (str, Path)):
-        img_cv = np.array(Image.open(data).convert("RGB"))
-    elif isinstance(data, Image.Image):
-        img_cv = np.array(data.convert("RGB"))
-    elif isinstance(data, np.ndarray):
-        img_cv = data
-    else:
-        raise TypeError(f"未対応の画像形式です: {type(data)}")
+        with Image.open(data) as image:
+            return np.array(image.convert("RGB"))
 
-    return img_cv
+    if isinstance(data, Image.Image):
+        return np.array(data.convert("RGB"))
 
+    raise TypeError(f"未対応の画像形式です: {type(data)}")
 
+# 画像前処理
 def preprocess_image(
-    img_cv: np.ndarray, 
-    target_size: int, 
-    mean: np.ndarray, 
-    std: np.ndarray
+    image: np.ndarray,
+    target_size: int,
+    mean: np.ndarray,
+    std: np.ndarray,
 ) -> np.ndarray:
-    """ニューラルネットワーク入力用の前処理 (リサイズ, [0,1]正規化, 標準化, NCHW化)
+    """画像をリサイズ・正規化し、NCHW形式に変換する。"""
+    # Resize and normalize to [0, 1]
+    image = cv2.resize(
+        image,
+        (target_size, target_size),
+        interpolation=cv2.INTER_LINEAR,
+    ).astype(np.float32) / 255.0
 
-    Args:
-        img_cv (np.ndarray): HWC形式・RGB順序の画像配列 (uint8)
-        target_size (int): リサイズ後の正方形サイズ (幅・高さ)
-        mean (np.ndarray): チャンネルごとの平均値
-        std (np.ndarray): チャンネルごとの標準偏差
+    # HWC -> CHW
+    image = image.transpose(2, 0, 1)
 
-    Returns:
-        np.ndarray: NCHW形式 (1, C, H, W) の float32 配列
-    """
-    # 1. リサイズ (H, W, C)
-    resized_cv = cv2.resize(
-        img_cv, 
-        (target_size, target_size), 
-        interpolation=cv2.INTER_LINEAR
-    )
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
 
-    # 2. float32化および [0, 1] 範囲への正規化
-    img_float = resized_cv.astype(np.float32) / 255.0
+    if mean.ndim == 1:
+        mean = mean[:, None, None]
+    if std.ndim == 1:
+        std = std[:, None, None]
 
-    # 3. 軸の入れ替え (H, W, C) -> (C, H, W)
-    img_chw = np.transpose(img_float, (2, 0, 1))
-
-    # 4. mean / std のブロードキャスト対応 (1D配列(C,)の場合、(C, 1, 1)に変形)
-    mean_arr = np.asarray(mean, dtype=np.float32)
-    std_arr = np.asarray(std, dtype=np.float32)
-
-    if mean_arr.ndim == 1:
-        mean_arr = mean_arr[:, None, None]
-    if std_arr.ndim == 1:
-        std_arr = std_arr[:, None, None]
-
-    # 5. 標準化
-    img_norm = (img_chw - mean_arr) / std_arr
-
-    # 6. バッチ次元の追加 (C, H, W) -> (1, C, H, W)
-    return np.expand_dims(img_norm, axis=0)
+    # Normalize and add batch dimension
+    return ((image - mean) / std)[None, ...]
 
 # yaml設定データの読み込み
 def load_config(config_path: str = "./configs/ov_config.yaml"):

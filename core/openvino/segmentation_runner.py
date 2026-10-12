@@ -41,8 +41,6 @@ class SegmentationRunner:
         self.foreground_threshold = config["foreground_threshold"]
         self.output_dir = config["output_dir"]
         self.color_palette = config["color_palette"]
-        self.init_n_points = config["init_n_points"]
-        self.max_refine_steps = config["max_refine_steps"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
@@ -138,10 +136,8 @@ class SegmentationRunner:
 
     def select_prompt_points(
         self,
-        foreground_mask: np.ndarray,
-        target_width: int,
-        target_height: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        foreground_mask: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
         """粗い前景マスクからSAM用の前景・背景ポイントを抽出する。
 
         Returns:
@@ -219,21 +215,14 @@ class SegmentationRunner:
         ).reshape(-1, 2)
 
         # 5. デバッグ画像を保存
-        if False:
-            for idx, response in enumerate(
-                (foreground_response, background_response)
-            ):
-                response_norm = response / kernel.size
-                image = Image.fromarray(
-                    (response_norm * 255).astype(np.uint8)
-                )
-                image = image.resize(
-                    (target_width, target_height),
-                    resample=Image.Resampling.NEAREST,
-                )
-                image.save(self.save_dir / f"tmp{idx}.png")
+        foreback_image_list: List[np.ndarray] = []
+        for idx, response in enumerate(
+            (foreground_response, background_response)
+        ):
+            response_norm = response / kernel.size
+            foreback_image_list += [response_norm]
 
-        return foreground_points, background_points
+        return foreground_points, background_points, foreback_image_list
 
     def convert_coordinate(self, point: int, img_size: int, feat_size: int) -> float:
         return point * img_size / feat_size
@@ -391,7 +380,8 @@ class SegmentationRunner:
 
     def _run_edgetam_refinement(
         self,
-        foreground_mask: np.ndarray,
+        foreground_points: np.ndarray,
+        background_points: np.ndarray,
         image_raw: Image.Image,
         width: int,
         height: int
@@ -401,10 +391,6 @@ class SegmentationRunner:
         # edgeTAMの特徴量抽出
         with Timer("    ┌ edgetam特徴量抽出"):
             feats = self._predict_edgetam_encoder(image_raw)
-
-        # 前景と背景のポイントを抽出
-        with Timer("    ┌ ポイント抽出処理時間"):
-            foreground_points, background_points = self.select_prompt_points(foreground_mask, width, height)
 
         # 前景が存在しない場合はマスクなしとして処理を終了
         current_mask_list: List[np.ndarray] = []
@@ -470,6 +456,7 @@ class SegmentationRunner:
         current_mask_list: List[np.ndarray],
         foreground_map: np.ndarray,
         foreground_mask: np.ndarray,
+        foreback_image_list: List[np.ndarray],
         point_coords: List[List[float]],
         point_labels: List[int],
         cluster_labels_list: List[np.ndarray]
@@ -510,6 +497,17 @@ class SegmentationRunner:
             (width, height), resample=Image.Resampling.NEAREST
         )
         mask_image.save(save_dir / "foreground_mask.png")
+
+        # 前景と背景っぽさを保存
+        for i, foreback_map in enumerate(foreback_image_list):
+            image = Image.fromarray(
+                (foreback_map * 255).astype(np.uint8)
+            )
+            image = image.resize(
+                (width, height),
+                resample=Image.Resampling.NEAREST,
+            )
+            image.save(self.save_dir / f"foreback_map{i}.png")
 
         # オーバーレイ画像保存 (CLIP前景プロンプト点付き)
         image_cv = cv2.cvtColor(np.array(image_raw), cv2.COLOR_RGB2BGR)
@@ -577,13 +575,18 @@ class SegmentationRunner:
         with Timer("粗い前景マスク取得処理時間"):
             foreground_map, foreground_mask, cluster_labels_list = self._generate_foreground_map(patch_features, fused_patch_features)
 
+        # 前景と背景のポイントを抽出
+        with Timer("ポイント抽出処理時間"):
+            foreground_points, background_points, foreback_image_list = self.select_prompt_points(foreground_mask)
+
         # 前景が存在する場合は EdgeTAM による精緻化
         with Timer("詳細な前景マスク取得処理時間"):
             point_coords: List[List[float]] = []
             point_labels: List[int] = []
             if np.sum(foreground_mask == 1) > 0:
                 current_mask, current_mask_list, point_coords, point_labels = self._run_edgetam_refinement(
-                    foreground_mask=foreground_mask,
+                    foreground_points=foreground_points,
+                    background_points=background_points,
                     image_raw=image_raw,
                     width=width,
                     height=height
@@ -605,6 +608,7 @@ class SegmentationRunner:
             current_mask_list=current_mask_list,
             foreground_map=foreground_map,
             foreground_mask=foreground_mask,
+            foreback_image_list=foreback_image_list,
             point_coords=point_coords,
             point_labels=point_labels,
             cluster_labels_list=cluster_labels_list
