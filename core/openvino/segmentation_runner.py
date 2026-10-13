@@ -136,7 +136,8 @@ class SegmentationRunner:
 
     def select_prompt_points(
         self,
-        foreground_mask: np.ndarray
+        foreground_mask: np.ndarray, 
+        semantic_labels: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
         """粗い前景マスクからSAM用の前景・背景ポイントを抽出する。
 
@@ -155,20 +156,19 @@ class SegmentationRunner:
         background_response = convolve(background, kernel)
 
         # 3. 3x3近傍がすべて前景の領域からポイントを抽出
-        foreground_interior = (
-            foreground_response == 9
-        ).astype(np.uint8) * 255
+        foreground_interior = foreground_response >= 9
 
-        _, _, _, centroids = cv2.connectedComponentsWithStats(
-            foreground_interior,
-            connectivity=8,
-        )
+        for i in range(np.max(semantic_labels)):
+            semantic_mask = (semantic_labels == i) * foreground_interior
+            cv2.imwrite(f"{i}.png", (semantic_mask * 255).astype(np.uint8))
+
+        _, _, _, centroids = cv2.connectedComponentsWithStats(foreground_interior.astype(np.uint8) * 255, connectivity=8)
 
         # ラベル0は背景なので除外
         foreground_points = centroids[1:].astype(np.float32)
 
         # 4. 背景ポイントをグリッドごとに抽出
-        background_interior = background_response == 9
+        background_interior = background_response >= 9
 
         grid_divisions = 8
         mask_height, mask_width = foreground.shape
@@ -324,58 +324,64 @@ class SegmentationRunner:
         self,
         patch_features: np.ndarray,
         fused_patch_features: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
         """CLIP特徴量とKMeansによるベース前景マップの抽出"""
 
         # パッチレベルの特徴量を取得
         patch_tokens = fused_patch_features[0, 1:, :]
 
-        cluster_labels_list: List[np.ndarray] = []
+        cluster_index_list: List[int] = []
         fg_prompts_num: int = len(self.foreground_prompts)
         bg_prompts_num: int = len(self.background_prompts)
         foreground_map: np.ndarray = np.zeros((self.feature_size * self.feature_size,), dtype=np.float32)
-        for k_clusters in self.k_clusters:
-            with Timer("    ┌ Kmeansクラスタ処理時間"):
-                cluster_labels = self.fit_predict_kmeans(patch_tokens, k=k_clusters, niter=self.niter)
-            cluster_labels_list.append(cluster_labels)
+        with Timer("    ┌ Kmeansクラスタ処理時間"):
+            cluster_labels = self.fit_predict_kmeans(patch_tokens, k=self.k_clusters, niter=self.niter)
 
-            with Timer("    ┌ クラスタごとのCLSトークン抽出処理時間"):
-                label_token_list: List[np.ndarray] = self.extractor.extract_cluster_tokens(patch_features, cluster_labels)
+        with Timer("    ┌ クラスタごとのCLSトークン抽出処理時間"):
+            label_token_list: List[np.ndarray] = self.extractor.extract_cluster_tokens(patch_features, cluster_labels)
 
-            for label_idx, label_features in enumerate(label_token_list):
-                # feature normalization
-                label_features: np.ndarray = label_features.reshape(1, -1)
-                label_norm: np.ndarray = np.linalg.norm(label_features, axis=-1, keepdims=True) + 1e-8
-                label_features: np.ndarray = label_features / label_norm
+        for label_idx, label_features in enumerate(label_token_list):
+            # feature normalization
+            label_features: np.ndarray = label_features.reshape(1, -1)
+            label_norm: np.ndarray = np.linalg.norm(label_features, axis=-1, keepdims=True) + 1e-8
+            label_features: np.ndarray = label_features / label_norm
 
-                # similarity / logits
-                logits = (100.0 * label_features @ self.fgbg_text_features.T)
+            # similarity / logits
+            logits = (100.0 * label_features @ self.fgbg_text_features.T)
 
-                # foreground / background を分離
-                fg_logits = logits[:, :fg_prompts_num]
-                bg_logits = logits[:, fg_prompts_num:]
+            # foreground / background を分離
+            fg_logits = logits[:, :fg_prompts_num]
+            bg_logits = logits[:, fg_prompts_num:]
 
-                # prompt数を補正したグループスコア
-                fg_score = self._logmeanexp(fg_logits, axis=-1)
-                bg_score = self._logmeanexp(bg_logits, axis=-1)
+            # prompt数を補正したグループスコア
+            fg_score = self._logmeanexp(fg_logits, axis=-1)
+            bg_score = self._logmeanexp(bg_logits, axis=-1)
 
-                # FG vs BG の2クラスsoftmax
-                group_logits = np.concatenate([fg_score[:, None], bg_score[:, None]], axis=-1)
-                group_probs = self._softmax(group_logits, axis=-1)
-                foreground_confidence = float(group_probs[0, 0])
+            # FG vs BG の2クラスsoftmax
+            group_logits = np.concatenate([fg_score[:, None], bg_score[:, None]], axis=-1)
+            group_probs = self._softmax(group_logits, axis=-1)
+            foreground_confidence = float(group_probs[0, 0])
 
-                # クラスタ内の全patchにconfidenceを付与
-                foreground_map[cluster_labels == label_idx] += foreground_confidence
+            # 前景か背景か
+            if foreground_confidence > self.foreground_threshold:
+                foreground_index = np.argmax(fg_logits, axis=1)
+                cluster_index_list += [foreground_index[0]]
+            else:
+                background_index = np.argmax(bg_logits, axis=1)
+                cluster_index_list += [fg_prompts_num + background_index[0]]
+                
+            # クラスタ内の全patchにconfidenceを付与
+            foreground_map[cluster_labels == label_idx] += foreground_confidence
 
         # KMeansの結果を平均
-        foreground_map /= len(self.k_clusters)
         foreground_map = foreground_map.reshape(self.feature_size, self.feature_size)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
 
         return (
             foreground_map,
             foreground_mask,
-            cluster_labels_list
+            cluster_labels, 
+            cluster_index_list
         )
 
     def _run_edgetam_refinement(
@@ -446,6 +452,21 @@ class SegmentationRunner:
 
         return resized_mask, current_mask_list, point_coords, point_labels
 
+    def semantic_segmentation(
+        self,
+        cluster_labels: np.ndarray,
+        cluster_index_list: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        cluster_indices = np.asarray(cluster_index_list)
+        semantic_indices = cluster_indices[cluster_labels]
+
+        semantic_list, semantic_labels = np.unique(
+            semantic_indices,
+            return_inverse=True,
+        )
+
+        return semantic_list, semantic_labels.reshape(self.feature_size, self.feature_size)
+
     def _save_results(
         self,
         save_dir: Path, 
@@ -459,7 +480,8 @@ class SegmentationRunner:
         foreback_image_list: List[np.ndarray],
         point_coords: List[List[float]],
         point_labels: List[int],
-        cluster_labels_list: List[np.ndarray]
+        cluster_labels: np.ndarray, 
+        semantic_labels: np.ndarray, 
     ) -> None:
         """処理結果の画像・マスク・オーバーレイの書き出し"""
         # マスク画像を保存
@@ -468,13 +490,20 @@ class SegmentationRunner:
             cv2.imwrite(str(save_dir / f"foreground_mask_n{i+1}.png"), mask_img)
 
         # レイヤー結合した特徴マップでのクラスタリング結果
-        for k_clusters, cluster_labels in zip(self.k_clusters, cluster_labels_list):
-            fused_cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
-            fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
-            fused_cluster_rgb = fused_cluster_rgb.resize(
-                (width, height), resample=Image.Resampling.NEAREST
-            )
-            fused_cluster_rgb.save(save_dir / f"layer_fused_k{k_clusters}.png")
+        fused_cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
+        fused_cluster_rgb = self.colorize_clusters_PIL(fused_cluster_labels_2d)
+        fused_cluster_rgb = fused_cluster_rgb.resize(
+            (width, height), resample=Image.Resampling.NEAREST
+        )
+        fused_cluster_rgb.save(save_dir / f"layer_fused_k{self.k_clusters}.png")
+
+        # セマンティックセグメンテーション処理
+        semantic_labels_2d = semantic_labels.reshape(self.feature_size, self.feature_size)
+        semantic_labels_rgb = self.colorize_clusters_PIL(semantic_labels_2d)
+        semantic_labels_rgb = semantic_labels_rgb.resize(
+            (width, height), resample=Image.Resampling.NEAREST
+        )
+        semantic_labels_rgb.save(save_dir / f"semantic_segmentation.png")
 
         # 前景度合いマップを保存
         foreground_map_2d = (
@@ -573,11 +602,15 @@ class SegmentationRunner:
 
         # CLIP + KMeans による初期前景マップの推定
         with Timer("粗い前景マスク取得処理時間"):
-            foreground_map, foreground_mask, cluster_labels_list = self._generate_foreground_map(patch_features, fused_patch_features)
+            foreground_map, foreground_mask, cluster_labels, cluster_index_list  = self._generate_foreground_map(patch_features, fused_patch_features)
+
+        # セマンティックセグメンテーションのラベルを取得
+        with Timer("セマンティックセグメンテーション処理時間"):
+            semantic_list, semantic_labels = self.semantic_segmentation(cluster_labels, cluster_index_list)
 
         # 前景と背景のポイントを抽出
         with Timer("ポイント抽出処理時間"):
-            foreground_points, background_points, foreback_image_list = self.select_prompt_points(foreground_mask)
+            foreground_points, background_points, foreback_image_list = self.select_prompt_points(foreground_mask, semantic_labels)
 
         # 前景が存在する場合は EdgeTAM による精緻化
         with Timer("詳細な前景マスク取得処理時間"):
@@ -611,5 +644,6 @@ class SegmentationRunner:
             foreback_image_list=foreback_image_list,
             point_coords=point_coords,
             point_labels=point_labels,
-            cluster_labels_list=cluster_labels_list
+            cluster_labels=cluster_labels,
+            semantic_labels=semantic_labels
         )

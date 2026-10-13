@@ -2,7 +2,7 @@
 image_size: 512
 
 # Kmeansのクラスタ数
-k_clusters: [8]
+k_clusters: 8
 
 # Kmeansのループ回数（多いほどクラスタは整う）
 n_iter: 10
