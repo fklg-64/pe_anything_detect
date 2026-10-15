@@ -20,7 +20,17 @@ ov_num_thread: 4
 device: "cpu"
 
 # INT8で量子化されたモデルを使用するか？
-use_int8: false
+et_use_int8: false
+pe_use_int8: true
+
+# EdgeTAMの高解像度特徴量のダウンサンプリング倍率（縦横それぞれ1/4）
+edgetam_high_res_feature_downscale_factor: 4
+
+# EdgeTAMに入力するポイント数
+# 前景：粗いセマンティックセグメンテーションのクラスごとに抽出する数
+edgetam_foreground_points_per_class: 8
+# 背景：粗い前景・背景マスクで背景と判定された領域から抽出する数
+edgetam_background_point_count: 8
 
 # 前景と判断するための自信度合い
 foreground_threshold: 0.5

@@ -3,3 +3,5 @@ outputs
 old
 .vscode
 __pycache__
+*.png
+*.jpg

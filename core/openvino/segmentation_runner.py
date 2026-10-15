@@ -15,6 +15,85 @@ from core.openvino.edgetam_runner import OVEdgeTamRunner
 from scipy.ndimage import distance_transform_edt
 from scipy.ndimage import convolve
 
+import numpy as np
+
+def farthest_point_sampling(points: np.ndarray, k: int) -> np.ndarray:
+    """
+    points: (M, 2) の座標配列。各行は (x, y)
+    k:      抽出する点の数
+
+    return: (k, 2) の座標配列
+    """
+    points = np.asarray(points)
+
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points must have shape (M, 2)")
+
+    m = len(points)
+
+    if not 0 <= k <= m:
+        raise ValueError("k must be between 0 and len(points)")
+
+    if k == 0:
+        return points[:0].copy()
+
+    if k == m:
+        return points.copy()
+
+    # 距離計算用
+    pts = points.astype(np.float64, copy=False)
+
+    # 最初は重心に最も近い点を選ぶ
+    center = pts.mean(axis=0)
+    first = np.argmin(np.sum((pts - center) ** 2, axis=1))
+
+    selected = np.empty(k, dtype=np.intp)
+    selected[0] = first
+
+    # 各点から、選択済みの点までの最小二乗距離
+    min_dist2 = np.sum((pts - pts[first]) ** 2, axis=1)
+    min_dist2[first] = -1
+
+    for i in range(1, k):
+        # 選択済みの点から最も遠い候補を選ぶ
+        idx = np.argmax(min_dist2)
+        selected[i] = idx
+
+        # 新しく選んだ点との距離で最小距離を更新
+        dist2 = np.sum((pts - pts[idx]) ** 2, axis=1)
+        min_dist2 = np.minimum(min_dist2, dist2)
+
+        # 重複選択を防ぐ
+        min_dist2[selected[:i + 1]] = -1
+
+    return points[selected]
+
+def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
+    """
+    mask: 2次元の二値マスク（0/1 または 0/255）
+    min_area: 除去する連結成分の最小面積（ピクセル数）
+
+    return: 0/1 の二値マスク
+    """
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+
+    # 小さな独立成分を除去
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+
+    cleaned = np.zeros_like(binary)
+
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            cleaned[labels == i] = 1
+
+    # 輪郭の細かなノイズを平滑化
+    cleaned = cv2.medianBlur(cleaned, 3)
+
+    return cleaned
+
 class SegmentationRunner:
     """抽出された特徴量・クラスタリングを用いた推論・マスク生成の実行クラス"""
 
@@ -41,9 +120,14 @@ class SegmentationRunner:
         self.foreground_threshold = config["foreground_threshold"]
         self.output_dir = config["output_dir"]
         self.color_palette = config["color_palette"]
+        self.et_fds = config["edgetam_high_res_feature_downscale_factor"]
+        self.fg_pt_per_cls = config["edgetam_foreground_points_per_class"]
+        self.bg_pt_cnt = config["edgetam_background_point_count"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
+        # edgetamの高解像度特徴量サイズ
+        self.et_high_res_feature_size: int = self.edgetam.target_size // self.et_fds
 
         # プロンプトとプロンプトのテキスト特徴量
         self.foreground_prompts: List[str] = []
@@ -136,8 +220,11 @@ class SegmentationRunner:
 
     def select_prompt_points(
         self,
+        image_raw: np.ndarray, 
         foreground_mask: np.ndarray, 
-        semantic_labels: np.ndarray
+        semantic_labels: np.ndarray, 
+        width: int,
+        height: int
     ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
         """粗い前景マスクからSAM用の前景・背景ポイントを抽出する。
 
@@ -145,83 +232,129 @@ class SegmentationRunner:
             foreground_points: 前景連結成分の重心 (N, 2)。座標は (x, y)。
             background_points: 各グリッドから選択した背景ポイント (M, 2)。
         """
-        # 1. 前景・背景マスクを二値化
-        foreground = (foreground_mask != 0).astype(np.float32)
-        background = 1.0 - foreground
+        # EdgeTAMの特徴量抽出
+        with Timer("    ┌ edgetam特徴量抽出"):
+            feats = self._predict_edgetam_encoder(image_raw)
 
-        # 2. 3x3近傍の前景・背景画素数を計算
+        if semantic_labels.shape != foreground_mask.shape:
+            raise ValueError(
+                f"Shape mismatch: semantic_labels={semantic_labels.shape}, "
+                f"foreground_mask={foreground_mask.shape}"
+            )
+
+
+        # 1. 前景と完全な背景を取得
+        foreground_binary = foreground_mask != 0
+        background_binary = ~foreground_binary
+
+        # 背景点はクラス間で共通の候補から1点選択
         kernel = np.ones((3, 3), dtype=np.float32)
+        background_map = convolve(background_binary.astype(np.uint8), kernel) / np.sum(kernel)
+        background_point = np.argwhere(background_map > 0.5)[:, ::-1]
+        background_point = farthest_point_sampling(background_point, self.bg_pt_cnt)
 
-        foreground_response = convolve(foreground, kernel)
-        background_response = convolve(background, kernel)
+        # 3. セマンティッククラスごとにマスクを精密化
+        semantic_ids = np.unique(semantic_labels[foreground_binary])
 
-        # 3. 3x3近傍がすべて前景の領域からポイントを抽出
-        foreground_interior = foreground_response >= 9
+        for semantic_id in semantic_ids:
+            # 対象クラスの粗いマスク
+            coarse_semantic_mask = ((semantic_labels == semantic_id) & foreground_binary).astype(np.uint8)
+            if not np.any(coarse_semantic_mask):
+                continue
 
-        for i in range(np.max(semantic_labels)):
-            semantic_mask = (semantic_labels == i) * foreground_interior
-            cv2.imwrite(f"{i}.png", (semantic_mask * 255).astype(np.uint8))
+            coarse_semantic_map = convolve(coarse_semantic_mask, kernel) / np.sum(kernel)
 
-        _, _, _, centroids = cv2.connectedComponentsWithStats(foreground_interior.astype(np.uint8) * 255, connectivity=8)
+            # 4. 粗いセマンティックマスクをロジットに変換
+            # 背景: -8、前景: +8
+            mask_logits = coarse_semantic_map * 16 - 8
 
-        # ラベル0は背景なので除外
-        foreground_points = centroids[1:].astype(np.float32)
+            # 5. マスクをedgetamの高解像度特徴量サイズにリサイズ
+            mask_input = cv2.resize(
+                mask_logits,
+                (self.et_high_res_feature_size, self.et_high_res_feature_size),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            # mask_inputに入力できる形状に変更
+            mask_input = mask_input[None, ...]
 
-        # 4. 背景ポイントをグリッドごとに抽出
-        background_interior = background_response >= 9
+            # 6. 正例点を対象セマンティック領域の内部から1点選択
+            foreground_point = np.argwhere(coarse_semantic_map > 0.5)[:, ::-1]
+            foreground_point = farthest_point_sampling(foreground_point, self.fg_pt_per_cls)
+            if foreground_point is None:
+                continue
 
-        grid_divisions = 8
-        mask_height, mask_width = foreground.shape
-        selected_points = []
+            # 正例
+            selected_points: List[List[float]] = foreground_point.tolist()
+            point_labels: List[int] = [1] * self.fg_pt_per_cls
+            # 負例
+            if background_point is not None:
+                selected_points += background_point.tolist()
+                point_labels += [0] * self.bg_pt_cnt
 
-        for row in range(grid_divisions):
-            y1 = row * mask_height // grid_divisions
-            y2 = (row + 1) * mask_height // grid_divisions
+            # 入力座標をEdgeTAM用の座標に変換
+            point_coords = self.transform_coords(
+                selected_points,
+                width,
+                height,
+                self.feature_size,
+            )
 
-            for col in range(grid_divisions):
-                x1 = col * mask_width // grid_divisions
-                x2 = (col + 1) * mask_width // grid_divisions
+            # 7. EdgeTAMによるマスク推定
+            for _ in range(5):
+                with Timer(f"    ┌ edgetam{semantic_id}回目マスク推定"):
+                    masks, scores, logits = self._predict_edgetam_decoder(
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                        feats=feats,
+                        height=height,
+                        width=width,
+                        mask_input=mask_input,
+                    )
 
-                cell = background_interior[y1:y2, x1:x2]
-
-                # セル内の半数を超える画素が背景内部の場合のみ選択
-                if cell.size == 0 or np.count_nonzero(cell) <= cell.size // 2:
+                if len(scores) == 0:
                     continue
 
-                # セル内の背景画素から中心に最も近い点を選択
-                bg_cell = background[y1:y2, x1:x2]
-                y_coords, x_coords = np.where(bg_cell == 1)
+                # 品質スコア最大の候補を採用
+                best_idx = int(np.argmax(scores))
 
-                if x_coords.size == 0:
-                    continue
+                current_mask = np.asarray(
+                    masks[best_idx]
+                ).squeeze().astype(np.uint8)
 
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
+                current_mask = clean_mask(current_mask, min_area=8)
 
-                distances = np.hypot(
-                    x_coords + x1 - center_x,
-                    y_coords + y1 - center_y,
+                mask_input = logits[best_idx:best_idx + 1]
+
+            # 8. デバッグ画像
+            if getattr(self, "debug", True):
+                cv2.imwrite(
+                    f"./tmp/f{semantic_id}.png",
+                    (coarse_semantic_mask * 255).astype(np.uint8),
                 )
 
-                idx = np.argmin(distances)
+                cv2.imwrite(
+                    f"./tmp/fm{semantic_id}.png",
+                    (coarse_semantic_map * 255).astype(np.uint8),
+                )
 
-                selected_points.append([
-                    x_coords[idx] + x1,
-                    y_coords[idx] + y1,
-                ])
+                cv2.imwrite(
+                    f"./tmp/b{semantic_id}.png",
+                    (background_binary * 255).astype(np.uint8) ,
+                )
 
-        background_points = np.asarray(
-            selected_points, dtype=np.float32
-        ).reshape(-1, 2)
+                cv2.imwrite(
+                    f"./tmp/bm{semantic_id}.png",
+                    (background_map * 255).astype(np.uint8) ,
+                )
 
-        # 5. デバッグ画像を保存
-        foreback_image_list: List[np.ndarray] = []
-        for idx, response in enumerate(
-            (foreground_response, background_response)
-        ):
-            response_norm = response / kernel.size
-            foreback_image_list += [response_norm]
+                cv2.imwrite(
+                    f"./tmp/segmentation{semantic_id}.png",
+                    (current_mask * 255).astype(np.uint8) ,
+                )
 
+        foreground_points = np.zeros((1,2))
+        background_points = np.zeros((1,2))
+        foreback_image_list = []
         return foreground_points, background_points, foreback_image_list
 
     def convert_coordinate(self, point: int, img_size: int, feat_size: int) -> float:
@@ -272,18 +405,20 @@ class SegmentationRunner:
             mask_logits=mask_logits_tensor,
         )
 
-        high_res_feats0, high_res_feats1, image_embed = feats
-        low_res_masks, iou_predictions = self.edgetam.decode(
-            high_res_feats0, high_res_feats1, image_embed,
-            point_coords=point_coords_norm,
-            point_labels=point_labels_norm,
-            mask_input=mask_input_tensor,
-            has_mask=has_mask,
-        )
+        with Timer("    ┌ デコード"):
+            high_res_feats0, high_res_feats1, image_embed = feats
+            low_res_masks, iou_predictions = self.edgetam.decode(
+                high_res_feats0, high_res_feats1, image_embed,
+                point_coords=point_coords_norm,
+                point_labels=point_labels_norm,
+                mask_input=mask_input_tensor,
+                has_mask=has_mask,
+            )
 
-        masks, scores, logits = self.edgetam.postprocess(
-            low_res_masks, iou_predictions, (height // 8, width // 8)
-        )
+        with Timer("    ┌ リサイズ"):
+            masks, scores, logits = self.edgetam.postprocess(
+                low_res_masks, iou_predictions, (height // 8, width // 8)
+            )
 
         return masks, scores, logits
 
@@ -610,7 +745,7 @@ class SegmentationRunner:
 
         # 前景と背景のポイントを抽出
         with Timer("ポイント抽出処理時間"):
-            foreground_points, background_points, foreback_image_list = self.select_prompt_points(foreground_mask, semantic_labels)
+            foreground_points, background_points, foreback_image_list = self.select_prompt_points(image_raw, foreground_mask, semantic_labels, width, height)
 
         # 前景が存在する場合は EdgeTAM による精緻化
         with Timer("詳細な前景マスク取得処理時間"):

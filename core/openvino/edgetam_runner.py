@@ -27,7 +27,7 @@ class OVEdgeTamHelper:
         # config関係
         self.target_size = config["image_size"]
         self.model_dir = config["model_dir"]
-        self.use_int8 = config["use_int8"]
+        self.use_int8 = config["et_use_int8"]
         self.device = config["device"].upper()
         self.num_threads = config["ov_num_thread"]
 
