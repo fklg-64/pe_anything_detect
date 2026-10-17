@@ -18,6 +18,67 @@ from scipy.ndimage import label as ndi_label
 
 import numpy as np
 
+# =============================================================================
+# 固定ハイパーパラメータ
+# yamlでは調整せずコードに固定している値を、すべてここにまとめる。
+# 値を変える場合はこのブロックだけを編集すること（他の箇所に数値を直書きしない）。
+# =============================================================================
+
+# --- CLIP（粗い前景・セマンティックの判定） ---
+# テキストとの類似度(cos)に掛ける係数（softmaxの温度の逆数）
+CLIP_LOGIT_SCALE = 100.0
+
+# --- KMeans ---
+KMEANS_SEED = 42
+FAISS_NUM_THREADS = 2
+
+# --- パッチ単位の幾何（粗い結果はCLIPのパッチ格子上にある） ---
+# 近傍の大きさ。「内側」「細い領域」の判定（この近傍で縮めて残るか）と、粗いマスクの平滑化に使う。
+# 3 = 1パッチ分の近傍。粗いマスクは縁・影で最大1パッチ太るという前提に基づく
+PATCH_NEIGHBORHOOD = 3
+PATCH_STRUCTURE = np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)
+# 背景の負例点を前景から離す距離（パッチ数）。縁・影の太り(1パッチ)を避けるため2
+BACKGROUND_POINT_MARGIN = 2
+# ノイズとして除去する領域の最小面積（パッチ面積に対する倍率）。1パッチ未満は粗いマスクの分解能以下
+MIN_REGION_PATCH_AREA = 1.0
+
+# --- EdgeTAMに渡す初期マスク（粗いマスクを事前確率として与える） ---
+# 初期マスクのロジット幅。確率 p のとき logit = (2p - 1) * PRIOR_LOGIT_RANGE （p=0.5が「不明」で0）
+PRIOR_LOGIT_RANGE = 8.0
+# core（物体内部）の外側にある粗いマスクに与える確率。0.5=前景とも背景とも言えない
+PRIOR_NON_CORE_PROBABILITY = 0.5
+# EdgeTAMのロジットがこの値を超えた画素を前景とする
+MASK_LOGIT_THRESHOLD = 0.0
+# EdgeTAMのデコーダ出力マスクを縮小する倍率（分母。高さ・幅を 1/N にする）
+EDGETAM_MASK_DOWNSCALE = 8
+
+# --- 重なり解決 ---
+# スコア = EdgeTAMの確信度 × ((1 - w) + w × 粗い前景らしさ) の w。0.5で両者を等しく扱う
+SCORE_PRIOR_WEIGHT = 0.5
+
+# --- ノイズ除去 ---
+# マスクの輪郭を平滑化するメディアンフィルタのカーネルサイズ
+MEDIAN_BLUR_KSIZE = 3
+
+# --- 可視化（結果の見た目のみ。セグメンテーション結果には影響しない） ---
+# セマンティック可視化の色 (RGB)。0番は背景で常にシアン
+SEMANTIC_COLORS = np.array([
+    [0, 255, 255],
+    [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+    [255, 0, 255], [255, 128, 0], [128, 0, 255], [255, 255, 255],
+    [128, 64, 0], [255, 128, 192], [0, 128, 0], [128, 128, 128],
+], dtype=np.uint8)
+# 前景オーバーレイ（粗い前景マスク・EdgeTAM最終マスク）の赤の不透明度
+FOREGROUND_OVERLAY_ALPHA = 0.3
+# 前景オーバーレイに描くプロンプト点の半径(px)と色(BGR)。正例=緑、負例=赤
+POINT_RADIUS = 20
+POINT_COLOR_POSITIVE = (0, 255, 0)
+POINT_COLOR_NEGATIVE = (0, 0, 255)
+# セマンティック結果（重畳 + 凡例）のmatplotlib図
+RESULT_FIGSIZE = (10, 6)
+RESULT_DPI = 150
+LEGEND_FONTSIZE = 9
+
 # 選択済みのポイントから最遠点を繰り返し抽出
 def farthest_point_sampling(points: np.ndarray, k: int) -> np.ndarray:
     """
@@ -91,17 +152,9 @@ def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
     cleaned = keep[labels].astype(np.uint8)
 
     # 輪郭の細かなノイズを平滑化
-    cleaned = cv2.medianBlur(cleaned, 3)
+    cleaned = cv2.medianBlur(cleaned, MEDIAN_BLUR_KSIZE)
 
     return cleaned
-
-# セマンティック可視化の色 (RGB)。0番は背景で常にシアン
-SEMANTIC_COLORS = np.array([
-    [0, 255, 255],
-    [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-    [255, 0, 255], [255, 128, 0], [128, 0, 255], [255, 255, 255],
-    [128, 64, 0], [255, 128, 192], [0, 128, 0], [128, 128, 128],
-], dtype=np.uint8)
 
 class SegmentationRunner:
     """抽出された特徴量・クラスタリングを用いた推論・マスク生成の実行クラス"""
@@ -215,9 +268,9 @@ class SegmentationRunner:
             if not features.flags["C_CONTIGUOUS"]
             else features
         )
-        faiss.omp_set_num_threads(2)
+        faiss.omp_set_num_threads(FAISS_NUM_THREADS)
         kmeans = faiss.Kmeans(
-            d=D, k=k, niter=niter, spherical=False, verbose=False, seed=42
+            d=D, k=k, niter=niter, spherical=False, verbose=False, seed=KMEANS_SEED
         )
         kmeans.train(features_contig)
         _, cluster_labels = kmeans.index.search(features_contig, 1)
@@ -231,11 +284,6 @@ class SegmentationRunner:
     # =========================================================================
     # 3. セマンティックセグメンテーションの精緻化 & 座標変換
     # =========================================================================
-
-    # 8近傍・3x3 の構造要素。パッチ単位の「内側」「幅」はすべてこれ（=1パッチ）を基準にする
-    _FULL3 = np.ones((3, 3), dtype=bool)
-    # 粗いマスクは縁・影で最大1パッチ太るため、背景の負例点は2パッチ以上離す
-    _BACKGROUND_MARGIN = 2
 
     @staticmethod
     def _sample_points(candidate: np.ndarray, k: int) -> np.ndarray:
@@ -271,7 +319,7 @@ class SegmentationRunner:
             region = comp == i
             edt = distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
             y, x = np.unravel_index(np.argmax(edt), edt.shape)
-            core = binary_erosion(region, structure=self._FULL3, border_value=1)
+            core = binary_erosion(region, structure=PATCH_STRUCTURE, border_value=1)
             result.append(((int(x), int(y)), core if core.any() else region, region))
         return result
 
@@ -350,9 +398,9 @@ class SegmentationRunner:
 
         for _, class_id, region in sorted(regions, key=lambda r: r[0]):
             region &= labels == class_id
-            if not region.any() or binary_erosion(region, structure=self._FULL3, border_value=1).any():
+            if not region.any() or binary_erosion(region, structure=PATCH_STRUCTURE, border_value=1).any():
                 continue
-            ring = binary_dilation(region, structure=self._FULL3) & ~region
+            ring = binary_dilation(region, structure=PATCH_STRUCTURE) & ~region
             neighbors = labels[ring & fg]
             neighbors = neighbors[neighbors != class_id]
             if neighbors.size:
@@ -372,7 +420,7 @@ class SegmentationRunner:
         if not outer.any():
             outer = background
         dist = distance_transform_edt(outer)
-        for margin in (self._BACKGROUND_MARGIN, 1):
+        for margin in (BACKGROUND_POINT_MARGIN, 1):
             candidate = outer & (dist >= margin)
             if candidate.any():
                 break
@@ -390,7 +438,7 @@ class SegmentationRunner:
     ) -> Tuple[Optional[np.ndarray], List[List[float]], List[int]]:
         """正例点と共通の負例点でEdgeTAMを反復実行し、低解像度ロジット(128x128)を返す。
 
-        prior_map: 初期マスク。ロジットは prior*16-8 とする（0.5=不明）。
+        prior_map: 初期マスクの前景確率。ロジットは (2p-1)*PRIOR_LOGIT_RANGE（0.5=不明）。
         """
         coords = self.transform_coords(foreground_points.tolist(), width, height, self.feature_size)
         labels = [1] * len(coords)
@@ -398,7 +446,7 @@ class SegmentationRunner:
         labels = labels + [0] * len(background_coords)
 
         mask_input = cv2.resize(
-            prior_map * 16 - 8,
+            (2.0 * prior_map - 1.0) * PRIOR_LOGIT_RANGE,
             (self.et_high_res_feature_size, self.et_high_res_feature_size),
             interpolation=cv2.INTER_LINEAR,
         )[None, ...]
@@ -458,7 +506,7 @@ class SegmentationRunner:
             return np.zeros((height, width), dtype=np.uint8), prompt_indices, point_coords, point_labels
 
         debug = getattr(self, "debug", False)
-        kernel = np.ones((3, 3), dtype=np.float32)
+        kernel = PATCH_STRUCTURE.astype(np.float32)
         size = (work_w, work_h)
 
         # EdgeTAMの特徴量抽出（全クラス共通）
@@ -471,7 +519,7 @@ class SegmentationRunner:
         )
 
         # 粗いマスクの信頼限界は1パッチ。1パッチ未満の領域はノイズとして扱う
-        min_area = max(1, work_w * work_h // (self.feature_size ** 2))
+        min_area = max(1, int(MIN_REGION_PATCH_AREA * work_w * work_h / self.feature_size ** 2))
         best_score = np.full((work_h, work_w), -1.0, dtype=np.float32)
 
         def to_full(patch_map: np.ndarray, interpolation: int) -> np.ndarray:
@@ -484,8 +532,8 @@ class SegmentationRunner:
                 core |= core_c
             coarse_map = convolve(coarse_mask.astype(np.uint8), kernel) / kernel.sum()
             core_map = convolve(core.astype(np.uint8), kernel) / kernel.sum()
-            # core内は前景(+8)、core外の粗いマスクは不明(0)、粗いマスク外は背景(-8)
-            prior_map = np.maximum(core_map, 0.5 * coarse_map)
+            # core内は前景、core外の粗いマスクは不明(PRIOR_NON_CORE_PROBABILITY)、粗いマスク外は背景
+            prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * coarse_map)
 
             fg_points = self._prompt_points(core, [c[0] for c in comps], self.fg_pt_per_cls)
             logit, coords, labels = self._estimate_class_logit(
@@ -498,13 +546,13 @@ class SegmentationRunner:
             if logit is None:
                 return coarse_full, to_full(coarse_map * foreground_map, cv2.INTER_LINEAR), core
             logit_full = cv2.resize(logit.astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
-            binary = clean_mask(logit_full > 0, min_area).astype(bool)
-            # 重なり解決用スコア = EdgeTAMの確信度 × 粗い前景らしさ（0.5は「どちらとも言えない」中立値）
+            binary = clean_mask(logit_full > MASK_LOGIT_THRESHOLD, min_area).astype(bool)
+            # 重なり解決用スコア = EdgeTAMの確信度 × ((1-w) + w × 粗い前景らしさ)
             confidence = 1.0 / (1.0 + np.exp(-logit.astype(np.float32)))
             prior_low = cv2.resize(
                 (coarse_map * foreground_map).astype(np.float32), confidence.shape[::-1], interpolation=cv2.INTER_LINEAR
             )
-            return binary, to_full(confidence * (0.5 + 0.5 * prior_low), cv2.INTER_LINEAR), core
+            return binary, to_full(confidence * ((1.0 - SCORE_PRIOR_WEIGHT) + SCORE_PRIOR_WEIGHT * prior_low), cv2.INTER_LINEAR), core
 
         class_components = {}
         for class_id, semantic_id in enumerate(semantic_ids, start=1):
@@ -600,11 +648,11 @@ class SegmentationRunner:
                   label=f"{i}: {name} ({ratios[i] * 100:.1f}%)")
             for i, name in enumerate(class_names)
         ]
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=RESULT_FIGSIZE)
         ax.imshow(overlay)
         ax.axis("off")
-        ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9)
-        fig.savefig(save_dir / "semantic_result.png", bbox_inches="tight", dpi=150)
+        ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=LEGEND_FONTSIZE)
+        fig.savefig(save_dir / "semantic_result.png", bbox_inches="tight", dpi=RESULT_DPI)
         if self.show_result:
             plt.show()
         plt.close(fig)
@@ -669,7 +717,7 @@ class SegmentationRunner:
 
         with Timer("    ┌ リサイズ"):
             masks, scores, logits = self.edgetam.postprocess(
-                low_res_masks, iou_predictions, (height // 8, width // 8)
+                low_res_masks, iou_predictions, (height // EDGETAM_MASK_DOWNSCALE, width // EDGETAM_MASK_DOWNSCALE)
             )
 
         return masks, scores, logits
@@ -692,7 +740,7 @@ class SegmentationRunner:
         image_features: np.ndarray
     ):
         # クラス分類
-        text_probs = 100.0 * image_features @ self.fgbg_text_features.T
+        text_probs = CLIP_LOGIT_SCALE * image_features @ self.fgbg_text_features.T
         text_probs = self._softmax(text_probs, axis=-1)
 
     def _logmeanexp(
@@ -734,7 +782,7 @@ class SegmentationRunner:
             label_features: np.ndarray = label_features / label_norm
 
             # similarity / logits
-            logits = (100.0 * label_features @ self.fgbg_text_features.T)
+            logits = (CLIP_LOGIT_SCALE * label_features @ self.fgbg_text_features.T)
 
             # foreground / background を分離
             fg_logits = logits[:, :fg_prompts_num]
@@ -928,15 +976,15 @@ class SegmentationRunner:
         mask_cv = np.array(mask_image)
         colored_mask = np.zeros_like(image_cv)
         colored_mask[:, :, 2] = mask_cv
-        overlay = cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0)
+        overlay = cv2.addWeighted(image_cv, 1.0 - FOREGROUND_OVERLAY_ALPHA, colored_mask, FOREGROUND_OVERLAY_ALPHA, 0)
         
         if np.sum(foreground_mask == 1) > 0:
             for point_label, point_coord in zip(point_labels, point_coords):
-                color = (0, 255, 0) if point_label == 1 else (0, 0, 255)
+                color = POINT_COLOR_POSITIVE if point_label == 1 else POINT_COLOR_NEGATIVE
                 cv2.circle(
                     overlay, 
                     (int(point_coord[0]), int(point_coord[1])), 
-                    20, color, -1
+                    POINT_RADIUS, color, -1
                 )
         cv2.imwrite(str(save_dir / "foreground_overlay.png"), overlay)
 
@@ -944,7 +992,7 @@ class SegmentationRunner:
         image_cv = cv2.cvtColor(np.array(image_raw), cv2.COLOR_RGB2BGR)
         colored_mask = np.zeros_like(image_cv)
         colored_mask[:, :, 2] = ((semantic_map > 0) * 255).astype(np.uint8)
-        overlay = cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0)
+        overlay = cv2.addWeighted(image_cv, 1.0 - FOREGROUND_OVERLAY_ALPHA, colored_mask, FOREGROUND_OVERLAY_ALPHA, 0)
         cv2.imwrite(str(save_dir / "foreground_overlay_edgetam.png"), overlay)
 
         print(f"Saving results to {save_dir}")
