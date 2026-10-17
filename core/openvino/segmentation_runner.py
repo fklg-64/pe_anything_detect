@@ -13,8 +13,8 @@ from core.utils import Timer, load_image, preprocess_image
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 
-from scipy.ndimage import distance_transform_edt
-from scipy.ndimage import convolve
+from scipy.ndimage import binary_dilation, binary_erosion, convolve, distance_transform_edt
+from scipy.ndimage import label as ndi_label
 
 import numpy as np
 
@@ -135,6 +135,12 @@ class SegmentationRunner:
         self.refine_iterations = config["edgetam_refine_iterations"]
         self.min_mask_area_ratio = config["min_mask_area_ratio"]
         self.semantic_max_side = config["semantic_max_side"]
+        self.prior_outer_weight = config["prior_outer_weight"]
+        self.coarse_cleanup = config["coarse_cleanup"]
+        self.coarse_hole_max_patches = config["coarse_hole_max_patches"]
+        self.coarse_min_region_patches = config["coarse_min_region_patches"]
+        self.coarse_isolated_min_patches = config["coarse_isolated_min_patches"]
+        self.background_point_margin = config["background_point_margin"]
         self.overlap_prior_floor = config["overlap_prior_floor"]
         self.overlay_alpha = config["overlay_alpha"]
         self.debug = config["debug"]
@@ -279,6 +285,104 @@ class SegmentationRunner:
             if neighbors.size:
                 semantic_map[y0:y1, x0:x1][hole] = np.bincount(neighbors).argmax()
 
+    def refine_coarse_segmentation(
+        self,
+        foreground_mask: np.ndarray,
+        semantic_labels: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """パッチ単位の粗い前景マスク・セマンティックラベルのノイズを整える。
+
+        1. 前景内部の小さな穴（反射・透明部など）を前景にし、最寄りの前景ラベルを与える。
+        2. 小さな領域を整理する。他クラスの前景に囲まれていればそのクラスへ統合し、
+           孤立した極小領域は背景へ戻す。
+        3. 幅の細いクラス領域（物体の縁・影が別クラスタになったもの）が他クラスの前景に
+           接していれば、最も長く接するクラスへ統合する。
+
+        Returns:
+            foreground_mask, semantic_labels: 整形後（入力は変更しない）。
+        """
+        original_fg = foreground_mask != 0
+        if not self.coarse_cleanup or not original_fg.any():
+            return foreground_mask, semantic_labels
+
+        fg = original_fg.copy()
+        labels = semantic_labels.copy()
+        full = np.ones((3, 3), dtype=bool)
+
+        # 1. 前景内部の小さな穴を埋める（画像端に接する背景は穴ではない）
+        n, comp = cv2.connectedComponents((~fg).astype(np.uint8), connectivity=4)
+        sizes = np.bincount(comp.ravel(), minlength=n)
+        border_ids = np.unique(np.concatenate([comp[0], comp[-1], comp[:, 0], comp[:, -1]]))
+        hole_ids = [i for i in range(1, n) if i not in border_ids and sizes[i] <= self.coarse_hole_max_patches]
+        holes = np.isin(comp, hole_ids)
+        if holes.any():
+            _, (iy, ix) = distance_transform_edt(~original_fg, return_indices=True)
+            labels[holes] = labels[iy, ix][holes]
+            fg |= holes
+
+        # 2. 小さな領域の整理
+        for class_id in np.unique(labels[fg]):
+            region = (fg & (labels == class_id)).astype(np.uint8)
+            n, comp, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=4)
+            for i in range(1, n):
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area >= self.coarse_min_region_patches:
+                    continue
+                island = comp == i
+                ring = binary_dilation(island, structure=full) & ~island
+                neighbors = labels[ring & fg]
+                neighbors = neighbors[neighbors != class_id]
+                if neighbors.size and neighbors.size * 2 >= ring.sum():
+                    # 周囲の半分以上が別クラスの前景: 孤立物体ではなくノイズ
+                    labels[island] = np.bincount(neighbors).argmax()
+                elif not neighbors.size and area < self.coarse_isolated_min_patches:
+                    # どの前景にも接しない極小領域は背景へ戻す
+                    fg[island] = False
+
+        # 背景へ戻したパッチには最寄りの背景ラベルを与える
+        removed = original_fg & ~fg
+        removed &= ~holes
+        if removed.any():
+            _, (iy, ix) = distance_transform_edt(fg, return_indices=True)
+            labels[removed] = labels[iy, ix][removed]
+
+        # 3. 幅の細い領域を、接している他クラスへ統合（小さい領域から順に）
+        thin_regions = []
+        for class_id in np.unique(labels[fg]):
+            region = (fg & (labels == class_id)).astype(np.uint8)
+            n, comp, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=4)
+            for i in range(1, n):
+                thin_regions.append((stats[i, cv2.CC_STAT_AREA], class_id, comp == i))
+        for _, class_id, region in sorted(thin_regions, key=lambda r: r[0]):
+            region = region & fg & (labels == class_id)
+            if not region.any() or binary_erosion(region, structure=full, border_value=1).any():
+                continue
+            ring = binary_dilation(region, structure=full) & ~region
+            neighbors = labels[ring & fg]
+            neighbors = neighbors[neighbors != class_id]
+            if neighbors.size:
+                labels[region] = np.bincount(neighbors).argmax()
+
+        return fg.astype(foreground_mask.dtype), labels
+
+    def _select_background_points(self, foreground_binary: np.ndarray) -> np.ndarray:
+        """画像端につながる背景のうち、前景から十分離れた位置から負例点を抽出する。
+
+        物体内部の穴や影・縁の近くに負例を置くと、物体が欠けるため避ける。
+        """
+        background = ~foreground_binary
+        labeled, _ = ndi_label(background)
+        border_ids = np.unique(np.concatenate([labeled[0], labeled[-1], labeled[:, 0], labeled[:, -1]]))
+        outer = np.isin(labeled, border_ids[border_ids > 0])
+        if not outer.any():
+            outer = background
+        dist = distance_transform_edt(outer)
+        for margin in (self.background_point_margin, 1):
+            candidate = outer & (dist >= margin)
+            if candidate.any():
+                break
+        return self._sample_points(candidate, self.bg_pt_cnt)
+
     def refine_semantic_segmentation(
         self,
         image_raw: np.ndarray,
@@ -322,16 +426,13 @@ class SegmentationRunner:
 
         # 背景の負例点は全クラス共通
         kernel = np.ones((3, 3), dtype=np.float32)
-        background_binary = ~foreground_binary
-        background_map = convolve(background_binary.astype(np.uint8), kernel) / np.sum(kernel)
-        background_points = self._sample_points(background_map > 0.5, self.bg_pt_cnt)
+        background_points = self._select_background_points(foreground_binary)
         background_coords = self.transform_coords(
             background_points.tolist(), width, height, self.feature_size
         )
 
         if debug:
-            self._save_debug_image("background_binary", background_binary, work_w, work_h)
-            self._save_debug_image("background_map", background_map, work_w, work_h)
+            self._save_debug_image("foreground_binary", foreground_binary, work_w, work_h)
 
         min_area = max(8, int(self.min_mask_area_ratio * work_h * work_w))
         best_score = np.full((work_h, work_w), -1.0, dtype=np.float32)
@@ -341,17 +442,22 @@ class SegmentationRunner:
             coarse_mask = ((semantic_labels == semantic_id) & foreground_binary).astype(np.uint8)
             coarse_map = convolve(coarse_mask, kernel) / np.sum(kernel)
 
-            # 粗いマスクをロジットに変換（背景: -8、前景: +8）し、EdgeTAMの高解像度特徴量サイズへ
+            # 物体の縁・影のパッチは信頼できないため、1パッチ内側(core)だけをプロンプトに使う
+            core = binary_erosion(coarse_mask.astype(bool), structure=np.ones((3, 3), dtype=bool), border_value=1)
+            if not core.any():
+                core = coarse_mask.astype(bool)
+            core_map = convolve(core.astype(np.uint8), kernel) / np.sum(kernel)
+            prior_map = np.maximum(core_map, self.prior_outer_weight * coarse_map)
+
+            # coreをロジットに変換（背景: -8、前景: +8）し、EdgeTAMの高解像度特徴量サイズへ
             mask_input = cv2.resize(
-                coarse_map * 16 - 8,
+                prior_map * 16 - 8,
                 (self.et_high_res_feature_size, self.et_high_res_feature_size),
                 interpolation=cv2.INTER_LINEAR,
             )[None, ...]
 
-            # 正例点は対象クラスの内部から抽出（薄いクラスは平滑化前のマスクで代用）
-            foreground_points = self._sample_points(coarse_map > 0.5, self.fg_pt_per_cls)
-            if len(foreground_points) == 0:
-                foreground_points = self._sample_points(coarse_mask > 0, self.fg_pt_per_cls)
+            # 正例点は対象クラスの内部(core)から抽出
+            foreground_points = self._sample_points(core, self.fg_pt_per_cls)
 
             class_coords = self.transform_coords(
                 foreground_points.tolist(), width, height, self.feature_size
@@ -413,7 +519,7 @@ class SegmentationRunner:
 
             if debug:
                 self._save_debug_image(f"c{class_id}_coarse_mask", coarse_mask, work_w, work_h)
-                self._save_debug_image(f"c{class_id}_coarse_map", coarse_map, work_w, work_h)
+                self._save_debug_image(f"c{class_id}_core", core, work_w, work_h)
                 self._save_debug_image(f"c{class_id}_prior", prior, work_w, work_h)
                 self._save_debug_image(f"c{class_id}_edgetam_mask", binary, work_w, work_h)
                 self._save_debug_image(f"c{class_id}_score", score_full, work_w, work_h)
@@ -751,6 +857,7 @@ class SegmentationRunner:
         point_labels: List[int],
         cluster_labels: np.ndarray, 
         semantic_labels: np.ndarray, 
+        raw_semantic_labels: np.ndarray,
     ) -> None:
         """処理結果の画像・マスク・オーバーレイの書き出し"""
         # 最終セマンティックセグメンテーション結果（重畳 + 凡例）
@@ -776,6 +883,12 @@ class SegmentationRunner:
             (width, height), resample=Image.Resampling.NEAREST
         )
         semantic_labels_rgb.save(save_dir / "coarse_semantic_segmentation.png")
+
+        # 整形前の粗いセマンティックセグメンテーション
+        raw_labels_rgb = self.colorize_clusters_PIL(raw_semantic_labels.reshape(self.feature_size, self.feature_size))
+        raw_labels_rgb.resize((width, height), resample=Image.Resampling.NEAREST).save(
+            save_dir / "coarse_semantic_segmentation_raw.png"
+        )
 
         # 前景度合いマップを保存
         foreground_map_2d = (
@@ -869,6 +982,11 @@ class SegmentationRunner:
         with Timer("セマンティックセグメンテーション処理時間"):
             labels_list, semantic_labels = self.semantic_segmentation(cluster_labels, cluster_index_list)
 
+        # パッチ単位の粗い結果を整形（穴埋め・小さな島の統合・境界パッチのラベル統一）
+        with Timer("粗いセグメンテーション整形処理時間"):
+            raw_semantic_labels = semantic_labels
+            foreground_mask, semantic_labels = self.refine_coarse_segmentation(foreground_mask, semantic_labels)
+
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             semantic_map, prompt_indices, point_coords, point_labels = self.refine_semantic_segmentation(
@@ -891,5 +1009,6 @@ class SegmentationRunner:
             point_coords=point_coords,
             point_labels=point_labels,
             cluster_labels=cluster_labels,
-            semantic_labels=semantic_labels
+            semantic_labels=semantic_labels,
+            raw_semantic_labels=raw_semantic_labels,
         )
