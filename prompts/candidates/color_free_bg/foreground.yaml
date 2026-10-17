@@ -30,7 +30,7 @@
         "a photo of a food item.",
         "a photo of a package.",
         "a photo of a label.",
-        "a photo of a fabric.",
+        # "a photo of a fabric.",  # タオル・カーペット等の背景が前景になるため無効化（zipperのIoUは0.96->0.92）
         "a photo of a tool.",
         "a photo of a coin.",
         "a photo of a plastic cup.",
