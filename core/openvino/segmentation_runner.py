@@ -743,18 +743,6 @@ class SegmentationRunner:
         text_probs = CLIP_LOGIT_SCALE * image_features @ self.fgbg_text_features.T
         text_probs = self._softmax(text_probs, axis=-1)
 
-    def _logmeanexp(
-        self,
-        x: np.ndarray,
-        axis: int = -1
-    ) -> np.ndarray:
-        """Numerically stable log-mean-exp."""
-        max_x = np.max(x, axis=axis, keepdims=True)
-        lse = max_x + np.log(
-            np.mean(np.exp(x - max_x), axis=axis, keepdims=True) + 1e-12
-        )
-        return np.squeeze(lse, axis=axis)
-
     def _generate_foreground_map(
         self,
         patch_features: np.ndarray,
@@ -788,9 +776,10 @@ class SegmentationRunner:
             fg_logits = logits[:, :fg_prompts_num]
             bg_logits = logits[:, fg_prompts_num:]
 
-            # prompt数を補正したグループスコア
-            fg_score = self._logmeanexp(fg_logits, axis=-1)
-            bg_score = self._logmeanexp(bg_logits, axis=-1)
+            # グループスコアは最も近いプロンプトの類似度。プロンプトは「言い換え」ではなく「選択肢」の
+            # 列挙なので、平均ではなく最大を使う（プロンプト数を増減しても判定が偏らない）
+            fg_score = np.max(fg_logits, axis=-1)
+            bg_score = np.max(bg_logits, axis=-1)
 
             # FG vs BG の2クラスsoftmax
             group_logits = np.concatenate([fg_score[:, None], bg_score[:, None]], axis=-1)
