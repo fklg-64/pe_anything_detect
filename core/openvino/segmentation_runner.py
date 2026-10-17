@@ -42,6 +42,10 @@ BACKGROUND_POINT_MARGIN = 2
 # ノイズとして除去する領域の最小面積（パッチ面積に対する倍率）。1パッチ未満は粗いマスクの分解能以下
 MIN_REGION_PATCH_AREA = 1.0
 
+# 前景クラスタに混ざる斑点を除くための、孤立成分の最小パッチ数。これ未満の孤立成分はクラスの推定に
+# 混ぜず、個別に範囲を制限して扱う（1〜2パッチの孤立成分は、物体より背景の斑点である場合が多い）
+MIN_ISOLATED_PATCHES = 3
+
 # --- EdgeTAMに渡す初期マスク（粗いマスクを事前確率として与える） ---
 # 初期マスクのロジット幅。確率 p のとき logit = (2p - 1) * PRIOR_LOGIT_RANGE （p=0.5が「不明」で0）
 PRIOR_LOGIT_RANGE = 8.0
@@ -559,7 +563,11 @@ class SegmentationRunner:
             coarse_mask = (semantic_labels == semantic_id) & foreground_binary
             comps = self._components(coarse_mask)
             class_components[class_id] = comps
-            binary, score, core = refine_region(coarse_mask, comps, f"クラス{class_id}")
+            # 孤立した極小成分（背景クラスタの斑点）はクラスの推定に混ぜない。混ぜると、斑点に置いた点を
+            # 経由して物体のマスクが周囲の背景へ広がる。斑点は後段で個別に（範囲を制限して）扱う
+            main = [c for c in comps if c[2].sum() >= MIN_ISOLATED_PATCHES] or comps
+            coarse_main = np.any([c[2] for c in main], axis=0)
+            binary, score, core = refine_region(coarse_main, main, f"クラス{class_id}")
 
             # 重なり部分はスコアの高いクラスを優先
             win = binary & (score > best_score)
@@ -580,6 +588,10 @@ class SegmentationRunner:
                 if semantic_map[py, px] != 0:
                     continue
                 binary, _, _ = refine_region(region, [(peak, core_c, region)], f"クラス{class_id}(再推定)")
+                if region.sum() < MIN_ISOLATED_PATCHES:
+                    # 極小成分は、成分を1パッチ広げた範囲までに制限する
+                    allowed = binary_dilation(region, structure=PATCH_STRUCTURE)
+                    binary &= to_full(allowed, cv2.INTER_NEAREST) > 0
                 semantic_map[binary & (semantic_map == 0)] = class_id
                 if debug:
                     self._save_debug_image(f"c{class_id}_rescue_{peak[0]}_{peak[1]}", binary, *size)

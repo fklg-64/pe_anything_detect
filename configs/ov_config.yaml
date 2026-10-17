@@ -11,7 +11,7 @@ n_iter: 10
 model_dir: "./weights/openvino_models"
 
 # プロンプトが保存されているディレクトリ
-prompts_dir: "./prompts"
+prompts_dir: "./prompts/candidates/color_free_bg"
 
 # OpenVINOの処理に使用するスレッド数
 ov_num_thread: 4

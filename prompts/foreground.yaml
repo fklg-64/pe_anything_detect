@@ -33,6 +33,8 @@
         "a photo of a fabric.",
         "a photo of a tool.",
         "a photo of a coin.",
+        "a photo of a plastic cup.",
+        "a photo of a foil lid.",
 
         # --- 旧プロンプト（無効化。比較用に残している） ---
         # "a photo of a fastener.",

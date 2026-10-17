@@ -20,6 +20,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -83,11 +84,15 @@ if __name__ == "__main__":
     parser.add_argument("--prompts-dir", default=None, help="foreground.yaml / background.yaml のあるディレクトリ")
     parser.add_argument("--mvtec", default="/home/llm/datasets/mvtec_anomaly_detection")
     parser.add_argument("--num", type=int, default=5, help="カテゴリごとの画像数")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="configの値を上書き（例: k_clusters=12）")
     args = parser.parse_args()
 
     config = load_config(args.config)
     if args.prompts_dir:
         config["prompts_dir"] = args.prompts_dir
+    for item in args.set:
+        key, value = item.split("=", 1)
+        config[key] = type(config[key])(yaml.safe_load(value))
     with contextlib.redirect_stdout(io.StringIO()):
         runner = SegmentationRunner(OVCLIPFeatureExtractor(config), OVEdgeTamRunner(config), config)
     print(f"fg={len(runner.foreground_prompts)}個, bg={len(runner.background_prompts)}個")
