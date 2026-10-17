@@ -210,6 +210,7 @@ class OVEdgeTamRunner(OVEdgeTamHelper):
             "INFERENCE_NUM_THREADS": str(self.num_threads),
             "PERFORMANCE_HINT": "LATENCY", 
             "ENABLE_CPU_PINNING": "YES", 
+            # "ENABLE_HYPER_THREADING": "NO",
             "NUM_STREAMS": "1",
         }
 

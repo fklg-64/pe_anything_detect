@@ -1,3 +1,4 @@
+import re
 import time
 import yaml
 from pathlib import Path
@@ -17,6 +18,7 @@ from scipy.ndimage import convolve
 
 import numpy as np
 
+# 選択済みのポイントから最遠点を繰り返し抽出
 def farthest_point_sampling(points: np.ndarray, k: int) -> np.ndarray:
     """
     points: (M, 2) の座標配列。各行は (x, y)
@@ -68,6 +70,7 @@ def farthest_point_sampling(points: np.ndarray, k: int) -> np.ndarray:
 
     return points[selected]
 
+# マスク画像からノイズを除去する関数
 def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
     """
     mask: 2次元の二値マスク（0/1 または 0/255）
@@ -82,17 +85,23 @@ def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
         binary, connectivity=8
     )
 
-    cleaned = np.zeros_like(binary)
-
-    for i in range(1, n):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            cleaned[labels == i] = 1
+    # 面積が足りる連結成分だけを残す（背景ラベル0は常に除外）
+    keep = stats[:, cv2.CC_STAT_AREA] >= min_area
+    keep[0] = False
+    cleaned = keep[labels].astype(np.uint8)
 
     # 輪郭の細かなノイズを平滑化
     cleaned = cv2.medianBlur(cleaned, 3)
 
     return cleaned
+
+# セマンティック可視化の色 (RGB)。0番は背景で常にシアン
+SEMANTIC_COLORS = np.array([
+    [0, 255, 255],
+    [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+    [255, 0, 255], [255, 128, 0], [128, 0, 255], [255, 255, 255],
+    [128, 64, 0], [255, 128, 192], [0, 128, 0], [128, 128, 128],
+], dtype=np.uint8)
 
 class SegmentationRunner:
     """抽出された特徴量・クラスタリングを用いた推論・マスク生成の実行クラス"""
@@ -123,6 +132,13 @@ class SegmentationRunner:
         self.et_fds = config["edgetam_high_res_feature_downscale_factor"]
         self.fg_pt_per_cls = config["edgetam_foreground_points_per_class"]
         self.bg_pt_cnt = config["edgetam_background_point_count"]
+        self.refine_iterations = config["edgetam_refine_iterations"]
+        self.min_mask_area_ratio = config["min_mask_area_ratio"]
+        self.semantic_max_side = config["semantic_max_side"]
+        self.overlap_prior_floor = config["overlap_prior_floor"]
+        self.overlay_alpha = config["overlay_alpha"]
+        self.debug = config["debug"]
+        self.show_result = config["show_result"]
 
         # 特徴マップのサイズ
         self.feature_size: int = self.extractor.feature_size
@@ -215,147 +231,266 @@ class SegmentationRunner:
         return color_map
 
     # =========================================================================
-    # 3. プロンプトポイント選出 & 座標変換 (ロジック不変)
+    # 3. セマンティックセグメンテーションの精緻化 & 座標変換
     # =========================================================================
 
-    def select_prompt_points(
+    @staticmethod
+    def _sample_points(candidate: np.ndarray, k: int) -> np.ndarray:
+        """True の画素から最遠点サンプリングで最大 k 点を抽出する。座標は (x, y)。"""
+        points = np.argwhere(candidate)[:, ::-1]
+        return farthest_point_sampling(points, min(k, len(points)))
+
+    def _save_debug_image(self, name: str, data: np.ndarray, width: int, height: int) -> None:
+        """デバッグ用の中間画像を save_dir/debug に元画像サイズで保存する。"""
+        debug_dir = self.save_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        image = np.clip(np.asarray(data, dtype=np.float32), 0.0, 1.0)
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
+        cv2.imwrite(str(debug_dir / f"{name}.png"), (image * 255).astype(np.uint8))
+
+    def _remove_small_regions(self, semantic_map: np.ndarray, min_area: int) -> None:
+        """セマンティックマップ上の小領域ノイズを除去する（in-place）。
+
+        1. クラスごとに小さな連結成分を背景へ戻す。
+        2. 背景に残った小さな穴を、周囲で最も多いクラスで埋める。
+        """
+        height, width = semantic_map.shape
+        for class_id in np.unique(semantic_map):
+            if class_id == 0:
+                continue
+            region = semantic_map == class_id
+            keep = clean_mask(region, min_area).astype(bool)
+            semantic_map[region & ~keep] = 0
+
+        n, comp, stats, _ = cv2.connectedComponentsWithStats(
+            (semantic_map == 0).astype(np.uint8), connectivity=8
+        )
+        ring_kernel = np.ones((3, 3), dtype=np.uint8)
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                continue
+            x, y, w, h = stats[i, :4]
+            x0, y0 = max(x - 1, 0), max(y - 1, 0)
+            x1, y1 = min(x + w + 1, width), min(y + h + 1, height)
+            hole = comp[y0:y1, x0:x1] == i
+            ring = cv2.dilate(hole.astype(np.uint8), ring_kernel).astype(bool) & ~hole
+            neighbors = semantic_map[y0:y1, x0:x1][ring]
+            neighbors = neighbors[neighbors > 0]
+            if neighbors.size:
+                semantic_map[y0:y1, x0:x1][hole] = np.bincount(neighbors).argmax()
+
+    def refine_semantic_segmentation(
         self,
-        image_raw: np.ndarray, 
-        foreground_mask: np.ndarray, 
-        semantic_labels: np.ndarray, 
+        image_raw: np.ndarray,
+        foreground_map: np.ndarray,
+        foreground_mask: np.ndarray,
+        semantic_labels: np.ndarray,
+        labels_list: np.ndarray,
         width: int,
-        height: int
-    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
-        """粗い前景マスクからSAM用の前景・背景ポイントを抽出する。
+        height: int,
+    ) -> Tuple[np.ndarray, List[int], List[List[float]], List[int]]:
+        """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
+
+        クラスごとにEdgeTAMで前景マスクを推定し、重なり部分は
+        「EdgeTAMの確信度 × 粗い前景らしさ(foreground_map)」が高いクラスを優先する。
+        背景は全クラス共通でクラス0とし、前景は1から振る。
 
         Returns:
-            foreground_points: 前景連結成分の重心 (N, 2)。座標は (x, y)。
-            background_points: 各グリッドから選択した背景ポイント (M, 2)。
+            semantic_map: (height, width) uint8。0=背景、1~=前景クラス。
+            prompt_indices: クラス1~に対応する、前景プロンプトのインデックス。
+            point_coords / point_labels: EdgeTAMに与えたプロンプト点（画像座標、全クラス分）。
         """
-        # EdgeTAMの特徴量抽出
+        foreground_binary = foreground_mask != 0
+        semantic_ids: np.ndarray = np.unique(semantic_labels[foreground_binary])
+        prompt_indices: List[int] = [int(labels_list[i]) for i in semantic_ids]
+
+        # マスク演算は長辺が semantic_max_side 以下の作業解像度で行い、最後に元画像サイズへ戻す
+        scale = min(1.0, self.semantic_max_side / max(width, height))
+        work_w, work_h = max(1, round(width * scale)), max(1, round(height * scale))
+
+        semantic_map = np.zeros((work_h, work_w), dtype=np.uint8)
+        point_coords: List[List[float]] = []
+        point_labels: List[int] = []
+        if len(semantic_ids) == 0:
+            return np.zeros((height, width), dtype=np.uint8), prompt_indices, point_coords, point_labels
+
+        debug = getattr(self, "debug", False)
+
+        # EdgeTAMの特徴量抽出（全クラス共通）
         with Timer("    ┌ edgetam特徴量抽出"):
             feats = self._predict_edgetam_encoder(image_raw)
 
-        if semantic_labels.shape != foreground_mask.shape:
-            raise ValueError(
-                f"Shape mismatch: semantic_labels={semantic_labels.shape}, "
-                f"foreground_mask={foreground_mask.shape}"
-            )
-
-
-        # 1. 前景と完全な背景を取得
-        foreground_binary = foreground_mask != 0
-        background_binary = ~foreground_binary
-
-        # 背景点はクラス間で共通の候補から1点選択
+        # 背景の負例点は全クラス共通
         kernel = np.ones((3, 3), dtype=np.float32)
+        background_binary = ~foreground_binary
         background_map = convolve(background_binary.astype(np.uint8), kernel) / np.sum(kernel)
-        background_point = np.argwhere(background_map > 0.5)[:, ::-1]
-        background_point = farthest_point_sampling(background_point, self.bg_pt_cnt)
+        background_points = self._sample_points(background_map > 0.5, self.bg_pt_cnt)
+        background_coords = self.transform_coords(
+            background_points.tolist(), width, height, self.feature_size
+        )
 
-        # 3. セマンティッククラスごとにマスクを精密化
-        semantic_ids = np.unique(semantic_labels[foreground_binary])
+        if debug:
+            self._save_debug_image("background_binary", background_binary, work_w, work_h)
+            self._save_debug_image("background_map", background_map, work_w, work_h)
 
-        for semantic_id in semantic_ids:
-            # 対象クラスの粗いマスク
-            coarse_semantic_mask = ((semantic_labels == semantic_id) & foreground_binary).astype(np.uint8)
-            if not np.any(coarse_semantic_mask):
-                continue
+        min_area = max(8, int(self.min_mask_area_ratio * work_h * work_w))
+        best_score = np.full((work_h, work_w), -1.0, dtype=np.float32)
 
-            coarse_semantic_map = convolve(coarse_semantic_mask, kernel) / np.sum(kernel)
+        for class_id, semantic_id in enumerate(semantic_ids, start=1):
+            # 対象クラスの粗いマスクとその平滑化マップ
+            coarse_mask = ((semantic_labels == semantic_id) & foreground_binary).astype(np.uint8)
+            coarse_map = convolve(coarse_mask, kernel) / np.sum(kernel)
 
-            # 4. 粗いセマンティックマスクをロジットに変換
-            # 背景: -8、前景: +8
-            mask_logits = coarse_semantic_map * 16 - 8
-
-            # 5. マスクをedgetamの高解像度特徴量サイズにリサイズ
+            # 粗いマスクをロジットに変換（背景: -8、前景: +8）し、EdgeTAMの高解像度特徴量サイズへ
             mask_input = cv2.resize(
-                mask_logits,
+                coarse_map * 16 - 8,
                 (self.et_high_res_feature_size, self.et_high_res_feature_size),
                 interpolation=cv2.INTER_LINEAR,
+            )[None, ...]
+
+            # 正例点は対象クラスの内部から抽出（薄いクラスは平滑化前のマスクで代用）
+            foreground_points = self._sample_points(coarse_map > 0.5, self.fg_pt_per_cls)
+            if len(foreground_points) == 0:
+                foreground_points = self._sample_points(coarse_mask > 0, self.fg_pt_per_cls)
+
+            class_coords = self.transform_coords(
+                foreground_points.tolist(), width, height, self.feature_size
             )
-            # mask_inputに入力できる形状に変更
-            mask_input = mask_input[None, ...]
+            class_labels = [1] * len(class_coords)
+            class_coords += background_coords
+            class_labels += [0] * len(background_coords)
+            point_coords += class_coords
+            point_labels += class_labels
 
-            # 6. 正例点を対象セマンティック領域の内部から1点選択
-            foreground_point = np.argwhere(coarse_semantic_map > 0.5)[:, ::-1]
-            foreground_point = farthest_point_sampling(foreground_point, self.fg_pt_per_cls)
-            if foreground_point is None:
-                continue
-
-            # 正例
-            selected_points: List[List[float]] = foreground_point.tolist()
-            point_labels: List[int] = [1] * self.fg_pt_per_cls
-            # 負例
-            if background_point is not None:
-                selected_points += background_point.tolist()
-                point_labels += [0] * self.bg_pt_cnt
-
-            # 入力座標をEdgeTAM用の座標に変換
-            point_coords = self.transform_coords(
-                selected_points,
-                width,
-                height,
-                self.feature_size,
-            )
-
-            # 7. EdgeTAMによるマスク推定
-            for _ in range(5):
-                with Timer(f"    ┌ edgetam{semantic_id}回目マスク推定"):
-                    masks, scores, logits = self._predict_edgetam_decoder(
-                        point_coords=point_coords,
-                        point_labels=point_labels,
+            # EdgeTAMによるマスク推定（前回のロジットを入力に反復して精緻化）
+            class_logit: Optional[np.ndarray] = None
+            for it in range(self.refine_iterations):
+                with Timer(f"    ┌ edgetam クラス{class_id} {it + 1}回目マスク推定"):
+                    _, scores, logits = self._predict_edgetam_decoder(
+                        point_coords=class_coords,
+                        point_labels=class_labels,
                         feats=feats,
                         height=height,
                         width=width,
                         mask_input=mask_input,
                     )
-
                 if len(scores) == 0:
-                    continue
-
-                # 品質スコア最大の候補を採用
+                    break
                 best_idx = int(np.argmax(scores))
-
-                current_mask = np.asarray(
-                    masks[best_idx]
-                ).squeeze().astype(np.uint8)
-
-                current_mask = clean_mask(current_mask, min_area=8)
-
                 mask_input = logits[best_idx:best_idx + 1]
+                class_logit = logits[best_idx]
 
-            # 8. デバッグ画像
-            if getattr(self, "debug", True):
-                cv2.imwrite(
-                    f"./tmp/f{semantic_id}.png",
-                    (coarse_semantic_mask * 255).astype(np.uint8),
+            # 精緻化マスクと、重なり解決用のスコア
+            # score = EdgeTAMの確信度 × (floor + (1-floor) × 粗い前景らしさ)
+            prior = coarse_map * foreground_map
+            coarse_full = cv2.resize(coarse_mask, (work_w, work_h), interpolation=cv2.INTER_NEAREST) > 0
+            if class_logit is None:
+                binary = coarse_full
+                score_low = prior
+            else:
+                logit_full = cv2.resize(
+                    class_logit.astype(np.float32), (work_w, work_h), interpolation=cv2.INTER_LINEAR
                 )
-
-                cv2.imwrite(
-                    f"./tmp/fm{semantic_id}.png",
-                    (coarse_semantic_map * 255).astype(np.uint8),
+                binary = clean_mask(logit_full > 0, min_area).astype(bool)
+                confidence = 1.0 / (1.0 + np.exp(-class_logit.astype(np.float32)))
+                prior_low = cv2.resize(
+                    prior, confidence.shape[::-1], interpolation=cv2.INTER_LINEAR
                 )
-
-                cv2.imwrite(
-                    f"./tmp/b{semantic_id}.png",
-                    (background_binary * 255).astype(np.uint8) ,
+                score_low = confidence * (
+                    self.overlap_prior_floor + (1.0 - self.overlap_prior_floor) * prior_low
                 )
+            if not binary.any():
+                # EdgeTAMのマスクが空なら粗いマスクで代用
+                binary = coarse_full
+            score_full = cv2.resize(
+                score_low.astype(np.float32), (work_w, work_h), interpolation=cv2.INTER_LINEAR
+            )
 
-                cv2.imwrite(
-                    f"./tmp/bm{semantic_id}.png",
-                    (background_map * 255).astype(np.uint8) ,
-                )
+            # 重なり部分はスコアの高いクラスを優先
+            win = binary & (score_full > best_score)
+            semantic_map[win] = class_id
+            best_score[win] = score_full[win]
 
-                cv2.imwrite(
-                    f"./tmp/segmentation{semantic_id}.png",
-                    (current_mask * 255).astype(np.uint8) ,
-                )
+            if debug:
+                self._save_debug_image(f"c{class_id}_coarse_mask", coarse_mask, work_w, work_h)
+                self._save_debug_image(f"c{class_id}_coarse_map", coarse_map, work_w, work_h)
+                self._save_debug_image(f"c{class_id}_prior", prior, work_w, work_h)
+                self._save_debug_image(f"c{class_id}_edgetam_mask", binary, work_w, work_h)
+                self._save_debug_image(f"c{class_id}_score", score_full, work_w, work_h)
 
-        foreground_points = np.zeros((1,2))
-        background_points = np.zeros((1,2))
-        foreback_image_list = []
-        return foreground_points, background_points, foreback_image_list
+        if debug:
+            self._save_debug_image(
+                "semantic_map_before_cleanup",
+                semantic_map / max(len(semantic_ids), 1), work_w, work_h,
+            )
+
+        # 重ね合わせ後のノイズ除去
+        self._remove_small_regions(semantic_map, min_area)
+
+        if (work_w, work_h) != (width, height):
+            semantic_map = cv2.resize(semantic_map, (width, height), interpolation=cv2.INTER_NEAREST)
+
+        return semantic_map, prompt_indices, point_coords, point_labels
+
+    @staticmethod
+    def _clean_prompt(prompt: str) -> str:
+        """"a photo of a " などの固有表現と末尾のピリオドを除いたクラス名にする。"""
+        return re.sub(r"^\s*a photo of (?:an?\s+)?", "", prompt, flags=re.IGNORECASE).rstrip(" .")
+
+    def semantic_class_names(self, prompt_indices: List[int]) -> List[str]:
+        """クラス0=background、クラス1~=前景プロンプト名のリストを返す。"""
+        all_prompts = self.foreground_prompts + self.background_prompts
+        return ["background"] + [self._clean_prompt(all_prompts[i]) for i in prompt_indices]
+
+    @staticmethod
+    def semantic_colors(num_classes: int) -> np.ndarray:
+        """クラス数分の色 (RGB, uint8)。足りなければ繰り返し、0番は常にシアン。"""
+        fg = SEMANTIC_COLORS[1:]
+        return np.vstack([SEMANTIC_COLORS[:1], fg[np.arange(num_classes - 1) % len(fg)]])[:num_classes]
+
+    def _save_semantic_result(
+        self,
+        save_dir: Path,
+        image_raw: np.ndarray,
+        semantic_map: np.ndarray,
+        class_names: List[str],
+    ) -> None:
+        """セマンティックマップの保存と、元画像への重畳＋凡例の表示。"""
+        colors = self.semantic_colors(len(class_names))
+        color_image = colors[semantic_map]
+
+        # クラスIDそのものを保存（パレット付きPNG）
+        index_image = Image.fromarray(semantic_map, mode="P")
+        index_image.putpalette(colors.flatten().tolist())
+        index_image.save(save_dir / "semantic_map.png")
+
+        # 元画像に色を重畳
+        overlay = cv2.addWeighted(
+            image_raw, 1.0 - self.overlay_alpha, color_image, self.overlay_alpha, 0
+        )
+        cv2.imwrite(str(save_dir / "semantic_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+        # 重畳画像 + 色とプロンプトの凡例
+        import matplotlib
+        if not self.show_result:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+
+        ratios = np.bincount(semantic_map.ravel(), minlength=len(class_names)) / semantic_map.size
+        handles = [
+            Patch(facecolor=colors[i] / 255.0, edgecolor="black",
+                  label=f"{i}: {name} ({ratios[i] * 100:.1f}%)")
+            for i, name in enumerate(class_names)
+        ]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.imshow(overlay)
+        ax.axis("off")
+        ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9)
+        fig.savefig(save_dir / "semantic_result.png", bbox_inches="tight", dpi=150)
+        if self.show_result:
+            plt.show()
+        plt.close(fig)
 
     def convert_coordinate(self, point: int, img_size: int, feat_size: int) -> float:
         return point * img_size / feat_size
@@ -595,12 +730,12 @@ class SegmentationRunner:
         cluster_indices = np.asarray(cluster_index_list)
         semantic_indices = cluster_indices[cluster_labels]
 
-        semantic_list, semantic_labels = np.unique(
+        labels_list, semantic_labels = np.unique(
             semantic_indices,
             return_inverse=True,
         )
 
-        return semantic_list, semantic_labels.reshape(self.feature_size, self.feature_size)
+        return labels_list, semantic_labels.reshape(self.feature_size, self.feature_size)
 
     def _save_results(
         self,
@@ -608,21 +743,23 @@ class SegmentationRunner:
         image_raw: Image.Image,
         width: int,
         height: int,
-        current_mask: np.ndarray,
-        current_mask_list: List[np.ndarray],
+        semantic_map: np.ndarray,
+        class_names: List[str],
         foreground_map: np.ndarray,
         foreground_mask: np.ndarray,
-        foreback_image_list: List[np.ndarray],
         point_coords: List[List[float]],
         point_labels: List[int],
         cluster_labels: np.ndarray, 
         semantic_labels: np.ndarray, 
     ) -> None:
         """処理結果の画像・マスク・オーバーレイの書き出し"""
-        # マスク画像を保存
-        for i, mask in enumerate(current_mask_list):
-            mask_img = (mask * 255).astype(np.uint8)
-            cv2.imwrite(str(save_dir / f"foreground_mask_n{i+1}.png"), mask_img)
+        # 最終セマンティックセグメンテーション結果（重畳 + 凡例）
+        self._save_semantic_result(save_dir, image_raw, semantic_map, class_names)
+
+        # クラスごとの最終マスクを保存
+        for class_id in range(1, len(class_names)):
+            mask_img = ((semantic_map == class_id) * 255).astype(np.uint8)
+            cv2.imwrite(str(save_dir / f"foreground_mask_n{class_id}.png"), mask_img)
 
         # レイヤー結合した特徴マップでのクラスタリング結果
         fused_cluster_labels_2d = cluster_labels.reshape(self.feature_size, self.feature_size)
@@ -638,7 +775,7 @@ class SegmentationRunner:
         semantic_labels_rgb = semantic_labels_rgb.resize(
             (width, height), resample=Image.Resampling.NEAREST
         )
-        semantic_labels_rgb.save(save_dir / f"semantic_segmentation.png")
+        semantic_labels_rgb.save(save_dir / "coarse_semantic_segmentation.png")
 
         # 前景度合いマップを保存
         foreground_map_2d = (
@@ -662,17 +799,6 @@ class SegmentationRunner:
         )
         mask_image.save(save_dir / "foreground_mask.png")
 
-        # 前景と背景っぽさを保存
-        for i, foreback_map in enumerate(foreback_image_list):
-            image = Image.fromarray(
-                (foreback_map * 255).astype(np.uint8)
-            )
-            image = image.resize(
-                (width, height),
-                resample=Image.Resampling.NEAREST,
-            )
-            image.save(self.save_dir / f"foreback_map{i}.png")
-
         # オーバーレイ画像保存 (CLIP前景プロンプト点付き)
         image_cv = cv2.cvtColor(np.array(image_raw), cv2.COLOR_RGB2BGR)
         mask_cv = np.array(mask_image)
@@ -693,7 +819,7 @@ class SegmentationRunner:
         # オーバーレイ画像（EdgeTAM 最終マスク版）
         image_cv = cv2.cvtColor(np.array(image_raw), cv2.COLOR_RGB2BGR)
         colored_mask = np.zeros_like(image_cv)
-        colored_mask[:, :, 2] = (current_mask * 255).astype(np.uint8)
+        colored_mask[:, :, 2] = ((semantic_map > 0) * 255).astype(np.uint8)
         overlay = cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0)
         cv2.imwrite(str(save_dir / "foreground_overlay_edgetam.png"), overlay)
 
@@ -741,27 +867,13 @@ class SegmentationRunner:
 
         # セマンティックセグメンテーションのラベルを取得
         with Timer("セマンティックセグメンテーション処理時間"):
-            semantic_list, semantic_labels = self.semantic_segmentation(cluster_labels, cluster_index_list)
+            labels_list, semantic_labels = self.semantic_segmentation(cluster_labels, cluster_index_list)
 
-        # 前景と背景のポイントを抽出
-        with Timer("ポイント抽出処理時間"):
-            foreground_points, background_points, foreback_image_list = self.select_prompt_points(image_raw, foreground_mask, semantic_labels, width, height)
-
-        # 前景が存在する場合は EdgeTAM による精緻化
-        with Timer("詳細な前景マスク取得処理時間"):
-            point_coords: List[List[float]] = []
-            point_labels: List[int] = []
-            if np.sum(foreground_mask == 1) > 0:
-                current_mask, current_mask_list, point_coords, point_labels = self._run_edgetam_refinement(
-                    foreground_points=foreground_points,
-                    background_points=background_points,
-                    image_raw=image_raw,
-                    width=width,
-                    height=height
-                )
-            else:
-                current_mask = np.zeros((height, width), dtype=np.uint8)
-                current_mask_list = []
+        # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
+        with Timer("詳細セマンティックセグメンテーション処理時間"):
+            semantic_map, prompt_indices, point_coords, point_labels = self.refine_semantic_segmentation(
+                image_raw, foreground_map, foreground_mask, semantic_labels, labels_list, width, height
+            )
 
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time * 1000:.2f} ms")
@@ -772,11 +884,10 @@ class SegmentationRunner:
             image_raw=image_raw,
             width=width,
             height=height,
-            current_mask=current_mask,
-            current_mask_list=current_mask_list,
+            semantic_map=semantic_map,
+            class_names=self.semantic_class_names(prompt_indices),
             foreground_map=foreground_map,
             foreground_mask=foreground_mask,
-            foreback_image_list=foreback_image_list,
             point_coords=point_coords,
             point_labels=point_labels,
             cluster_labels=cluster_labels,

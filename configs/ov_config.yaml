@@ -21,7 +21,7 @@ device: "cpu"
 
 # INT8で量子化されたモデルを使用するか？
 et_use_int8: false
-pe_use_int8: true
+pe_use_int8: false
 
 # EdgeTAMの高解像度特徴量のダウンサンプリング倍率（縦横それぞれ1/4）
 edgetam_high_res_feature_downscale_factor: 4
@@ -31,6 +31,27 @@ edgetam_high_res_feature_downscale_factor: 4
 edgetam_foreground_points_per_class: 8
 # 背景：粗い前景・背景マスクで背景と判定された領域から抽出する数
 edgetam_background_point_count: 8
+
+# EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
+edgetam_refine_iterations: 3
+
+# セマンティックマップのマスク演算（重なり解決・ノイズ除去）を行う作業解像度の長辺上限（出力は元画像サイズ）
+semantic_max_side: 1024
+
+# 除去する連結成分の最小面積（画像面積に対する比率）
+min_mask_area_ratio: 0.0005
+
+# 前景マスクの重なり解決: 粗い前景らしさの重み下限（1に近いほどEdgeTAMの確信度のみで決める）
+overlap_prior_floor: 0.5
+
+# 元画像に重畳するセマンティックカラーの不透明度
+overlay_alpha: 0.5
+
+# デバッグ中間画像を output_dir/<画像名>/debug に保存するか？
+debug: false
+
+# セマンティックセグメンテーション結果をmatplotlibのウィンドウで表示するか？（Falseでもpngは保存）
+show_result: false
 
 # 前景と判断するための自信度合い
 foreground_threshold: 0.5
