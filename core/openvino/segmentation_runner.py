@@ -133,15 +133,7 @@ class SegmentationRunner:
         self.fg_pt_per_cls = config["edgetam_foreground_points_per_class"]
         self.bg_pt_cnt = config["edgetam_background_point_count"]
         self.refine_iterations = config["edgetam_refine_iterations"]
-        self.min_mask_area_ratio = config["min_mask_area_ratio"]
         self.semantic_max_side = config["semantic_max_side"]
-        self.prior_outer_weight = config["prior_outer_weight"]
-        self.coarse_cleanup = config["coarse_cleanup"]
-        self.coarse_hole_max_patches = config["coarse_hole_max_patches"]
-        self.coarse_min_region_patches = config["coarse_min_region_patches"]
-        self.coarse_isolated_min_patches = config["coarse_isolated_min_patches"]
-        self.background_point_margin = config["background_point_margin"]
-        self.overlap_prior_floor = config["overlap_prior_floor"]
         self.overlay_alpha = config["overlay_alpha"]
         self.debug = config["debug"]
         self.show_result = config["show_result"]
@@ -240,11 +232,48 @@ class SegmentationRunner:
     # 3. セマンティックセグメンテーションの精緻化 & 座標変換
     # =========================================================================
 
+    # 8近傍・3x3 の構造要素。パッチ単位の「内側」「幅」はすべてこれ（=1パッチ）を基準にする
+    _FULL3 = np.ones((3, 3), dtype=bool)
+    # 粗いマスクは縁・影で最大1パッチ太るため、背景の負例点は2パッチ以上離す
+    _BACKGROUND_MARGIN = 2
+
     @staticmethod
     def _sample_points(candidate: np.ndarray, k: int) -> np.ndarray:
         """True の画素から最遠点サンプリングで最大 k 点を抽出する。座標は (x, y)。"""
         points = np.argwhere(candidate)[:, ::-1]
         return farthest_point_sampling(points, min(k, len(points)))
+
+    @staticmethod
+    def _prompt_points(core: np.ndarray, peaks: List[Tuple[int, int]], k: int) -> np.ndarray:
+        """正例点を返す。各連結成分の最内点(peaks)を必ず含め、残りは core 上の最遠点で k 点まで補う。
+
+        最内点を必ず含めることで、細い物体や小さい物体にも漏れなく点が置かれる。
+        """
+        selected = [np.asarray(p, dtype=np.float64) for p in peaks]
+        points = np.argwhere(core)[:, ::-1].astype(np.float64)
+        if len(points) and len(selected) < k:
+            min_d2 = np.min(((points[:, None, :] - np.asarray(selected)[None]) ** 2).sum(-1), axis=1)
+            while len(selected) < k and min_d2.max() > 0:
+                idx = int(np.argmax(min_d2))
+                selected.append(points[idx])
+                min_d2 = np.minimum(min_d2, ((points - points[idx]) ** 2).sum(-1))
+        return np.asarray(selected).reshape(-1, 2).astype(int)
+
+    def _components(self, mask: np.ndarray) -> List[Tuple[Tuple[int, int], np.ndarray, np.ndarray]]:
+        """マスクの連結成分ごとに (最内点(x, y), core, 成分マスク) を返す。
+
+        最内点は距離変換の最大点。core は成分を1パッチ内側へ縮めたもので、
+        縮めると消える細い成分では成分そのものを core とする。
+        """
+        n, comp = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+        result = []
+        for i in range(1, n):
+            region = comp == i
+            edt = distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
+            y, x = np.unravel_index(np.argmax(edt), edt.shape)
+            core = binary_erosion(region, structure=self._FULL3, border_value=1)
+            result.append(((int(x), int(y)), core if core.any() else region, region))
+        return result
 
     def _save_debug_image(self, name: str, data: np.ndarray, width: int, height: int) -> None:
         """デバッグ用の中間画像を save_dir/debug に元画像サイズで保存する。"""
@@ -286,78 +315,44 @@ class SegmentationRunner:
                 semantic_map[y0:y1, x0:x1][hole] = np.bincount(neighbors).argmax()
 
     def refine_coarse_segmentation(
-        self,
-        foreground_mask: np.ndarray,
-        semantic_labels: np.ndarray,
+        self, semantic_labels: np.ndarray, foreground_mask: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """パッチ単位の粗い前景マスク・セマンティックラベルのノイズを整える。
+        """パッチ単位の粗い結果を整える。返り値は (前景マスク, セマンティックラベル)。
 
-        1. 前景内部の小さな穴（反射・透明部など）を前景にし、最寄りの前景ラベルを与える。
-        2. 小さな領域を整理する。他クラスの前景に囲まれていればそのクラスへ統合し、
-           孤立した極小領域は背景へ戻す。
-        3. 幅の細いクラス領域（物体の縁・影が別クラスタになったもの）が他クラスの前景に
-           接していれば、最も長く接するクラスへ統合する。
+        前景に囲まれた背景（反射・透明部などの穴）は前景とし、最寄りの前景ラベルを与える。
+        最終的な形はEdgeTAMが決めるため、穴埋めは粗いマスクを物体単位でつなぐ目的に限る。
 
-        Returns:
-            foreground_mask, semantic_labels: 整形後（入力は変更しない）。
+        続いて、縁・影由来の細いクラス領域を取り除く。
+
+        物体の縁や影のパッチは背景と物体のトークンが混ざり、別クラスタ（別プロンプト）になりやすい。
+        幅が2パッチ以下（3x3で縮めると消える）のクラス領域が他クラスの前景に接していれば、
+        最も長く接するクラスへ統合する。小さい領域から順に処理する。
         """
         original_fg = foreground_mask != 0
-        if not self.coarse_cleanup or not original_fg.any():
-            return foreground_mask, semantic_labels
-
         fg = original_fg.copy()
         labels = semantic_labels.copy()
-        full = np.ones((3, 3), dtype=bool)
 
-        # 1. 前景内部の小さな穴を埋める（画像端に接する背景は穴ではない）
+        # 画像端に接しない背景の連結成分 = 穴
         n, comp = cv2.connectedComponents((~fg).astype(np.uint8), connectivity=4)
-        sizes = np.bincount(comp.ravel(), minlength=n)
         border_ids = np.unique(np.concatenate([comp[0], comp[-1], comp[:, 0], comp[:, -1]]))
-        hole_ids = [i for i in range(1, n) if i not in border_ids and sizes[i] <= self.coarse_hole_max_patches]
-        holes = np.isin(comp, hole_ids)
-        if holes.any():
+        holes = (comp > 0) & ~np.isin(comp, border_ids)
+        if holes.any() and original_fg.any():
             _, (iy, ix) = distance_transform_edt(~original_fg, return_indices=True)
             labels[holes] = labels[iy, ix][holes]
             fg |= holes
 
-        # 2. 小さな領域の整理
+        regions = []
         for class_id in np.unique(labels[fg]):
-            region = (fg & (labels == class_id)).astype(np.uint8)
-            n, comp, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=4)
-            for i in range(1, n):
-                area = stats[i, cv2.CC_STAT_AREA]
-                if area >= self.coarse_min_region_patches:
-                    continue
-                island = comp == i
-                ring = binary_dilation(island, structure=full) & ~island
-                neighbors = labels[ring & fg]
-                neighbors = neighbors[neighbors != class_id]
-                if neighbors.size and neighbors.size * 2 >= ring.sum():
-                    # 周囲の半分以上が別クラスの前景: 孤立物体ではなくノイズ
-                    labels[island] = np.bincount(neighbors).argmax()
-                elif not neighbors.size and area < self.coarse_isolated_min_patches:
-                    # どの前景にも接しない極小領域は背景へ戻す
-                    fg[island] = False
+            n, comp, stats, _ = cv2.connectedComponentsWithStats(
+                (fg & (labels == class_id)).astype(np.uint8), connectivity=4
+            )
+            regions += [(stats[i, cv2.CC_STAT_AREA], class_id, comp == i) for i in range(1, n)]
 
-        # 背景へ戻したパッチには最寄りの背景ラベルを与える
-        removed = original_fg & ~fg
-        removed &= ~holes
-        if removed.any():
-            _, (iy, ix) = distance_transform_edt(fg, return_indices=True)
-            labels[removed] = labels[iy, ix][removed]
-
-        # 3. 幅の細い領域を、接している他クラスへ統合（小さい領域から順に）
-        thin_regions = []
-        for class_id in np.unique(labels[fg]):
-            region = (fg & (labels == class_id)).astype(np.uint8)
-            n, comp, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=4)
-            for i in range(1, n):
-                thin_regions.append((stats[i, cv2.CC_STAT_AREA], class_id, comp == i))
-        for _, class_id, region in sorted(thin_regions, key=lambda r: r[0]):
-            region = region & fg & (labels == class_id)
-            if not region.any() or binary_erosion(region, structure=full, border_value=1).any():
+        for _, class_id, region in sorted(regions, key=lambda r: r[0]):
+            region &= labels == class_id
+            if not region.any() or binary_erosion(region, structure=self._FULL3, border_value=1).any():
                 continue
-            ring = binary_dilation(region, structure=full) & ~region
+            ring = binary_dilation(region, structure=self._FULL3) & ~region
             neighbors = labels[ring & fg]
             neighbors = neighbors[neighbors != class_id]
             if neighbors.size:
@@ -377,11 +372,54 @@ class SegmentationRunner:
         if not outer.any():
             outer = background
         dist = distance_transform_edt(outer)
-        for margin in (self.background_point_margin, 1):
+        for margin in (self._BACKGROUND_MARGIN, 1):
             candidate = outer & (dist >= margin)
             if candidate.any():
                 break
         return self._sample_points(candidate, self.bg_pt_cnt)
+
+    def _estimate_class_logit(
+        self,
+        feats: Tuple,
+        prior_map: np.ndarray,
+        foreground_points: np.ndarray,
+        background_coords: List[List[float]],
+        width: int,
+        height: int,
+        tag: str,
+    ) -> Tuple[Optional[np.ndarray], List[List[float]], List[int]]:
+        """正例点と共通の負例点でEdgeTAMを反復実行し、低解像度ロジット(128x128)を返す。
+
+        prior_map: 初期マスク。ロジットは prior*16-8 とする（0.5=不明）。
+        """
+        coords = self.transform_coords(foreground_points.tolist(), width, height, self.feature_size)
+        labels = [1] * len(coords)
+        coords = coords + background_coords
+        labels = labels + [0] * len(background_coords)
+
+        mask_input = cv2.resize(
+            prior_map * 16 - 8,
+            (self.et_high_res_feature_size, self.et_high_res_feature_size),
+            interpolation=cv2.INTER_LINEAR,
+        )[None, ...]
+
+        logit: Optional[np.ndarray] = None
+        for it in range(self.refine_iterations):
+            with Timer(f"    ┌ edgetam {tag} {it + 1}回目マスク推定"):
+                _, scores, logits = self._predict_edgetam_decoder(
+                    point_coords=coords,
+                    point_labels=labels,
+                    feats=feats,
+                    height=height,
+                    width=width,
+                    mask_input=mask_input,
+                )
+            if len(scores) == 0:
+                break
+            best_idx = int(np.argmax(scores))
+            mask_input = logits[best_idx:best_idx + 1]
+            logit = logits[best_idx]
+        return logit, coords, labels
 
     def refine_semantic_segmentation(
         self,
@@ -398,6 +436,7 @@ class SegmentationRunner:
         クラスごとにEdgeTAMで前景マスクを推定し、重なり部分は
         「EdgeTAMの確信度 × 粗い前景らしさ(foreground_map)」が高いクラスを優先する。
         背景は全クラス共通でクラス0とし、前景は1から振る。
+        どのクラスのマスクにも入らなかった粗い連結成分は、その成分だけで再推定する。
 
         Returns:
             semantic_map: (height, width) uint8。0=背景、1~=前景クラス。
@@ -419,115 +458,87 @@ class SegmentationRunner:
             return np.zeros((height, width), dtype=np.uint8), prompt_indices, point_coords, point_labels
 
         debug = getattr(self, "debug", False)
+        kernel = np.ones((3, 3), dtype=np.float32)
+        size = (work_w, work_h)
 
         # EdgeTAMの特徴量抽出（全クラス共通）
         with Timer("    ┌ edgetam特徴量抽出"):
             feats = self._predict_edgetam_encoder(image_raw)
 
         # 背景の負例点は全クラス共通
-        kernel = np.ones((3, 3), dtype=np.float32)
-        background_points = self._select_background_points(foreground_binary)
         background_coords = self.transform_coords(
-            background_points.tolist(), width, height, self.feature_size
+            self._select_background_points(foreground_binary).tolist(), width, height, self.feature_size
         )
 
-        if debug:
-            self._save_debug_image("foreground_binary", foreground_binary, work_w, work_h)
-
-        min_area = max(8, int(self.min_mask_area_ratio * work_h * work_w))
+        # 粗いマスクの信頼限界は1パッチ。1パッチ未満の領域はノイズとして扱う
+        min_area = max(1, work_w * work_h // (self.feature_size ** 2))
         best_score = np.full((work_h, work_w), -1.0, dtype=np.float32)
 
+        def to_full(patch_map: np.ndarray, interpolation: int) -> np.ndarray:
+            return cv2.resize(patch_map.astype(np.float32), size, interpolation=interpolation)
+
+        def refine_region(coarse_mask, comps, tag):
+            """粗いマスクに対するEdgeTAMの2値マスク(作業解像度)と、重なり解決用スコアを返す。"""
+            core = np.zeros_like(coarse_mask, dtype=bool)
+            for _, core_c, _ in comps:
+                core |= core_c
+            coarse_map = convolve(coarse_mask.astype(np.uint8), kernel) / kernel.sum()
+            core_map = convolve(core.astype(np.uint8), kernel) / kernel.sum()
+            # core内は前景(+8)、core外の粗いマスクは不明(0)、粗いマスク外は背景(-8)
+            prior_map = np.maximum(core_map, 0.5 * coarse_map)
+
+            fg_points = self._prompt_points(core, [c[0] for c in comps], self.fg_pt_per_cls)
+            logit, coords, labels = self._estimate_class_logit(
+                feats, prior_map, fg_points, background_coords, width, height, tag
+            )
+            point_coords.extend(coords)
+            point_labels.extend(labels)
+
+            coarse_full = to_full(coarse_mask, cv2.INTER_NEAREST) > 0
+            if logit is None:
+                return coarse_full, to_full(coarse_map * foreground_map, cv2.INTER_LINEAR), core
+            logit_full = cv2.resize(logit.astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
+            binary = clean_mask(logit_full > 0, min_area).astype(bool)
+            # 重なり解決用スコア = EdgeTAMの確信度 × 粗い前景らしさ（0.5は「どちらとも言えない」中立値）
+            confidence = 1.0 / (1.0 + np.exp(-logit.astype(np.float32)))
+            prior_low = cv2.resize(
+                (coarse_map * foreground_map).astype(np.float32), confidence.shape[::-1], interpolation=cv2.INTER_LINEAR
+            )
+            return binary, to_full(confidence * (0.5 + 0.5 * prior_low), cv2.INTER_LINEAR), core
+
+        class_components = {}
         for class_id, semantic_id in enumerate(semantic_ids, start=1):
-            # 対象クラスの粗いマスクとその平滑化マップ
-            coarse_mask = ((semantic_labels == semantic_id) & foreground_binary).astype(np.uint8)
-            coarse_map = convolve(coarse_mask, kernel) / np.sum(kernel)
-
-            # 物体の縁・影のパッチは信頼できないため、1パッチ内側(core)だけをプロンプトに使う
-            core = binary_erosion(coarse_mask.astype(bool), structure=np.ones((3, 3), dtype=bool), border_value=1)
-            if not core.any():
-                core = coarse_mask.astype(bool)
-            core_map = convolve(core.astype(np.uint8), kernel) / np.sum(kernel)
-            prior_map = np.maximum(core_map, self.prior_outer_weight * coarse_map)
-
-            # coreをロジットに変換（背景: -8、前景: +8）し、EdgeTAMの高解像度特徴量サイズへ
-            mask_input = cv2.resize(
-                prior_map * 16 - 8,
-                (self.et_high_res_feature_size, self.et_high_res_feature_size),
-                interpolation=cv2.INTER_LINEAR,
-            )[None, ...]
-
-            # 正例点は対象クラスの内部(core)から抽出
-            foreground_points = self._sample_points(core, self.fg_pt_per_cls)
-
-            class_coords = self.transform_coords(
-                foreground_points.tolist(), width, height, self.feature_size
-            )
-            class_labels = [1] * len(class_coords)
-            class_coords += background_coords
-            class_labels += [0] * len(background_coords)
-            point_coords += class_coords
-            point_labels += class_labels
-
-            # EdgeTAMによるマスク推定（前回のロジットを入力に反復して精緻化）
-            class_logit: Optional[np.ndarray] = None
-            for it in range(self.refine_iterations):
-                with Timer(f"    ┌ edgetam クラス{class_id} {it + 1}回目マスク推定"):
-                    _, scores, logits = self._predict_edgetam_decoder(
-                        point_coords=class_coords,
-                        point_labels=class_labels,
-                        feats=feats,
-                        height=height,
-                        width=width,
-                        mask_input=mask_input,
-                    )
-                if len(scores) == 0:
-                    break
-                best_idx = int(np.argmax(scores))
-                mask_input = logits[best_idx:best_idx + 1]
-                class_logit = logits[best_idx]
-
-            # 精緻化マスクと、重なり解決用のスコア
-            # score = EdgeTAMの確信度 × (floor + (1-floor) × 粗い前景らしさ)
-            prior = coarse_map * foreground_map
-            coarse_full = cv2.resize(coarse_mask, (work_w, work_h), interpolation=cv2.INTER_NEAREST) > 0
-            if class_logit is None:
-                binary = coarse_full
-                score_low = prior
-            else:
-                logit_full = cv2.resize(
-                    class_logit.astype(np.float32), (work_w, work_h), interpolation=cv2.INTER_LINEAR
-                )
-                binary = clean_mask(logit_full > 0, min_area).astype(bool)
-                confidence = 1.0 / (1.0 + np.exp(-class_logit.astype(np.float32)))
-                prior_low = cv2.resize(
-                    prior, confidence.shape[::-1], interpolation=cv2.INTER_LINEAR
-                )
-                score_low = confidence * (
-                    self.overlap_prior_floor + (1.0 - self.overlap_prior_floor) * prior_low
-                )
-            if not binary.any():
-                # EdgeTAMのマスクが空なら粗いマスクで代用
-                binary = coarse_full
-            score_full = cv2.resize(
-                score_low.astype(np.float32), (work_w, work_h), interpolation=cv2.INTER_LINEAR
-            )
+            coarse_mask = (semantic_labels == semantic_id) & foreground_binary
+            comps = self._components(coarse_mask)
+            class_components[class_id] = comps
+            binary, score, core = refine_region(coarse_mask, comps, f"クラス{class_id}")
 
             # 重なり部分はスコアの高いクラスを優先
-            win = binary & (score_full > best_score)
+            win = binary & (score > best_score)
             semantic_map[win] = class_id
-            best_score[win] = score_full[win]
+            best_score[win] = score[win]
 
             if debug:
-                self._save_debug_image(f"c{class_id}_coarse_mask", coarse_mask, work_w, work_h)
-                self._save_debug_image(f"c{class_id}_core", core, work_w, work_h)
-                self._save_debug_image(f"c{class_id}_prior", prior, work_w, work_h)
-                self._save_debug_image(f"c{class_id}_edgetam_mask", binary, work_w, work_h)
-                self._save_debug_image(f"c{class_id}_score", score_full, work_w, work_h)
+                self._save_debug_image(f"c{class_id}_coarse_mask", coarse_mask, *size)
+                self._save_debug_image(f"c{class_id}_core", core, *size)
+                self._save_debug_image(f"c{class_id}_edgetam_mask", binary, *size)
+                self._save_debug_image(f"c{class_id}_score", score, *size)
+
+        # 取りこぼし防止: 最内点がどのクラスにも覆われていない粗い連結成分は、単独で再推定する
+        for class_id, comps in class_components.items():
+            for peak, core_c, region in comps:
+                px = min(int((peak[0] + 0.5) * work_w / self.feature_size), work_w - 1)
+                py = min(int((peak[1] + 0.5) * work_h / self.feature_size), work_h - 1)
+                if semantic_map[py, px] != 0:
+                    continue
+                binary, _, _ = refine_region(region, [(peak, core_c, region)], f"クラス{class_id}(再推定)")
+                semantic_map[binary & (semantic_map == 0)] = class_id
+                if debug:
+                    self._save_debug_image(f"c{class_id}_rescue_{peak[0]}_{peak[1]}", binary, *size)
 
         if debug:
             self._save_debug_image(
-                "semantic_map_before_cleanup",
-                semantic_map / max(len(semantic_ids), 1), work_w, work_h,
+                "semantic_map_before_cleanup", semantic_map / max(len(semantic_ids), 1), *size
             )
 
         # 重ね合わせ後のノイズ除去
@@ -985,7 +996,7 @@ class SegmentationRunner:
         # パッチ単位の粗い結果を整形（穴埋め・小さな島の統合・境界パッチのラベル統一）
         with Timer("粗いセグメンテーション整形処理時間"):
             raw_semantic_labels = semantic_labels
-            foreground_mask, semantic_labels = self.refine_coarse_segmentation(foreground_mask, semantic_labels)
+            foreground_mask, semantic_labels = self.refine_coarse_segmentation(semantic_labels, foreground_mask)
 
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
