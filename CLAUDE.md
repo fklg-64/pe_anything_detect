@@ -16,6 +16,8 @@ python develop.py            # OpenVINO 版の実行（本命・最新）
 python test_pytorch.py       # PyTorch 版の実行（動作確認用。最新の処理と同期しているとは限らない）
 python prompts/create_prompts.py  # prompts/semantic.json を生成
 python tools/eval_prompts.py [--prompts-dir DIR]  # MVTec(fg_mask)でプロンプトを評価（前景IoU・クラスの割れやすさ）
+python tools/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
+python tools/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
 - 実行対象画像は `develop.py` / `test_pytorch.py` 内の `image_paths` リストを直接編集する（CLI 引数なし）。
