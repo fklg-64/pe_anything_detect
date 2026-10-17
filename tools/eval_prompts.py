@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
 from core.openvino.segmentation_runner import SegmentationRunner
-from core.utils import load_config, load_image, preprocess_image
+from core.utils import load_config, load_image
 
 # fg_mask が全面前景になるテクスチャ系カテゴリは対象外
 OBJECT_CATEGORIES = [
@@ -37,19 +37,11 @@ OBJECT_CATEGORIES = [
 
 
 def segment(runner: SegmentationRunner, image_path: str):
-    """SegmentationRunner.run と同じ処理（保存なし）。(semantic_map, prompt_indices) を返す。"""
+    """SegmentationRunner.segment の結果（保存なし）。(semantic_map, prompt_indices) を返す。"""
     image = load_image(image_path)
-    height, width = image.shape[:2]
     with contextlib.redirect_stdout(io.StringIO()):  # Timerの出力を抑える
-        tensor = preprocess_image(image, runner.extractor.target_size, runner.extractor.mean, runner.extractor.std)
-        _, patch, fused = runner._feature_extraction(tensor)
-        fg_map, fg_mask, clusters, cluster_index = runner._generate_foreground_map(patch, fused)
-        labels_list, labels = runner.semantic_segmentation(clusters, cluster_index)
-        fg_mask, labels = runner.refine_coarse_segmentation(labels, fg_mask)
-        semantic_map, prompt_indices, _, _ = runner.refine_semantic_segmentation(
-            image, fg_map, fg_mask, labels, labels_list, width, height
-        )
-    return semantic_map, prompt_indices
+        result = runner.segment(image)
+    return result.semantic_map, result.prompt_indices
 
 
 def evaluate(runner, mvtec: Path, indices):

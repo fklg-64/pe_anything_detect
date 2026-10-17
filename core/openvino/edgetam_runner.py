@@ -166,18 +166,21 @@ class OVEdgeTamHelper:
         self,
         low_res_masks: np.ndarray,
         iou_predictions: np.ndarray, 
-        orig_hw: Tuple[int, int]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います (NumPy版)。"""
-        # マスクを元画像の解像度にリサイズ
-        masks = self.postprocess_masks(low_res_masks, orig_hw)
+        orig_hw: Tuple[int, int],
+        need_masks: bool = True,
+    ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
+        """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います (NumPy版)。
+
+        need_masks=False のときは、リサイズ・二値化を省いて masks に None を返します（logits だけ使う呼び出し用）。
+        """
+        masks: Optional[np.ndarray] = None
+        if need_masks:
+            # マスクを元画像の解像度にリサイズ
+            masks = self.postprocess_masks(low_res_masks, orig_hw)
+            masks = masks > self.mask_threshold
+            # 不要なバッチ次元を削除して float 型へキャスト
+            masks = np.squeeze(masks, axis=0).astype(np.float32)
         low_res_masks = np.clip(low_res_masks, -32.0, 32.0)
-
-        # masks = low_res_masks > self.mask_threshold
-        masks = masks > self.mask_threshold
-
-        # 不要なバッチ次元を削除して float 型へキャスト
-        masks = np.squeeze(masks, axis=0).astype(np.float32)
         iou_predictions = np.squeeze(iou_predictions, axis=0).astype(np.float32)
         low_res_masks = np.squeeze(low_res_masks, axis=0)
 

@@ -71,6 +71,10 @@ class OVCLIPFeatureExtractor:
         tokenizer_path = model_dir / f"pe_tokenizer.xml"
 
         visual_model = core.read_model(visual_path)
+        # 未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す
+        for result in visual_model.get_results():
+            if result.output(0).get_names() & {"cls2patch_attention"}:
+                visual_model.remove_result(result)
         text_model = core.read_model(text_path)
         patch_logits_model = core.read_model(patch_logits_path)
         tokenizer_model = core.read_model(tokenizer_path)
@@ -93,13 +97,12 @@ class OVCLIPFeatureExtractor:
 
     def extract_image_features(self, image_tensor: np.ndarray, normalize=True):
         outs = self.compiled_visual_model([image_tensor])
-        raw_image_features = outs[self.compiled_visual_model.output(0)]
+        raw_image_features = outs[self.compiled_visual_model.output("raw_image_features")]
         if normalize:
             raw_image_features = raw_image_features / np.linalg.norm(raw_image_features, axis=-1, keepdims=True)
-        raw_patch_features = outs[self.compiled_visual_model.output(1)]
-        cls2patch_attention = outs[self.compiled_visual_model.output(2)]
-        fused_patch_features = outs[self.compiled_visual_model.output(3)]
-        return raw_image_features, raw_patch_features, cls2patch_attention, fused_patch_features
+        raw_patch_features = outs[self.compiled_visual_model.output("raw_patch_features")]
+        fused_patch_features = outs[self.compiled_visual_model.output("fused_layer_features")]
+        return raw_image_features, raw_patch_features, fused_patch_features
 
     def extract_text_features(self, prompts: List[str], normalize=True):
         tokenizer_outputs = self.compiled_tokenizer(prompts)

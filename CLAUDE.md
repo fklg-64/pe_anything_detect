@@ -29,22 +29,29 @@ python tools/eval_synthetic.py --data DIR  # 合成データでIoU・有無・�
 
 `core/torch/` と `core/openvino/` が並行する同名構造（`feature_extractor`, `edgetam_runner`, `segmentation_runner`）。**開発の主軸は `core/openvino/`**。`core/torch/` は変換元モデルの定義も兼ねる（`convert_openvino.py` が `DecodeModel`, `RepVitModel`, `TorchCLIPFeatureExtractor` 等を import して変換）。`core/torch/sam2/` は SAM2/EdgeTAM のベンダリングコード。
 
-パイプライン（`core/openvino/segmentation_runner.py` の `SegmentationRunner.run`）:
+`core/openvino/` の構成:
 
-1. `preprocess_image` → `OVCLIPFeatureExtractor`（CLIP 画像特徴: 画像全体・パッチ・fused パッチ）
-2. 画像分類（`_image_classification`）
-3. `_generate_foreground_map`: テキストプロンプト（`prompts/foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る
-4. `semantic_segmentation`: クラスタ代表トークンを `prompts/semantic.json` のカテゴリ語彙と照合してセマンティックラベルを付与
-5. `select_prompt_points`: 前景（クラスごと `edgetam_foreground_points_per_class` 点）/ 背景（`edgetam_background_point_count` 点）を `farthest_point_sampling` 等で抽出
-6. `_run_edgetam_refinement`: ポイントを EdgeTAM の encoder/decoder（`OVEdgeTamRunner`）に渡し精緻化
-7. `_save_results` が `output_dir/<画像名>/` に可視化を保存
+- `segmentation_runner.py`: `SegmentationRunner`。`segment(image)`（保存なしのパイプライン、`SegmentationResult` を返す）と `run(path)`（読み込み・`segment`・保存）。
+- `coarse_segmentation.py`: `CoarseSegmenter`。CLIP 特徴量・テキストプロンプトとの照合・faiss KMeans による粗い前景/セマンティック推定と、パッチ単位の整形。
+- `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM（`OVEdgeTamRunner`）でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
+- `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分・ノイズ除去などの純粋関数。
+- `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
+- `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。
 
-注意: 現在 `run()` 内の EdgeTAM 精緻化は `and False` で無効化されている（セマンティックセグメンテーション実装中の WIP）。変更時は意図的なものか確認すること。
+パイプライン（`SegmentationRunner.segment`）:
 
-`core/utils.py` に共通ヘルパー（`Timer` コンテキストマネージャー、`load_image`, `preprocess_image`, `load_config`）。各処理は `with Timer(...)` で ms 計測する流儀。
+1. `resize_image` + `normalize_image`（リサイズは CLIP と EdgeTAM で共通、正規化はモデルごと）
+2. `CoarseSegmenter.extract_features`: CLIP 画像特徴（パッチ・fused パッチ）
+3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る
+4. `assign_semantic_labels`: クラスタに対応するプロンプトで粗いセマンティックラベルを付与
+5. `refine_coarse_segmentation`: 穴埋め・細い領域の統合
+6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点）/ 背景（`edgetam_background_point_count` 点）のプロンプト点で EdgeTAM の encoder/decoder を反復し、クラスを統合
+7. `run()` では `ResultSaver` が `output_dir/<画像名>/` に可視化を保存
+
+`core/utils.py` に共通ヘルパー（`Timer` コンテキストマネージャー、`load_image`, `resize_image`, `normalize_image`, `preprocess_image`, `load_config`）。各処理は `with Timer(...)` で ms 計測する流儀。
 
 ## 補足
 
-- 座標系: 入力画像 → CLIP パッチ特徴マップ（`image_size`/patch）→ EdgeTAM の座標の変換は `SegmentationRunner.transform_coords` / `OVEdgeTamHelper.transform_coords` を使う。
+- 座標系: 入力画像 → CLIP パッチ特徴マップ（`image_size`/patch）→ EdgeTAM の座標の変換は `SemanticRefiner.transform_coords` / `OVEdgeTamHelper.transform_coords` を使う。
 - INT8 モデルは `et_use_int8` / `pe_use_int8` で切替（EdgeTAM / PE それぞれ）。
 - データセットのパス（`/home/llm/datasets/...`）は環境固有でリポジトリには含まれない。
