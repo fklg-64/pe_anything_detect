@@ -1,6 +1,6 @@
 """マスク・座標・点サンプリングの純粋なヘルパー関数（状態を持たない）。"""
 
-from typing import List, Tuple
+from typing import Optional, List, Tuple
 
 import cv2
 import numpy as np
@@ -100,10 +100,15 @@ def prompt_points(core: np.ndarray, peaks: List[Tuple[int, int]], k: int) -> np.
     return np.asarray(selected).reshape(-1, 2).astype(int)
 
 
-def select_background_points(foreground_binary: np.ndarray, count: int) -> np.ndarray:
+def select_background_points(
+    foreground_binary: np.ndarray, count: int, foreground_map: Optional[np.ndarray] = None
+) -> np.ndarray:
     """画像端につながる背景のうち、前景から十分離れた位置から負例点を count 点抽出する。
 
     物体内部の穴や影・縁の近くに負例を置くと、物体が欠けるため避ける。
+    foreground_map を渡すと、背景と判定された中でも前景確信度が最も低い（背景だと最も確信できる）
+    パッチから選ぶ。確信の弱い「背景」は、実際は物体（例: 濃い布）のことがあり、そこに負例を置くと
+    物体を打ち消してしまうため。
     """
     background = ~foreground_binary
     labeled, _ = ndi_label(background)
@@ -116,6 +121,13 @@ def select_background_points(foreground_binary: np.ndarray, count: int) -> np.nd
         candidate = outer & (dist >= margin)
         if candidate.any():
             break
+    if foreground_map is not None:
+        # 確信度の低い（値の小さい）パッチから count 個以上そろうところまでを候補にする
+        for level in np.unique(foreground_map[candidate]):
+            confident = candidate & (foreground_map <= level)
+            if confident.sum() >= count:
+                candidate = confident
+                break
     return sample_points(candidate, count)
 
 

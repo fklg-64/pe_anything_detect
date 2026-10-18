@@ -111,7 +111,7 @@ class SemanticRefiner:
 
         # 背景の負例点は全クラス共通
         background_coords = self.transform_coords(
-            select_background_points(foreground_binary, self.bg_pt_cnt).tolist(), width, height
+            select_background_points(foreground_binary, self.bg_pt_cnt, foreground_map).tolist(), width, height
         )
 
         ctx = RefineContext(
