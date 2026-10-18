@@ -36,6 +36,9 @@
         "a photo of a plastic cup.",
         "a photo of a foil lid.",
 
+        # 実験用
+        "a photo of a animal."
+
         # --- 旧プロンプト（無効化。比較用に残している） ---
         # "a photo of a fastener.",
         # "a photo of a screw.",
