@@ -1,6 +1,6 @@
-from core.torch.feature_extractor import TorchCLIPFeatureExtractor
-from core.torch.edgetam_runner import EdgeTamRunner
-from core.torch.segmentation_runner import SegmentationRunner
+from core.torch.feature_extractor import TorchCLIPBackend
+from core.torch.edgetam_runner import TorchEdgeTamBackend
+from core.common.segmentation_runner import SegmentationRunner
 from core.utils import load_config
 
 if __name__ == "__main__":
@@ -28,10 +28,10 @@ if __name__ == "__main__":
     config = load_config("./configs/torch_config.yaml")
     
     # 特徴量抽出モデル
-    extractor = TorchCLIPFeatureExtractor(config)
+    extractor = TorchCLIPBackend(config)
 
     # プロンプトセグメンテーションモデル
-    edgetam = EdgeTamRunner(config)
+    edgetam = TorchEdgeTamBackend(config)
 
     # セグメンテーション実行処理インスタンス
     runner = SegmentationRunner(extractor, edgetam, config)

@@ -39,7 +39,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
-from core.openvino.segmentation_runner import SegmentationRunner
+from core.common.segmentation_runner import SegmentationRunner
 from core.utils import load_config, load_image
 
 # fg_mask が全面前景になるテクスチャ系カテゴリは対象外

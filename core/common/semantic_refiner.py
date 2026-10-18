@@ -2,15 +2,16 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 from scipy.ndimage import binary_dilation
 
 from core.utils import Timer, normalize_image
-from core.openvino.edgetam_runner import OVEdgeTamRunner
-from core.openvino.mask_utils import (
+from core.common.backend import EdgeTamBackend
+from core.common.edgetam_helper import EdgeTamHelper
+from core.common.mask_utils import (
     Component,
     clean_mask,
     connected_components,
@@ -20,7 +21,7 @@ from core.openvino.mask_utils import (
     resize_map,
     select_background_points,
 )
-from core.openvino.params import (
+from core.common.params import (
     EDGETAM_MASK_DOWNSCALE,
     MASK_LOGIT_THRESHOLD,
     MIN_ISOLATED_PATCHES,
@@ -30,7 +31,7 @@ from core.openvino.params import (
     PRIOR_NON_CORE_PROBABILITY,
     SCORE_PRIOR_WEIGHT,
 )
-from core.openvino.visualization import save_debug_image
+from core.common.visualization import save_debug_image
 
 
 @dataclass
@@ -54,7 +55,7 @@ class RefineContext:
 
 
 class SemanticRefiner:
-    def __init__(self, edgetam: OVEdgeTamRunner, feature_size: int, config: dict):
+    def __init__(self, edgetam: Union[EdgeTamBackend, EdgeTamHelper], feature_size: int, config: dict):
         self.edgetam = edgetam
         self.feature_size = feature_size
         self.fg_pt_per_cls = config["edgetam_foreground_points_per_class"]

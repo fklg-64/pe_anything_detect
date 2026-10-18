@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
-from core.openvino.segmentation_runner import SegmentationRunner
+from core.common.segmentation_runner import SegmentationRunner
 from core.utils import load_config
 from eval_prompts import segment
 

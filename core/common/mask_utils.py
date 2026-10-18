@@ -7,7 +7,7 @@ import numpy as np
 from scipy.ndimage import binary_erosion, distance_transform_edt
 from scipy.ndimage import label as ndi_label
 
-from core.openvino.params import (
+from core.common.params import (
     BACKGROUND_POINT_MARGIN,
     MEDIAN_BLUR_KSIZE,
     PATCH_NEIGHBORHOOD,

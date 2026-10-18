@@ -10,9 +10,9 @@ import yaml
 from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt
 
 from core.utils import Timer
-from core.openvino.feature_extractor import OVCLIPFeatureExtractor
-from core.openvino.mask_utils import softmax
-from core.openvino.params import (
+from core.common.backend import CLIPBackend
+from core.common.mask_utils import softmax
+from core.common.params import (
     CLIP_LOGIT_SCALE,
     FAISS_NUM_THREADS,
     KMEANS_SEED,
@@ -42,7 +42,7 @@ def load_color_shape_prompts(path: Path) -> List[str]:
 class CoarseSegmenter:
     """画像をパッチ格子上の「前景らしさ」と「粗いセマンティックラベル」に分ける。"""
 
-    def __init__(self, extractor: OVCLIPFeatureExtractor, config: dict):
+    def __init__(self, extractor: CLIPBackend, config: dict):
         self.extractor = extractor
         self.prompts_dir = config["prompts_dir"]
         self.k_clusters = config["k_clusters"]

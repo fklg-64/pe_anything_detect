@@ -1,6 +1,6 @@
 # 粗いセマンティックセグメンテーション
 
-`SegmentationRunner._generate_foreground_map` から `refine_coarse_segmentation` までの処理（OpenVINO 版、`core/openvino/segmentation_runner.py`）をまとめる。
+`SegmentationRunner._generate_foreground_map` から `refine_coarse_segmentation` までの処理（OpenVINO 版、`core/common/segmentation_runner.py`）をまとめる。
 
 この段階の目的は、**CLIP の特徴とテキストプロンプトだけで、画像を 32×32 のパッチ単位に「背景 / 前景（どの種類の物体か）」へ分けること**。ここで得た粗い結果は、次段（EdgeTAM による精緻化 `refine_semantic_segmentation`）が「どこに・どのクラスのプロンプト点を置くか」の根拠として使う。したがって、ここでの誤りは最終結果の誤り（背景の広がり、物体の見逃し、クラスの割れ）に直結する。
 

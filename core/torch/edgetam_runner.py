@@ -12,6 +12,7 @@ import torch.nn as nn
 from PIL import Image
 import numpy as np
 
+from core.common.edgetam_helper import EdgeTamHelper
 from sam2.build_sam import build_sam2
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.modeling.backbones.image_encoder import FpnNeck
@@ -391,3 +392,44 @@ class DecodeModel(BaseModel):
         low_res_masks = low_res_masks.squeeze(0)
 
         return masks, iou_predictions, low_res_masks
+
+class TorchEdgeTamBackend(EdgeTamHelper):
+    """EdgeTAMのPyTorch backend。共通ロジックに合わせ、入出力は np.ndarray（前後処理は EdgeTamHelper）。"""
+
+    def __init__(self, config: yaml):
+        super().__init__(config)
+        self.device = config["device"]
+        self.edgetam_encoder = RepVitModel(config)
+        self.edgetam_decoder = DecodeModel(config)
+
+    def _to_tensor(self, x: np.ndarray, dtype=torch.float32) -> torch.Tensor:
+        return torch.from_numpy(np.ascontiguousarray(x)).to(device=self.device, dtype=dtype)
+
+    @staticmethod
+    def _to_numpy(x: torch.Tensor) -> np.ndarray:
+        return x.detach().cpu().numpy()
+
+    def encode(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        outs = self.edgetam_encoder(self._to_tensor(image_tensor))
+        return tuple(self._to_numpy(o) for o in outs)
+
+    def decode(
+        self,
+        high_res_feats0: np.ndarray,
+        high_res_feats1: np.ndarray,
+        image_embed: np.ndarray,
+        point_coords: np.ndarray,
+        point_labels: np.ndarray,
+        mask_input: np.ndarray,
+        has_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        low_res_masks, iou_predictions = self.edgetam_decoder(
+            self._to_tensor(high_res_feats0),
+            self._to_tensor(high_res_feats1),
+            self._to_tensor(image_embed),
+            point_coords=self._to_tensor(point_coords),
+            point_labels=self._to_tensor(point_labels, torch.int32),
+            mask_input=self._to_tensor(mask_input),
+            has_mask=self._to_tensor(has_mask),
+        )
+        return self._to_numpy(low_res_masks), self._to_numpy(iou_predictions)

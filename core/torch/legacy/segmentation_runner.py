@@ -1,3 +1,4 @@
+# 注意: 旧パイプライン（単一マスク前景）。共通パイプライン(core/common)へ移行したため、現在の torch_config.yaml では動かない（k_clusters がリストだった時代の設定が必要）。参照用に退避。
 import os
 import time
 import json

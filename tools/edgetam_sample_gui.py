@@ -5,12 +5,11 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-import torch
 from typing import Optional, Tuple, List, Union
 
 from core.utils import load_config, load_image, preprocess_image
 from core.openvino.edgetam_runner import OVEdgeTamRunner
-from core.torch.edgetam_runner import EdgeTamRunner
+from core.torch.edgetam_runner import TorchEdgeTamBackend
 
 class SAMInteractiveApp(ctk.CTk):
 
@@ -132,20 +131,16 @@ class SAMInteractiveApp(ctk.CTk):
             self.edgetam = OVEdgeTamRunner(config)
         elif mode == "pytorch":
             config = load_config(f"./configs/torch_config.yaml")
-            self.device = config["device"]
-            self.edgetam = EdgeTamRunner(config)
+            self.edgetam = TorchEdgeTamBackend(config)
 
     def _predict_edgetam_encoder(self, image_raw: np.ndarray) -> Optional[Tuple]:
-        if isinstance(self.edgetam, OVEdgeTamRunner):
-            return self.edgetam.encode(
-                preprocess_image(
-                    image_raw, 
-                    self.edgetam.target_size, 
-                    self.edgetam.mean, self.edgetam.std
-                )
+        return self.edgetam.encode(
+            preprocess_image(
+                image_raw,
+                self.edgetam.target_size,
+                self.edgetam.mean, self.edgetam.std
             )
-        elif isinstance(self.edgetam, EdgeTamRunner):
-            return self.edgetam.encode(self.edgetam.transform(image_raw))
+        )
 
     def _predict_edgetam_decoder(
         self,
@@ -156,60 +151,33 @@ class SAMInteractiveApp(ctk.CTk):
         width: int,
         mask_input: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if isinstance(self.edgetam, OVEdgeTamRunner):
-            if mask_input is None:
-                mask_logits_tensor = np.array([0], dtype=np.float32)
-            else:
-                mask_logits_tensor = mask_input
+        if mask_input is None:
+            mask_logits_tensor = np.array([0], dtype=np.float32)
+        else:
+            mask_logits_tensor = mask_input
 
-            mask_input_tensor, point_coords_norm, point_labels_norm, has_mask = self.edgetam.preprocess(
-                (height, width),
-                point_coords=np.array(point_coords, dtype=np.float32),
-                point_labels=np.array(point_labels, dtype=np.int32),
-                mask_logits=mask_logits_tensor,
-            )
+        mask_input_tensor, point_coords_norm, point_labels_norm, has_mask = self.edgetam.preprocess(
+            (height, width),
+            point_coords=np.array(point_coords, dtype=np.float32),
+            point_labels=np.array(point_labels, dtype=np.int32),
+            mask_logits=mask_logits_tensor,
+        )
 
-            high_res_feats0, high_res_feats1, image_embed = feats
-            low_res_masks, iou_predictions = self.edgetam.decode(
-                high_res_feats0, high_res_feats1, image_embed,
-                point_coords=point_coords_norm,
-                point_labels=point_labels_norm,
-                mask_input=mask_input_tensor,
-                has_mask=has_mask,
-            )
+        high_res_feats0, high_res_feats1, image_embed = feats
+        low_res_masks, iou_predictions = self.edgetam.decode(
+            high_res_feats0, high_res_feats1, image_embed,
+            point_coords=point_coords_norm,
+            point_labels=point_labels_norm,
+            mask_input=mask_input_tensor,
+            has_mask=has_mask,
+        )
 
-            masks, scores, logits = self.edgetam.postprocess(
-                low_res_masks, iou_predictions, (height // 8, width // 8)
-            )
+        masks, scores, logits = self.edgetam.postprocess(
+            low_res_masks, iou_predictions, (height // 8, width // 8)
+        )
 
-            return masks, scores, logits
-        elif isinstance(self.edgetam, EdgeTamRunner):
-            if mask_input is None:
-                mask_logits_tensor = torch.tensor([0], dtype=torch.float32, device=self.device)
-            else:
-                mask_logits_tensor = mask_input
-    
-            mask_input_tensor, point_coords_norm, point_labels_norm, has_mask = self.edgetam.preprocess(
-                (height, width),
-                point_coords=torch.tensor(point_coords, dtype=torch.float32, device=self.device),
-                point_labels=torch.tensor(point_labels, dtype=torch.int64, device=self.device),
-                mask_logits=mask_logits_tensor,
-            )
-    
-            high_res_feats0, high_res_feats1, image_embed = feats
-            low_res_masks, iou_predictions = self.edgetam.decode(
-                high_res_feats0, high_res_feats1, image_embed,
-                point_coords=point_coords_norm,
-                point_labels=point_labels_norm,
-                mask_input=mask_input_tensor,
-                has_mask=has_mask,
-            )
-    
-            masks, scores, logits = self.edgetam.postprocess(
-                low_res_masks, iou_predictions
-            )
-    
-            return masks.detach().numpy(), scores.detach().numpy(), logits
+        return masks, scores, logits
+
 
     # =========================================================
     # 3. 推論処理部（SAM組み込み対象の関数）
@@ -217,7 +185,7 @@ class SAMInteractiveApp(ctk.CTk):
     def run_sam_inference(
         self,
         image: np.ndarray,
-        feats: List[Union[torch.Tensor, np.ndarray]], 
+        feats: List[np.ndarray], 
         points: List[List[float]],
         point_labels: List[int],
         logits: np.ndarray | None,
@@ -257,7 +225,7 @@ class SAMInteractiveApp(ctk.CTk):
 
         # 特徴量抽出
         cv_image_rgb: np.ndarray = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
-        self.feats: List[Union[torch.Tensor, np.ndarray]] = self._predict_edgetam_encoder(cv_image_rgb)
+        self.feats: List[np.ndarray] = self._predict_edgetam_encoder(cv_image_rgb)
 
     def reset_prompts(self):
         """ポイントや過去のlogits・表示位置を全リセット"""

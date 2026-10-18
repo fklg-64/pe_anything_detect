@@ -1,6 +1,6 @@
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
 from core.openvino.edgetam_runner import OVEdgeTamRunner
-from core.openvino.segmentation_runner import SegmentationRunner
+from core.common.segmentation_runner import SegmentationRunner
 from core.utils import load_config
 
 if __name__ == "__main__":

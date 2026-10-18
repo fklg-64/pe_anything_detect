@@ -5,12 +5,12 @@ from typing import Union
 import numpy as np
 
 from core.utils import Timer, load_image, normalize_image, resize_image
-from core.openvino.coarse_segmentation import CoarseSegmenter
-from core.openvino.edgetam_runner import OVEdgeTamRunner
-from core.openvino.feature_extractor import OVCLIPFeatureExtractor
-from core.openvino.result import SegmentationResult
-from core.openvino.semantic_refiner import SemanticRefiner
-from core.openvino.visualization import ResultSaver, semantic_class_names
+from core.common.coarse_segmentation import CoarseSegmenter
+from core.common.backend import CLIPBackend, EdgeTamBackend
+from core.common.edgetam_helper import EdgeTamHelper
+from core.common.result import SegmentationResult
+from core.common.semantic_refiner import SemanticRefiner
+from core.common.visualization import ResultSaver, semantic_class_names
 
 
 class SegmentationRunner:
@@ -18,8 +18,8 @@ class SegmentationRunner:
 
     def __init__(
         self,
-        extractor: OVCLIPFeatureExtractor,
-        edgetam: OVEdgeTamRunner,
+        extractor: CLIPBackend,
+        edgetam: Union[EdgeTamBackend, EdgeTamHelper],
         config: dict,
     ):
         self.extractor = extractor

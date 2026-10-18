@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from core.openvino.result import SegmentationResult
+from core.common.result import SegmentationResult
 
 # セマンティック可視化の色 (RGB)。0番は背景で常にシアン
 SEMANTIC_COLORS = np.array([

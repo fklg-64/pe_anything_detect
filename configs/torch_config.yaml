@@ -2,10 +2,13 @@
 image_size: 512
 
 # Kmeansのクラスタ数
-k_clusters: [8]
+k_clusters: 8
 
 # Kmeansのループ回数（多いほどクラスタは整う）
 n_iter: 10
+
+# プロンプトが保存されているディレクトリ
+prompts_dir: "./prompts/candidates/color_free_bg"
 
 # peモデル名（timmからロード）
 pe_model_id: "hf-hub:timm/PE-Core-T-16-384"
@@ -16,29 +19,44 @@ edgetam_model_path: "./weights/edgetam.pt"
 # edgetamモデルの設定データパス
 edgetam_model_config: "configs/edgetam.yaml"
 
-# プロンプトが保存されているディレクトリ
-prompts_dir: "./prompts"
-
-# OpenVINO変換を実施するか
-to_openvino: false
-
-# OpenVINO変換に使用するモデルのディレクトリ
+# OpenVINO変換（convert_openvino.py）の保存先ディレクトリ
 ov_model_dir: "./weights/openvino_models"
-
-# 使用するデバイス
-device: "cpu"
 
 # 計算精度
 dtype: "float32"
 
-# INT8で量子化されたモデルを使用するか？
-use_int8: false
+# 使用するデバイス
+device: "cpu"
+
+# EdgeTAMの高解像度特徴量のダウンサンプリング倍率（縦横それぞれ1/4）
+edgetam_high_res_feature_downscale_factor: 4
+
+# EdgeTAMに入力するポイント数
+# 前景：粗いセマンティックセグメンテーションのクラスごとに抽出する数
+edgetam_foreground_points_per_class: 8
+# 背景：粗い前景・背景マスクで背景と判定された領域から抽出する数
+edgetam_background_point_count: 8
+
+# EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
+edgetam_refine_iterations: 3
+
+# セマンティックマップのマスク演算（重なり解決・ノイズ除去）を行う作業解像度の長辺上限（出力は元画像サイズ）
+semantic_max_side: 1024
+
+# 元画像に重畳するセマンティックカラーの不透明度
+overlay_alpha: 0.5
+
+# デバッグ中間画像を output_dir/<画像名>/debug に保存するか？
+debug: false
+
+# セマンティックセグメンテーション結果をmatplotlibのウィンドウで表示するか？（Falseでもpngは保存）
+show_result: false
 
 # 前景と判断するための自信度合い
 foreground_threshold: 0.5
 
 # 結果を出力するディレクトリ
-output_dir: "./outputs/experiment_results"
+output_dir: "./outputs/experiment_results_torch"
 
 # カラーパレット
 color_palette: [

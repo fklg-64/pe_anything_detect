@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openvino_models)。実行時は先に必須
 python develop.py            # OpenVINO 版の実行（本命・最新）
-python test_pytorch.py       # PyTorch 版の実行（動作確認用。最新の処理と同期しているとは限らない）
+python test_pytorch.py       # PyTorch 版の実行（core/common を共有するので OpenVINO 版と同じ処理。手法の実験用）
 python prompts/create_prompts.py  # prompts/semantic.json を生成
 python tools/eval_prompts.py [--prompts-dir DIR]  # MVTec(fg_mask)でプロンプトを評価（前景IoU・クラスの割れやすさ）
 python tools/eval_prompts.py --gt-dir DIR  # 任意の画像+正解マスク(DIR/images, DIR/masks)で前景IoU・物体の検出率(大きさ別)・背景の誤検出を評価
@@ -30,16 +30,24 @@ python tools/eval_synthetic.py --data DIR  # 合成データでIoU・有無・�
 
 ## アーキテクチャ
 
-`core/torch/` と `core/openvino/` が並行する同名構造（`feature_extractor`, `edgetam_runner`, `segmentation_runner`）。**開発の主軸は `core/openvino/`**。`core/torch/` は変換元モデルの定義も兼ねる（`convert_openvino.py` が `DecodeModel`, `RepVitModel`, `TorchCLIPFeatureExtractor` 等を import して変換）。`core/torch/sam2/` は SAM2/EdgeTAM のベンダリングコード。
+処理の本体は backend 非依存の `core/common/` にあり、モデル推論の「口」だけを `core/openvino/`（OpenVINO）と `core/torch/`（PyTorch）が持つ。**手法の開発は `core/common/` で行えば、両 backend に反映される。** `develop.py`（OpenVINO）と `test_pytorch.py`（PyTorch）は backend の生成部だけが違う。`core/torch/` は変換元モデルの定義も兼ねる（`convert_openvino.py` が `DecodeModel`, `RepVitModel`, `TorchCLIPFeatureExtractor` 等を import して変換）。`core/torch/sam2/` は SAM2/EdgeTAM のベンダリングコード。
 
-`core/openvino/` の構成:
+`core/common/` の構成（torch / openvino を import しない）:
 
+- `backend.py`: backend の契約（`CLIPBackend` / `EdgeTamBackend` の Protocol）。入出力はすべて `np.ndarray`。
+- `edgetam_helper.py`: `EdgeTamHelper`。EdgeTAM の座標変換・プロンプト前処理・後処理（NumPy）。backend はこれを継承して `encode` / `decode` だけ実装する。
 - `segmentation_runner.py`: `SegmentationRunner`。`segment(image)`（保存なしのパイプライン、`SegmentationResult` を返す）と `run(path)`（読み込み・`segment`・保存）。
 - `coarse_segmentation.py`: `CoarseSegmenter`。CLIP 特徴量・テキストプロンプトとの照合・faiss KMeans による粗い前景/セマンティック推定と、パッチ単位の整形。
-- `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM（`OVEdgeTamRunner`）でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
+- `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM backend でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
 - `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分・ノイズ除去などの純粋関数。
 - `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
 - `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。
+
+backend:
+
+- OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
+- PyTorch: `core/torch/feature_extractor.py`（`TorchCLIPBackend`。変換済みモデルと同じグラフ `to_openvino=True` で動かし、出力を ndarray 化）, `edgetam_runner.py`（`TorchEdgeTamBackend`）
+- `core/torch/legacy/segmentation_runner.py`: 共通化前の旧パイプライン（単一マスク前景）。参照用で、現在の config では動かない。
 
 パイプライン（`SegmentationRunner.segment`）:
 
@@ -55,6 +63,6 @@ python tools/eval_synthetic.py --data DIR  # 合成データでIoU・有無・�
 
 ## 補足
 
-- 座標系: 入力画像 → CLIP パッチ特徴マップ（`image_size`/patch）→ EdgeTAM の座標の変換は `SemanticRefiner.transform_coords` / `OVEdgeTamHelper.transform_coords` を使う。
+- 座標系: 入力画像 → CLIP パッチ特徴マップ（`image_size`/patch）→ EdgeTAM の座標の変換は `SemanticRefiner.transform_coords` / `EdgeTamHelper.transform_coords` を使う。
 - INT8 モデルは `et_use_int8` / `pe_use_int8` で切替（EdgeTAM / PE それぞれ）。
 - データセットのパス（`/home/llm/datasets/...`）は環境固有でリポジトリには含まれない。

@@ -1,6 +1,8 @@
 import os
 import sys
 
+from typing import List, Union
+
 import yaml
 import types
 import numpy as np
@@ -95,3 +97,42 @@ class TorchCLIPFeatureExtractor:
             return self.model.visual.trunk.custom_forward(
                 patch_features, cluster_labels, normalize=True
             )
+
+
+class TorchCLIPBackend(TorchCLIPFeatureExtractor):
+    """CLIPのPyTorch backend。共通ロジックに合わせ、入出力は np.ndarray。
+
+    OpenVINOへ変換したモデルと同じグラフ（to_openvino=True）で動かし、出力の形式・正規化を OVCLIPFeatureExtractor に揃える。
+    """
+
+    def __init__(self, config: yaml):
+        config = {**config, "to_openvino": True}
+        super().__init__(config)
+        self.device = config["device"]
+        self.model.to(self.device).eval()
+
+        # 画像の正規化に使用する変数（OVCLIPFeatureExtractorと同じ）
+        self.target_size = self.force_image_size
+        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+
+    @staticmethod
+    def _to_numpy(x: torch.Tensor) -> np.ndarray:
+        return x.detach().cpu().numpy()
+
+    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
+        x = torch.from_numpy(np.ascontiguousarray(image_tensor)).to(device=self.device, dtype=torch.float32)
+        with torch.no_grad():
+            raw_image, raw_patch, _, fused = self.model.encode_image(x, normalize=normalize)
+        return self._to_numpy(raw_image), self._to_numpy(raw_patch), self._to_numpy(fused)
+
+    def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
+        tokens = self.tokenizer(prompts).to(self.device)
+        with torch.no_grad():
+            return self._to_numpy(self.model.encode_text(tokens, normalize=normalize))
+
+    def extract_cluster_tokens(self, patch_features: np.ndarray, fused_cluster_labels: np.ndarray) -> np.ndarray:
+        patch = torch.from_numpy(np.ascontiguousarray(patch_features)).to(device=self.device, dtype=torch.float32)
+        labels = torch.from_numpy(np.ascontiguousarray(fused_cluster_labels)).to(device=self.device, dtype=torch.int64)
+        with torch.no_grad():
+            return self._to_numpy(self.model.visual.trunk.custom_forward(patch, labels, normalize=True))
