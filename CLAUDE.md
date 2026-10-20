@@ -15,15 +15,29 @@ python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openv
 python develop.py            # OpenVINO 版の実行（本命・最新）
 python test_pytorch.py       # PyTorch 版の実行（core/common を共有するので OpenVINO 版と同じ処理。手法の実験用）
 python prompts/create_prompts.py  # prompts/semantic.json を生成
-python tools/eval_prompts.py [--prompts-dir DIR]  # MVTec(fg_mask)でプロンプトを評価（前景IoU・クラスの割れやすさ）
-python tools/eval_prompts.py --gt-dir DIR  # 任意の画像+正解マスク(DIR/images, DIR/masks)で前景IoU・物体の検出率(大きさ別)・背景の誤検出を評価
-python tools/diag_clusters.py  # 粗いセグメンテーションの診断（クラスタ単位の前景/背景判定の誤り率）
-python tools/diag_refined_judgement.py [--gt-dir DIR]  # リファイン後のマスクを前景/背景に再判定したときの効果を診断（採用していない案の検証用）
+python tools/evaluation/eval_prompts.py [--prompts-dir DIR]  # MVTec(fg_mask)でプロンプトを評価（前景IoU・クラスの割れやすさ）
+python tools/evaluation/eval_prompts.py --gt-dir DIR  # 任意の画像+正解マスク(DIR/images, DIR/masks)で前景IoU・物体の検出率(大きさ別)・背景の誤検出を評価
+python tools/evaluation/diag_clusters.py  # 粗いセグメンテーションの診断（クラスタ単位の前景/背景判定の誤り率）
+python tools/evaluation/diag_refined_judgement.py [--gt-dir DIR]  # リファイン後のマスクを前景/背景に再判定したときの効果を診断（採用していない案の検証用）
+python tools/experiments/tiling/eval_tiling.py [--mode baseline|A|B] [--viz-dir DIR] [--diag]  # Overlapping Tiling（4タイル+全体縮小）で前景マップを作る実験。本体には組み込んでいない
+python tools/experiments/decontam/exp_decontam.py --phase p0,p1,p2,p3,p4,p5,p6 --num 6  # 前景特徴への背景混入を軽減する手法の検証（PyTorch版、結果は outputs/decontam/results.json）
+python tools/experiments/decontam/report_decontam.py  # 上の結果を outputs/decontam/index.html に可視化
+python tools/experiments/decontam/exp_decontam_cases.py  # 粗いマスクと最終結果（EdgeTAMまで）を画像で並べる
+python tools/experiments/decontam_followup/exp_followup_data.py  # 小物体・複数物体の合成データ（MVTecの部品×背景）を outputs/decontam_followup/data/ に作る
+python tools/experiments/decontam_followup/exp_followup.py --task {synthetic,mvtec,refine,develop,ov,cases,timing} --variants ...  # 追検証（変種は exp_decontam.py の registry 名。--verify で独立した画像）
+python tools/experiments/decontam_followup/report_followup.py  # 上の結果を outputs/decontam_followup/index.html に可視化
+python tools/experiments/dual_cluster/exp_dualcluster.py --task {m1,analysis,mvtec,synthetic,cases,viz,cost,develop} --variants ...  # PE と EdgeTAM の特徴を別々にKMeansして粗い結果を統合する実験（PyTorch版、結果は outputs/dual_cluster/。本体には組み込んでいない）
+python tools/experiments/dual_cluster/report_dualcluster.py  # 上の結果を outputs/dual_cluster/index.html に可視化
+python tools/experiments/dual_cluster_recheck/exp_recheck.py --task {oracle,control,mvtec,synthetic,cases,develop} --variants ... [--setting default|ring] [--verify]  # dual_cluster の再検証（zipper を除く・精緻化で粗いマスクの外周1パッチを「不明」にする案。結果は outputs/dual_cluster_recheck/。本体には組み込んでいない）
+python tools/experiments/dual_cluster_recheck/exp_fgarea.py  # fg_mask の面積比（zipper を評価から除く根拠）
+python tools/experiments/dual_cluster_recheck/report_recheck.py  # 上の結果を outputs/dual_cluster_recheck/index.html に可視化
+python convert_openvino.py --cluster-layers 6 --out-dir ./weights/openvino_models_l6 --pe-only  # クラスタリングに使う層を変えた PE のモデルだけを別フォルダに書き出す（既存のモデルは上書きしない）
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
-python tools/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
-python tools/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
+python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
+python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
+- `tools/` は用途別のフォルダ: `evaluation/`（評価・診断）, `dataset/`, `gui/`, `experiments/<名前>/`（手法の検証実験。本体には未組み込みで、`outputs/<名前>/` と対）。実験どうしは `from tools.experiments.decontam import exp_decontam as E` の形で import し合う。構成は `tools/README.md`。評価カテゴリは `tools/evaluation/eval_prompts.py` の `OBJECT_CATEGORIES`（10 種。過去の数値はこれ）と `EVAL_CATEGORIES`（zipper を除く 9 種。zipper は fg_mask が画面の 78% で物体として扱う意味が無い）。
 - 実行対象画像は `develop.py` / `test_pytorch.py` 内の `image_paths` リストを直接編集する（CLI 引数なし）。
 - 設定は `configs/ov_config.yaml`（OpenVINO）/ `configs/torch_config.yaml`（PyTorch）。`core.utils.load_config()` の既定は ov_config。
 - `convert_openvino.py` は冒頭で `/opt/intel/openvino` を `sys.path`/`PYTHONPATH` から除去する（pip 版 openvino との衝突回避）。この処理を `import openvino` より前に保つこと。
@@ -47,6 +61,7 @@ python tools/eval_synthetic.py --data DIR  # 合成データでIoU・有無・�
 backend:
 
 - OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
+- PyTorch（実験用）: `core/torch/feature_extractor.py` の `TorchCLIPProbe`。全層の hidden・attention 出力を取り出し、後半ブロックを attention マスク付きで再実行できる。`tools/experiments/decontam/exp_decontam*.py` が使う。
 - PyTorch: `core/torch/feature_extractor.py`（`TorchCLIPBackend`。変換済みモデルと同じグラフ `to_openvino=True` で動かし、出力を ndarray 化）, `edgetam_runner.py`（`TorchEdgeTamBackend`）
 - `core/torch/legacy/segmentation_runner.py`: 共通化前の旧パイプライン（単一マスク前景）。参照用で、現在の config では動かない。
 
@@ -65,5 +80,6 @@ backend:
 ## 補足
 
 - 座標系: 入力画像 → CLIP パッチ特徴マップ（`image_size`/patch）→ EdgeTAM の座標の変換は `SemanticRefiner.transform_coords` / `EdgeTamHelper.transform_coords` を使う。
+- クラスタリングに使う PE の層は config の `cluster_layers`（既定 `[8, 9, 10]`）。OpenVINO 版は変換時に固定される（`convert_openvino.py --cluster-layers`）。第 6 層のみのモデルは `weights/openvino_models_l6` に作成済み（切り替えは `configs/ov_config.yaml` の `model_dir`）。
 - INT8 モデルは `et_use_int8` / `pe_use_int8` で切替（EdgeTAM / PE それぞれ）。
 - データセットのパス（`/home/llm/datasets/...`）は環境固有でリポジトリには含まれない。

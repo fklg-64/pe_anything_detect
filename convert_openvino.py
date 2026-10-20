@@ -273,10 +273,23 @@ class EdgeTAMOpenVINOExporter(BaseOpenVINOExporter):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="PyTorch -> OpenVINO 変換")
+    parser.add_argument("--cluster-layers", type=int, nargs="+", default=None,
+                        help="クラスタリングに使う PE の層（fused_layer_features に連結する層）。既定は設定値の [8, 9, 10]")
+    parser.add_argument("--out-dir", default=None, help="保存先。既定は設定の ov_model_dir（既存のモデルを上書きしない場合に指定する）")
+    parser.add_argument("--pe-only", action="store_true", help="PE（CLIP）だけを変換し、EdgeTAM は変換しない")
+    args = parser.parse_args()
+
     # 設定データ
     config = load_config("./configs/torch_config.yaml")
     # OpenVINOモデルに変換するモードに強制変更
     config["to_openvino"] = True
+    if args.cluster_layers:
+        config["cluster_layers"] = args.cluster_layers
+    if args.out_dir:
+        config["ov_model_dir"] = args.out_dir
 
     # Extractor / EdgeTAM モデルの初期化
     extractor = TorchCLIPFeatureExtractor(config)
@@ -286,6 +299,9 @@ if __name__ == "__main__":
     # CLIP モデルのエクスポート
     exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=config["ov_model_dir"])
     exporter_pe.export_all()
+
+    if args.pe_only:
+        raise SystemExit(0)
 
     # EdgeTAM モデルのエクスポート
     exporter_edgetam = EdgeTAMOpenVINOExporter(edgetam_encoder, edgetam_decoder, save_dir=config["ov_model_dir"])

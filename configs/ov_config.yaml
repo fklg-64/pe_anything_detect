@@ -8,7 +8,7 @@ k_clusters: 8
 n_iter: 10
 
 # モデルのディレクトリ
-model_dir: "./weights/openvino_models"
+model_dir: "./weights/openvino_models_l6"
 
 # プロンプトが保存されているディレクトリ
 prompts_dir: "./prompts/candidates/color_free_bg"
