@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openvino_models)。実行時は先に必須
 python develop.py            # OpenVINO 版の実行（本命・最新）
 python test_pytorch.py       # PyTorch 版の実行（core/common を共有するので OpenVINO 版と同じ処理。手法の実験用）
+python test_pytorch_sam2.py  # PyTorch 版を SAM2.1（公式 Hiera-T）で精緻化して実行（configs/torch_config_sam2.yaml。EdgeTAM との差し替えの検証用）
 python prompts/create_prompts.py  # prompts/semantic.json を生成
 python tools/evaluation/eval_prompts.py [--prompts-dir DIR]  # MVTec(fg_mask)でプロンプトを評価（前景IoU・クラスの割れやすさ）
 python tools/evaluation/eval_prompts.py --gt-dir DIR  # 任意の画像+正解マスク(DIR/images, DIR/masks)で前景IoU・物体の検出率(大きさ別)・背景の誤検出を評価
@@ -31,6 +32,8 @@ python tools/experiments/dual_cluster/report_dualcluster.py  # 上の結果を o
 python tools/experiments/dual_cluster_recheck/exp_recheck.py --task {oracle,control,mvtec,synthetic,cases,develop} --variants ... [--setting default|ring] [--verify]  # dual_cluster の再検証（zipper を除く・精緻化で粗いマスクの外周1パッチを「不明」にする案。結果は outputs/dual_cluster_recheck/。本体には組み込んでいない）
 python tools/experiments/dual_cluster_recheck/exp_fgarea.py  # fg_mask の面積比（zipper を評価から除く根拠）
 python tools/experiments/dual_cluster_recheck/report_recheck.py  # 上の結果を outputs/dual_cluster_recheck/index.html に可視化
+python tools/setup/vendor_sam2.py [--src /home/llm/sam2]  # 公式 SAM2.1 を core/torch/sam2_official/ にコピー（パッケージ名を sam2_official に変えるだけ。core/torch/sam2 は EdgeTAM の fork で別物）
+python tools/experiments/sam2/exp_sam2.py --task {mvtec,synthetic,timing,cases,develop} --backend {edgetam,sam2} --points 前景:背景,... [--setting default|ring] [--verify]  # EdgeTAM → SAM2.1 の切り替えと、プロンプト点数の測定（PyTorch版、結果は outputs/sam2/。本体には組み込んでいない）
 python convert_openvino.py --cluster-layers 6 --out-dir ./weights/openvino_models_l6 --pe-only  # クラスタリングに使う層を変えた PE のモデルだけを別フォルダに書き出す（既存のモデルは上書きしない）
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
@@ -62,6 +65,7 @@ backend:
 
 - OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
 - PyTorch（実験用）: `core/torch/feature_extractor.py` の `TorchCLIPProbe`。全層の hidden・attention 出力を取り出し、後半ブロックを attention マスク付きで再実行できる。`tools/experiments/decontam/exp_decontam*.py` が使う。
+- PyTorch（SAM2.1）: `core/torch/sam2_runner.py` の `TorchSam2Backend`。EdgeTAM のクラス（`RepVitModel` / `DecodeModel` / `TorchEdgeTamBackend`）を継承し、モデルの取得だけを公式 SAM2.1 に差し替える（デコーダーの入出力と特徴量の形状が同じなので、`SegmentationRunner(extractor, TorchSam2Backend(config), config)` でそのままつながる）。`core/torch/sam2_official/` は公式 SAM2.1 のコピー（パッケージ名 `sam2_official`、`UPSTREAM.md` 参照）。`core/torch/sam2/` は EdgeTAM の fork で公式とは別物（同名のパッケージは同時に置けない）。
 - PyTorch: `core/torch/feature_extractor.py`（`TorchCLIPBackend`。変換済みモデルと同じグラフ `to_openvino=True` で動かし、出力を ndarray 化）, `edgetam_runner.py`（`TorchEdgeTamBackend`）
 - `core/torch/legacy/segmentation_runner.py`: 共通化前の旧パイプライン（単一マスク前景）。参照用で、現在の config では動かない。
 

@@ -410,3 +410,15 @@ flowchart TD
 
 - 小さい物体（画像面積の 0.5% 未満）の評価データが無い。`tools/dataset/make_synthetic_dataset.py` の部品・背景が環境に無く、合成データは作れていない。小物体への影響は、データができてから測る。
 - 「粗いマスクの支持範囲」案は、背景への漏れが多いデータで効くかもしれない。合成データでの再評価が必要。
+
+## 15. 精緻化のモデルを EdgeTAM から SAM2.1 tiny に替える検証
+
+精緻化（EdgeTAM のエンコーダー・デコーダー）を、公式 SAM2.1（Hiera-T）に替えて測った。実施内容・全表・図は **`outputs/sam2/index.html`**（`python tools/experiments/sam2/report_sam2.py` で再生成）。実験は `tools/experiments/sam2/exp_sam2.py`。本体（`core/common`）と EdgeTAM のコードは変更していない。
+
+- **実装**: `core/torch/sam2` は EdgeTAM の fork で公式 SAM2.1 とは別物（`sam2_base` / `mask_decoder` / `prompt_encoder` / `transformer` などに EdgeTAM 用の追加と OpenVINO 対応の書き換え）。同名のパッケージは同時に置けないので、公式を `core/torch/sam2_official/`（パッケージ名 `sam2_official`）にコピーした（`tools/setup/vendor_sam2.py`。import と `_target_` の書き換えだけ。`UPSTREAM.md` に記録）。`__init__.py` と `build_sam.py` だけ公式から変えた（`GlobalHydra` に依存せず `OmegaConf` で組み、`image_size` を上書きできる）。`core/torch/sam2_runner.py` の `TorchSam2Backend` は `TorchEdgeTamBackend` のサブクラスで、モデルの取得だけを差し替える（EdgeTAM と SAM2.1 はデコーダーの入出力と特徴量の形状が同じ）。`python test_pytorch_sam2.py`（`configs/torch_config_sam2.yaml`）。公式のパッケージとの照合で、特徴量・logit・IoU 予測の差は 0。
+- **モデルだけを替えた効果**（前景 8 点・背景 8 点、粗い判定は PE 第 6 層、zipper を除く）: MVTec 108 枚で 0.815 → 0.819（+0.004 [−0.015, +0.024]）、独立 54 枚で 0.806 → 0.814（差なし）。合成データは IoU 0.573 → 0.551（−0.022 [−0.041, −0.003]）と有意に低い。toothbrush は 0.83 → 0.90（SAM2.1 は縁が削れにくい）、capsule は 0.81 → 0.74（背景への広がり）。
+- **点数**（前景 1〜4 × 背景 1〜4、EdgeTAM と SAM2.1 の両方）: 「点が多すぎる」は支持されない。MVTec で点を減らすと両モデルとも下がる（EdgeTAM 4:4 −0.019 / 2:2 −0.037 / 1:1 −0.166、SAM2.1 4:4 −0.015 / 2:2 −0.050 / 1:1 −0.223）。12:12・16:16 は 8:8 と差がなく、8 点で飽和。合成データでは EdgeTAM が 3:3〜4:4 でわずかに上がる（+0.02）が、SAM2.1 は変わらず検出率が下がる。
+- **外周「不明」との組み合わせ**（§14 と `outputs/dual_cluster_recheck`、本体未反映）: 外周ありでは点数への依存がほぼ無くなる。前景 4・背景 4（点は約 60 → 約 32 / 枚）が 8:8 と同等（EdgeTAM +0.002、SAM2.1 +0.005、差なし）。EdgeTAM 4:4 + 外周は 0.846 で、現行（EdgeTAM 8:8・外周なし 0.815）に +0.032 [+0.013, +0.052]。ただし合成データでは検出率が少し下がる。
+- **処理時間**（PyTorch・CPU・4 スレッド）: SAM2.1 のエンコーダー 213ms（EdgeTAM 66.6ms、約 3.2 倍）。デコーダーは 1 回約 9ms で点数にほぼ依らず、点を 8+8 → 2+2 にしてもデコード回数は 12.2 → 9.0 回 / 枚で、削れるのは約 30ms。
+- **判断**: SAM2.1 への切り替えは見送りを推奨。512 入力では MVTec は EdgeTAM と差がなく、合成データは低く、エンコーダーは約 3 倍重い。判断基準を満たさないので OpenVINO 化は作っていない。1024 入力（SAM2 の学習解像度）は未検証（`SemanticRefiner` が受ける画像が CLIP と共通の 512 なので本体の修正が要り、さらに重い）。
+- **限界**: 17 設定を同じ 108 枚で比べており多重比較の補正は無い（独立 54 枚は一部の設定のみ）。PyTorch のみ。capsule・metal_nut で背景全体に前景が広がる失敗が設定ごとに出たり消えたりして、結果は不安定。

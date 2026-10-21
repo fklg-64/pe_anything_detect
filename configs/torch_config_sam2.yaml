@@ -1,0 +1,113 @@
+# SAM2.1（公式）で精緻化するときの設定。torch_config.yaml との違いは sam2_model_* と、プロンプト点の数（測定して決める）
+# 処理画像サイズ
+image_size: 512
+
+# Kmeansのクラスタ数
+k_clusters: 8
+
+# クラスタリングに使うPEの層。現行の運用（configs/ov_config.yaml の model_dir = 第6層のモデル）に合わせる
+cluster_layers: [6]
+
+# Kmeansのループ回数（多いほどクラスタは整う）
+n_iter: 10
+
+# プロンプトが保存されているディレクトリ
+prompts_dir: "./prompts/candidates/color_free_bg"
+
+# peモデル名（timmからロード）
+pe_model_id: "hf-hub:timm/PE-Core-T-16-384"
+
+# edgetamモデルまでのパス
+edgetam_model_path: "./weights/edgetam.pt"
+
+# edgetamモデルの設定データパス
+edgetam_model_config: "configs/edgetam.yaml"
+
+# sam2.1（公式。core/torch/sam2_official）のモデルまでのパスと、設定（sam2_official 内の相対パス）。
+# SAM2.1 を使う実行（test_pytorch_sam2.py）はこの設定ファイルを読む。edgetam_* の設定は使わない
+sam2_model_path: "./weights/sam2.1_hiera_tiny.pt"
+sam2_model_config: "configs/sam2.1/sam2.1_hiera_t.yaml"
+
+# OpenVINO変換（convert_openvino.py）の保存先ディレクトリ
+ov_model_dir: "./weights/openvino_models"
+
+# 計算精度
+dtype: "float32"
+
+# 使用するデバイス
+device: "cpu"
+
+# EdgeTAMの高解像度特徴量のダウンサンプリング倍率（縦横それぞれ1/4）
+edgetam_high_res_feature_downscale_factor: 4
+
+# EdgeTAMに入力するポイント数
+# 前景：粗いセマンティックセグメンテーションのクラスごとに抽出する数
+edgetam_foreground_points_per_class: 8
+# 背景：粗い前景・背景マスクで背景と判定された領域から抽出する数
+edgetam_background_point_count: 8
+
+# EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
+edgetam_refine_iterations: 3
+
+# セマンティックマップのマスク演算（重なり解決・ノイズ除去）を行う作業解像度の長辺上限（出力は元画像サイズ）
+semantic_max_side: 1024
+
+# 元画像に重畳するセマンティックカラーの不透明度
+overlay_alpha: 0.5
+
+# デバッグ中間画像を output_dir/<画像名>/debug に保存するか？
+debug: false
+
+# セマンティックセグメンテーション結果をmatplotlibのウィンドウで表示するか？（Falseでもpngは保存）
+show_result: false
+
+# 前景と判断するための自信度合い
+foreground_threshold: 0.5
+
+# 結果を出力するディレクトリ
+output_dir: "./outputs/experiment_results"
+
+# カラーパレット
+color_palette: [
+  0, 0, 0,
+  255, 0, 0,
+  0, 255, 0,
+  0, 0, 255,
+  255, 255, 0,
+  0, 255, 255,
+  255, 0, 255,
+  192, 192, 192,
+  128, 0, 0,
+  128, 128, 0,
+  0, 128, 0,
+  128, 0, 128,
+  0, 0, 128,
+  255, 165, 0,
+  255, 105, 180,
+  255, 69, 0,
+  255, 20, 147,
+  34, 139, 34,
+  0, 255, 127,
+  255, 182, 193,
+  255, 215, 0,
+  139, 69, 19,
+  244, 164, 96,
+  72, 61, 139,
+  0, 191, 255,
+  70, 130, 180,
+  147, 112, 219,
+  153, 50, 204,
+  255, 228, 225,
+  255, 0, 255,
+  255, 228, 181,
+  255, 99, 71,
+  0, 250, 154,
+  221, 160, 221,
+  238, 130, 238,
+  186, 85, 211,
+  255, 240, 245,
+  219, 112, 147,
+  255, 69, 0,
+  240, 128, 128,
+  255, 105, 180,
+]
