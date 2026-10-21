@@ -221,6 +221,23 @@ def patch_mean(patch_map: np.ndarray) -> np.ndarray:
     )
 
 
+def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    """ガイデッドフィルタ（He ら 2010）の輝度（1チャンネル）ガイド版。ボックスフィルタと四則演算だけ。
+
+    src を、guide（同じ大きさの float32、0〜1）の縁に沿うように整える。窓（半径 radius）の中で src ≒ a × guide + b と
+    当てはめ、窓ごとの (a, b) を平均して出力する。guide が平坦な所は平滑化、縁のある所は縁を保つ。
+    """
+    ksize = (2 * radius + 1, 2 * radius + 1)
+
+    def box(x: np.ndarray) -> np.ndarray:
+        return cv2.boxFilter(x, -1, ksize, borderType=cv2.BORDER_REFLECT)
+
+    mean_i, mean_p = box(guide), box(src)
+    a = (box(guide * src) - mean_i * mean_p) / (box(guide * guide) - mean_i * mean_i + eps)
+    b = mean_p - a * mean_i
+    return box(a) * guide + box(b)
+
+
 def resize_map(patch_map: np.ndarray, size: Tuple[int, int], interpolation: int) -> np.ndarray:
     """パッチ格子のマップを size=(幅, 高さ) へ拡大する。"""
     return cv2.resize(patch_map.astype(np.float32), size, interpolation=interpolation)

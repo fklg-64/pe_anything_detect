@@ -35,6 +35,9 @@ MIN_ISOLATED_PATCHES = 3
 PRIOR_LOGIT_RANGE = 8.0
 # core（物体内部）の外側にある粗いマスクに与える確率。0.5=前景とも背景とも言えない
 PRIOR_NON_CORE_PROBABILITY = 0.5
+# 初期マスクの縁を入力画像に沿わせるガイデッドフィルタ（He ら 2010）の正則化。ガイドは入力画像の輝度（0〜1）で、半径は粗いマスクの信頼限界（1パッチ）。
+# 値は 0.001〜0.01 で結果が変わらない（0.1 では下がる）
+GUIDED_FILTER_EPS = 1e-2
 # EdgeTAMのロジットがこの値を超えた画素を前景とする
 MASK_LOGIT_THRESHOLD = 0.0
 # EdgeTAMのデコーダ出力マスクを縮小する倍率（分母。高さ・幅を 1/N にする）

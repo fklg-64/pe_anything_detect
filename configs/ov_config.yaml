@@ -28,9 +28,14 @@ edgetam_high_res_feature_downscale_factor: 4
 
 # EdgeTAMに入力するポイント数
 # 前景：粗いセマンティックセグメンテーションのクラスごとに抽出する数
-edgetam_foreground_points_per_class: 8
+edgetam_foreground_points_per_class: 4
 # 背景：粗い前景・背景マスクで背景と判定された領域から抽出する数
-edgetam_background_point_count: 8
+edgetam_background_point_count: 4
+
+# 粗い判定で、PEの特徴に加えてEdgeTAMの特徴（image_embed）でもKMeansでクラスタ分けし、両方が前景のパッチだけを前景にする（AND）。
+# 背景の斑点・織り目などの誤検出（小物体・複数物体・雑多な背景の画像）を減らす。代償として小物体の検出率が少し下がる。
+# 大きな単体物体（MVTec型）では効果が無いので、そうした画像だけを扱うときは false にする。EdgeTAMエンコーダは粗い判定の前に1回だけ実行し、精緻化にも使う
+use_edgetam_clustering: false
 
 # EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
 edgetam_refine_iterations: 3

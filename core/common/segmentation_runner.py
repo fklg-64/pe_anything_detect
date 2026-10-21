@@ -26,6 +26,8 @@ class SegmentationRunner:
         self.edgetam = edgetam
         self.output_dir = config["output_dir"]
         self.debug = config["debug"]
+        # 粗い判定で、PE に加えて EdgeTAM の特徴でもクラスタ分けして前景確信度を AND する（誤検出を減らす。小物体の検出率が少し下がる）
+        self.use_edgetam_clustering = config.get("use_edgetam_clustering", False)
 
         self.coarse = CoarseSegmenter(extractor, config)
         self.refiner = SemanticRefiner(edgetam, extractor.feature_size, config)
@@ -52,6 +54,12 @@ class SegmentationRunner:
             resized = resize_image(image_raw, self.extractor.target_size)
             image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
 
+        # EdgeTAMの特徴量抽出（粗い判定で EdgeTAM の特徴を使うときは、ここで 1 回だけ実行して精緻化にも渡す）
+        edgetam_feats = None
+        if self.use_edgetam_clustering:
+            with Timer("EdgeTAM特徴量抽出処理時間"):
+                edgetam_feats = self.refiner.predict_encoder(resized)
+
         # 特徴量抽出
         with Timer("特徴量抽出処理時間"):
             _, patch_features, fused_patch_features = self.coarse.extract_features(image_tensor)
@@ -59,7 +67,9 @@ class SegmentationRunner:
         # CLIP + KMeans による初期前景マップの推定
         with Timer("粗い前景マスク取得処理時間"):
             foreground_map, foreground_mask, cluster_labels, cluster_index_list = (
-                self.coarse.generate_foreground_map(patch_features, fused_patch_features)
+                self.coarse.generate_foreground_map(
+                    patch_features, fused_patch_features, *((edgetam_feats[2],) if edgetam_feats is not None else ())
+                )
             )
 
         # セマンティックセグメンテーションのラベルを取得
@@ -74,7 +84,7 @@ class SegmentationRunner:
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             semantic_map, prompt_indices, point_coords, point_labels = self.refiner.refine(
-                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height
+                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_feats
             )
 
         elapsed_time = time.time() - start

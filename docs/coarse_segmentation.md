@@ -19,7 +19,7 @@
 
 ```mermaid
 flowchart TD
-    IMG["入力画像<br/>(512x512 に前処理)"] --> CLIP["CLIP 画像エンコーダ (PE-Spatial)<br/>OpenVINO"]
+    IMG["入力画像<br/>(512x512 に前処理)"] --> CLIP["CLIP 画像エンコーダ (PE-Core-T-16。PE-Spatial の重みは未使用)<br/>OpenVINO"]
     CLIP -->|"fused_patch_features<br/>(1+1024, D)"| KM
     CLIP -->|"patch_features<br/>(生のパッチ特徴)"| POOL
 
@@ -43,6 +43,8 @@ flowchart TD
 ---
 
 ## 2. 処理の流れ（シーケンス）
+
+（`use_edgetam_clustering: true` のときの、EdgeTAM の特徴での 2 回目のクラスタリングと AND は [§3.5](#35-edgetam-の特徴でも別にクラスタ分けして-anduse_edgetam_clustering)）
 
 ```mermaid
 sequenceDiagram
@@ -123,6 +125,35 @@ p_fg     = softmax([fg_score, bg_score])[0]       # = sigmoid(fg_score - bg_scor
 | k6 | 150 | **fabric 42.2** | plain wall 41.5 | 0.68 | **前景** | タオル ✗ |
 
 物体（コイン）は 4〜5 ロジットの差で安定して勝つ一方、背景のタオルは前景プロンプト `fabric` と背景プロンプトが **0.1〜0.7 ロジット差**で拮抗し、判定が不安定になっている。**ロジット差が 1 未満のクラスタは、プロンプトの小さな変更で結果が反転する**と考えてよい。
+
+### 3.5 EdgeTAM の特徴でも別にクラスタ分けして AND する（`use_edgetam_clustering`）
+
+`use_edgetam_clustering: true`（既定）のとき、`generate_foreground_map` は EdgeTAM エンコーダーの `image_embed`（256 次元・32×32）を受け取り、**PE のクラスタ結果と EdgeTAM のクラスタ結果の前景確信度の小さい方**（AND）を採る。
+
+**なぜ**: 粗い誤りの主因は、背景のクラスタを前景とする判定の誤り（背景の斑点・織り目の一部が前景のクラスタに混ざる）。PE の特徴のクラスタは意味は近いが空間的にばらける（クラスタあたりの連結成分数が平均 40 個）。EdgeTAM の特徴のクラスタは、物体の輪郭・領域に沿ってまとまる（同 7.2 個）。両方が前景としたパッチだけを前景にすると、誤検出が半分以下になる。代償として、小物体の検出率が少し下がる（精緻化の事前マスクの改良と併用すると、ほぼ消える。[improvement_methods.md §4](improvement_methods.md)）。
+
+```mermaid
+flowchart TD
+    IMG["入力画像 (512x512)"] --> PE["PE: パッチ特徴 fused / patch"]
+    IMG --> ET["EdgeTAM エンコーダー<br/>image_embed (1, 256, 32, 32)<br/>(SegmentationRunner が粗い判定の前に 1 回だけ実行。精緻化にも渡す)"]
+    PE --> KP["KMeans K=8 → PE ラベル"]
+    ET --> EF["(1024, 256) に並べて L2 正規化"]
+    EF --> KE["KMeans K=8 → EdgeTAM ラベル"]
+    KP --> P1["PE ラベルごとに PE トークンをプール<br/>→ テキストと照合 → conf_pe, prompt_pe"]
+    KE --> P2["EdgeTAM ラベルごとに PE トークンをプール<br/>→ 同じ照合 → conf_ed, prompt_ed"]
+    PE --> P1
+    PE --> P2
+    P1 --> AND["conf = min(conf_pe, conf_ed)<br/>前景 = conf > foreground_threshold"]
+    P2 --> AND
+    AND --> PR["プロンプト: 前景なら確信が強い方、<br/>背景なら確信が弱い方（背景側）の見方"]
+    PR --> OUT["foreground_map / foreground_mask<br/>cluster_labels = PE × EdgeTAM のクラスタの組<br/>cluster_index_list"]
+```
+
+- EdgeTAM の特徴にテキストとの対応は無いので、EdgeTAM のクラスタに入るパッチの **PE の最終層トークンをプール**して、PE 側と同じ照合（`_classify_cluster`）を行う。プールの OpenVINO モデル（`pe_patch_logits_model`）は PE 側と同じ入出力（ラベル数 K=8）で、新しいモデルは要らない。
+- クラスタの組（PE ラベル × EdgeTAM ラベル、最大 64）の中では、確信度とプロンプトは一定になる。`cluster_labels` にはこの組の番号を返す（デバッグ画像 `cluster_labels` の見え方が変わる）。
+- 追加コストは、EdgeTAM 特徴の KMeans（約 2ms）と PE トークンのプール（約 3ms）。EdgeTAM エンコーダー（約 34ms）は精緻化でも必要なので、粗い判定の前に実行して使い回し、増えない。
+- 検証（合成データ・MVTec）: [improvement_methods.md §4](improvement_methods.md)。MVTec のような大きな単体物体の画像では上乗せにならない（独立 54 枚ではわずかに下がる）ので、そうした画像だけを扱うときは `false` にする。
+- 交差セル（PE ラベル × EdgeTAM ラベルでパッチを分け、セルごとに PE トークンをプールして判定し直す）は、合成データでは AND より誤検出が少ないが、MVTec で下がり、OpenVINO のプールのモデルがラベル数 64 に対応するか未確認なので、実装していない。
 
 ---
 
@@ -246,6 +277,7 @@ flowchart TD
 | `foreground_threshold` | 0.5 | 同上 | `p_fg` がこの値を超えたクラスタを前景とする |
 | `image_size` | 512 | 同上 | 入力サイズ。パッチ 16px なので 32×32 パッチ（`feature_size`） |
 | `prompts_dir` | — | 同上 | `foreground.yaml` / `background.yaml` のあるディレクトリ |
+| `use_edgetam_clustering` | true | 同上 | EdgeTAM の特徴でも別にクラスタ分けして前景確信度を AND する（§3.5） |
 | `CLIP_LOGIT_SCALE` | 100.0 | `segmentation_runner.py` 冒頭 | 類似度（cos）に掛ける係数 |
 | `KMEANS_SEED` / `FAISS_NUM_THREADS` | 42 / 2 | 同上 | KMeans の再現性・スレッド数 |
 | `PATCH_NEIGHBORHOOD` | 3 | 同上 | 「細い」「接している」「内側」の判定に使う近傍（= 1 パッチ分） |
@@ -405,3 +437,34 @@ PE の特徴と EdgeTAM のエンコーダー出力（`image_embed`、256 次元
 - **限界**: 11 変種を同じ 108 枚で外周あり・なしに比べており、多重比較の補正は無い。独立 54 枚は区間が広い。PyTorch 版のみ（OpenVINO 版は未確認）。実験では `_refine_region` を複製して 1 行を変えた（外周なしの設定が本体と画像ごとに一致することは確認済み）。
 
 次の手順（候補）: 外周の改良を本体に入れるかの判断（MVTec 型に有効、小物体・影・雑多な背景では膨らむ）、実画像での見比べ、OpenVINO 版での確認、transistor・screw の評価データ側の扱い。
+
+---
+
+## 14. 性能向上の方針のための診断（Phase 0）
+
+粗い段階と詳細段階のどちらが最終性能を決めているかを測った。実施内容・全表・事例は **`outputs/diagnosis/index.html`**（`python tools/experiments/diagnosis/report_diagnosis.py` で再生成）。実験は `tools/experiments/diagnosis/`。本体（`core/`）は変更していない。粗い判定は PE 第 6 層（現行）、精緻化は EdgeTAM。
+
+- **正解注入（粗い結果を正解の 32×32 パッチにする）**: 合成データ 120 枚で IoU 0.573 → **0.876**（外周「不明」ありで 0.902）。背景の種類によらず 0.84〜0.92。難しい条件の失敗はほぼすべて粗い段階。MVTec は 0.815 → 0.857（外周あり 0.844 → 0.903）で、zipper・screw・transistor を除く 7 カテゴリでは現行 0.890 対 上限 0.899（**差 +0.009**）。現行の事前マスクのままでは、粗い判定を完璧にしても MVTec は上がらない（詳細側の縁の扱いが律速。外周あり 0.931 対 0.965、物体が少しでも入ったパッチまで含めると上限 0.950。ただし合成データの小物体では膨らんで 0.876 → 0.823）。
+- **粗い誤りの分解**（合成データ、画像の面積比 8.8%）: クラスタの判定の誤り（背景のクラスタを前景とする）6.5%、クラスタの混在 1.6%、格子の解像度 1.1%。最終マスクの誤検出は孤立した成分（10.2%）で、食み出しは 0.16%。背景の種類で IoU は plain 0.89 / textured 0.67 / pattern 0.59 / natural 0.15（natural は実物の写る背景で、前景の定義が曖昧）。
+- **クラス単位**: 部品の種類が 2 つ以上の 94 枚で、正解の種類 3.6 に対し予測クラス 1.5、homogeneity 0.13。結果はほぼ前景 / 背景で、セマンティックの区別は弱い（これまで測っていなかった）。
+- **処理時間**（OpenVINO・FP32・4 スレッド。静かな状態で測り直した値。最初の測定は別のソフトが動いていて約 1.5 倍遅かった）: 中央値 227ms のうち PE 38%（86ms）、デコード 27%（9 回 × 約 7ms）、EdgeTAM エンコーダー 15%（34ms）、精緻化の NumPy 処理 16%（36ms）。200ms には約 27ms 足りない。候補バックボーン（512px、重みなし）は PE-Spatial-T が PE-Core-T と同じ（0.97 倍）、DINOv3-S 2.1 倍、PE-Core-S 2.6 倍。PE-Core-T は 256px で 0.22 倍、224px で 0.17 倍（224px の 1 枚が 14ms）。
+- **限界**: 合成データは貼り合わせで、natural 背景は実物を含む。正解注入は上限で、達成できる値ではない。時間は 1 つの環境（静かな状態）。実画像の正解は無く目視のみ。
+
+次の手順（候補）: 粗い段階の分類を切り抜きの CLIP 埋め込みで行う案（C1）、PE-Spatial-T をクラスタリングの特徴源にする案（C2）、事前マスクの縁を画素に近い精度で作る案（R1）。
+
+---
+
+## 15. 追加実験（Phase 1・2）: 事前マスクの縁・切り抜きでの分類・特徴源の差し替え
+
+§14 の診断を受けた追加実験。実施内容・全表・事例は **`outputs/phase2/index.html`**（`python tools/experiments/phase2/report_phase2.py` で再生成）。手法の詳細（アルゴリズム・組み込みの差分案・Mermaid の流れ図）は **[improvement_methods.md](improvement_methods.md)**。本体（`core/`）は変更していない。
+
+- **効いた: R1 = 外周「不明」+ ガイデッドフィルタ（手法 D）**。精緻化の事前確率（外周「不明」で作った 32×32）を 128×128 に拡大し、入力画像（128×128 に縮小した輝度）をガイドに、半径 4（= 1 パッチ）・eps 0.01 のガイデッドフィルタにかける。MVTec 108 枚で 0.815 → **0.844**（+0.029 [+0.014, +0.047]、外周のみと同じ）、独立 54 枚で 0.806 → 0.827（+0.021 [−0.001, +0.043]）。合成データは、外周のみの悪化（0.573 → 0.521）が **0.566（−0.007 [−0.030, +0.012]、有意でない）**に消える。1 回 約 3ms（グレーガイド。NumPy）。
+- **D + プロンプト点 4:4**: MVTec 0.840（+0.026 [+0.006, +0.045]）、合成 **0.590**（+0.017 [+0.003, +0.034]）、検出率 0.909、点は 62 → 32。現在までの最良（手法 B を使わない場合）。
+- **手法 B（PE と EdgeTAM の別々のクラスタリングの統合）+ D**: 検出率の低下が消える。交差セル + D は合成 0.653（+0.080 [+0.033, +0.128]）、検出率 0.909（現行 0.914）、背景の誤検出 3.8%。AND + D は 0.634（+0.061）、検出率 0.907。MVTec では上乗せにならない（AND + D 0.837、交差セル + D 0.804。独立 54 枚では現行 0.806 に対し 0.797 / 0.773）。
+- **効かなかった**: C1（領域の分類を切り抜きの CLIP 埋め込みで行う）は、成分単位では誤りを減らす（合成 9.2% → 4.1%）が前景を多数消し、最終 IoU は合成 0.496〜0.567・MVTec 0.255〜0.820（現行 0.573 / 0.815）。C2（クラスタリングの特徴を PE-Spatial-T に替える・EdgeTAM と連結する）は MVTec 0.712〜0.803・合成 0.519〜0.590 で、別々のクラスタリングを統合する手法 B に届かない。
+- **限界**: PyTorch 版のみ。変種を同じ画像で多数比べており、多重比較の補正は無い（独立 54 枚で上位を確認したが区間は広い）。ガイドが輝度のみで、透明・低コントラストの物体は縁の手がかりが弱い。実画像の正解は無く目視のみ。
+
+**2026-10-22 に、D・点数 4:4・手法 B の AND を本体に組み込んだ**（共通コード。PyTorch・OpenVINO の両方。`use_edgetam_clustering` で B を切り替え）。内容・結果・処理時間・既知の問題（B で cable が下がる）は [improvement_methods.md §9](improvement_methods.md)、レポートは `outputs/implementation/index.html`。
+
+次の手順（候補）: 処理時間の短縮（現在 中央値 206ms。デコードの反復・作業解像度・INT8・並列実行）、B で cable のような大きな物体が崩れる問題の対策。
+

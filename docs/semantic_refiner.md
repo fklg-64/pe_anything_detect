@@ -88,9 +88,11 @@ sequenceDiagram
     participant S as SemanticRefiner
     participant E as EdgeTAM backend<br/>(OpenVINO / PyTorch)
 
-    R->>S: refine(resized, foreground_map, foreground_mask, semantic_labels, ...)
+    R->>S: refine(resized, foreground_map, foreground_mask, semantic_labels, ..., feats)
+    Note over S,E: feats が渡されなければ encode(正規化した画像) を実行<br/>(use_edgetam_clustering = true のときは粗い判定の前に SegmentationRunner が実行済み)
     S->>E: encode(正規化した画像)
     E-->>S: feats (high_res_feats0/1, image_embed)
+    S->>S: 入力画像の輝度を 128x128 に縮小 (初期マスクの縁を整えるガイド)
     S->>S: 背景の負例点を選ぶ (select_background_points)
 
     loop クラス 1..N
@@ -118,6 +120,10 @@ sequenceDiagram
 
 `predict_encoder` が `resized` を EdgeTAM 用の mean/std で正規化し、`encode` に渡す。得られる `feats = (high_res_feats0, high_res_feats1, image_embed)` は、以降のすべてのクラス・反復で使い回す。
 
+`use_edgetam_clustering: true`（既定。[coarse_segmentation.md §3.5](coarse_segmentation.md)）のときは、粗い判定が EdgeTAM の `image_embed` を使うので、`SegmentationRunner.segment` が**粗い判定の前に 1 回だけ**エンコードし、`refine(..., feats)` に渡す（精緻化の中では再実行しない）。
+
+さらに、初期マスクの縁を整えるガイドとして、`resized`（入力画像）を EdgeTAM の高解像度特徴量と同じ大きさ（128×128）に縮小し、RGB の平均（輝度、0〜1）を作る（`RefineContext.guide`。1 枚につき 1 回）。
+
 ### 4.2 作業解像度
 
 マスク演算（連結成分・メディアン・重なり解決）は画像が大きいと重い。そこで、長辺が `semantic_max_side`（既定 1024）以下になる**作業解像度**で行い、最後に元画像サイズへ戻す。小さい画像は拡大せず、そのまま使う。
@@ -129,7 +135,7 @@ scale = min(1.0, semantic_max_side / max(width, height))
 
 ### 4.3 背景の負例点（全クラス共通）
 
-`select_background_points` で `edgetam_background_point_count`（既定 8）点を選ぶ。選び方は次の順に絞り込む。
+`select_background_points` で `edgetam_background_point_count`（既定 4）点を選ぶ。選び方は次の順に絞り込む。
 
 ```mermaid
 flowchart TD
@@ -188,9 +194,12 @@ flowchart TD
 flowchart TD
     A["coarse_mask (32x32)<br/>主成分"] --> CORE["core = 各成分の core の和"]
     A --> CM["coarse_map = patch_mean(coarse_mask)<br/>(3x3 平均で縁を滑らかに)"]
+    A --> DIL["dilated = 粗いマスクを 1 パッチ膨らませる"]
+    CM --> UNK["unknown = max(coarse_map, dilated)"]
+    DIL --> UNK
     CORE --> COREM["core_map = patch_mean(core)"]
     COREM --> PRIOR
-    CM --> PRIOR["prior_map = max(core_map, 0.5 × coarse_map)"]
+    UNK --> PRIOR["prior_map = max(core_map, 0.5 × unknown)<br/>→ 128x128 に拡大 → ガイデッドフィルタ (入力画像の輝度)"]
     CORE --> FG["正例点 = prompt_points(core, 各成分の最内点, 点数)"]
     PRIOR --> EST["_estimate_class_logit<br/>→ logit (128x128)"]
     FG --> EST
@@ -202,32 +211,50 @@ flowchart TD
 
 ### 6.1 初期マスク（`prior_map`）：粗い結果を事前確率として与える
 
-粗いマスクの中でも、**core（物体の内側）は確実、core の外側（縁）は不確か**という前提で確率を作る。
+粗いマスクの中でも、**core（物体の内側）は確実、core の外側（縁）と、粗いマスクのすぐ外側（1 パッチ）は不確か**という前提で確率を作る。
 
 | 領域 | 確率 | 意味 |
 |---|---|---|
 | core 内 | 1.0 付近 | 前景だと確信できる |
 | core 外の粗いマスク | `PRIOR_NON_CORE_PROBABILITY` = 0.5 | 前景とも背景とも言えない（縁・影） |
-| 粗いマスク外 | 0 付近 | 背景 |
+| **粗いマスクの外側 1 パッチ** | **0.5** | 不明（粗いマスクの信頼限界） |
+| それより外 | 0 付近 | 背景 |
 
-この確率 `p` を `logit = (2p - 1) × PRIOR_LOGIT_RANGE`（±8）に変換し、128×128 に拡大して `mask_input` にする。`p = 0.5` が logit 0（不明）になる。
+粗いマスクはクラスタ単位の判定で作るので、**物体の縁のパッチ（物体と背景のトークンが混ざる）が落ちて、物体より内側に入る**ことがある。外側の 1 パッチを背景（0）にすると、EdgeTAM が縁を戻せず**縁が削れる**（toothbrush・capsule・cable で顕著）。そこで外側 1 パッチも「不明」にし、EdgeTAM（画像）に決めさせる。「粗いマスクを膨らませる」のとは違い、膨らませた分を前景とは言わない。
+
+```python
+unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, PATCH_STRUCTURE).astype(np.float32))
+prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
+```
+
+**縁を画像に沿わせる（ガイデッドフィルタ）**: 外側 1 パッチをまるごと「不明」にすると、小物体では不明の領域が物体と同じ大きさになり、背景へ膨らむ（合成データで悪化）。また、32×32 の事前確率を 128×128 に双一次補間するだけでは、縁の位置が 16px（512 入力）の格子に縛られる。そこで、`prior_map` を 128×128 に拡大し、**入力画像の輝度をガイドにしたガイデッドフィルタ**（`mask_utils.guided_filter`、半径 = 1 パッチ = 128×128 では 4 画素、`GUIDED_FILTER_EPS` = 0.01）にかける。縁の「不明」が、その画素の明るさのパターンが物体側と似ていれば 1 に、背景側と似ていれば 0 に倒れる。
+
+```python
+size = self.et_high_res_feature_size                                    # 128
+prior_map = np.clip(guided_filter(ctx.guide, cv2.resize(prior_map, (size, size), cv2.INTER_LINEAR),
+                                  self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)
+```
+
+この確率 `p` を `logit = (2p - 1) × PRIOR_LOGIT_RANGE`（±8）にして `mask_input` にする（既に 128×128 なので拡大は何もしない）。`p = 0.5` が logit 0（不明）になる。
 
 ```mermaid
 flowchart LR
     subgraph P["確率 p (パッチ格子 32x32)"]
         P1["背景: 0"]
-        P2["縁・影: 0.5"]
+        P2["縁・影・外側 1 パッチ: 0.5"]
         P3["物体の内側 (core): 1"]
     end
-    P --> L["logit = (2p-1) × 8<br/>-8 / 0 / +8"]
-    L --> R["128x128 に双一次拡大<br/>EdgeTAM の mask_input"]
+    P --> UP["128x128 に双一次拡大"]
+    UP --> GF["ガイデッドフィルタ<br/>(入力画像の輝度、半径 4、eps 0.01)<br/>不明の縁が画像の縁に沿って 0 / 1 に倒れる"]
+    GF --> L["logit = (2p-1) × 8<br/>-8 / 0 / +8"]
+    L --> R["EdgeTAM の mask_input"]
 ```
 
-縁を「不明」にしておくことで、EdgeTAM が画像の実際の輪郭に沿って縁を決められる。粗いマスクが太っていても、その太りを鵜呑みにしない。
+縁を「不明」にしておくことで、EdgeTAM が画像の実際の輪郭に沿って縁を決められる。粗いマスクが太っていても、その太りを鵜呑みにしない。効果の測定は [improvement_methods.md §2・§3](improvement_methods.md)（MVTec 0.815 → 0.844、合成データでは外周のみの悪化 0.521 が 0.566 に戻る）。
 
 ### 6.2 正例点（`prompt_points`）
 
-`edgetam_foreground_points_per_class`（既定 8）点を、**core 上**から選ぶ。
+`edgetam_foreground_points_per_class`（既定 4）点を、**core 上**から選ぶ。
 
 1. **各連結成分の最内点を必ず含める**。細い物体・小さい物体にも漏れなく点が置かれる。
 2. 点数が足りなければ、core 上で既存の点から最も遠い点を順に足す（最遠点サンプリング）。
@@ -349,8 +376,9 @@ flowchart TD
 
 | キー | 既定 | 意味 |
 |---|---|---|
-| `edgetam_foreground_points_per_class` | 8 | クラスごとの正例点の数 |
-| `edgetam_background_point_count` | 8 | 背景の負例点の数（全クラス共通） |
+| `edgetam_foreground_points_per_class` | 4 | クラスごとの正例点の数（以前は 8。外周 + ガイデッドフィルタと併用で、8 と同等以上のまま点が約半分） |
+| `edgetam_background_point_count` | 4 | 背景の負例点の数（全クラス共通。以前は 8） |
+| `use_edgetam_clustering` | true | 粗い判定で EdgeTAM の特徴でもクラスタ分けして AND する（[coarse_segmentation.md §3.5](coarse_segmentation.md)）。true のとき EdgeTAM のエンコードを粗い判定の前に 1 回だけ実行して精緻化に渡す |
 | `edgetam_refine_iterations` | 3 | 前回のロジットを入力に再推定する回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度の長辺上限 |
 | `edgetam_high_res_feature_downscale_factor` | 4 | 初期マスクの解像度（`image_size` ÷ この値 = 128） |
@@ -364,7 +392,8 @@ flowchart TD
 | `MIN_REGION_PATCH_AREA` | 1.0 | ノイズとして除く最小面積（1 パッチ分に相当する画素数の倍率） |
 | `MIN_ISOLATED_PATCHES` | 3 | 斑点とみなす孤立成分の上限パッチ数 |
 | `PRIOR_LOGIT_RANGE` | 8.0 | 初期マスクのロジット幅 |
-| `PRIOR_NON_CORE_PROBABILITY` | 0.5 | core の外側にある粗いマスクの確率 |
+| `PRIOR_NON_CORE_PROBABILITY` | 0.5 | core の外側にある粗いマスクと、その外側 1 パッチの確率 |
+| `GUIDED_FILTER_EPS` | 0.01 | 初期マスクの縁を整えるガイデッドフィルタの正則化（0.001〜0.01 で結果は同じ）。半径は 1 パッチ（`et_high_res_feature_size // feature_size` = 4 画素） |
 | `MASK_LOGIT_THRESHOLD` | 0.0 | 二値化の閾値 |
 | `SCORE_PRIOR_WEIGHT` | 0.5 | スコアに粗い前景らしさを混ぜる割合 |
 | `MEDIAN_BLUR_KSIZE` | 3 | 輪郭の平滑化カーネル |

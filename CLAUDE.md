@@ -18,6 +18,7 @@ python test_pytorch_sam2.py  # PyTorch 版を SAM2.1（公式 Hiera-T）で精�
 python prompts/create_prompts.py  # prompts/semantic.json を生成
 python tools/evaluation/eval_prompts.py [--prompts-dir DIR]  # MVTec(fg_mask)でプロンプトを評価（前景IoU・クラスの割れやすさ）
 python tools/evaluation/eval_prompts.py --gt-dir DIR  # 任意の画像+正解マスク(DIR/images, DIR/masks)で前景IoU・物体の検出率(大きさ別)・背景の誤検出を評価
+python tools/evaluation/eval_pipeline.py --backend {torch,openvino} [--cluster-layers 6] [--set key=value ...] [--tasks mvtec,verify,synthetic,agree,timing]  # 本体のパイプライン（SegmentationRunner + PyTorch / OpenVINO backend）を MVTec と合成データで評価（設定を上書きして比べられる。結果は outputs/implementation/）
 python tools/evaluation/diag_clusters.py  # 粗いセグメンテーションの診断（クラスタ単位の前景/背景判定の誤り率）
 python tools/evaluation/diag_refined_judgement.py [--gt-dir DIR]  # リファイン後のマスクを前景/背景に再判定したときの効果を診断（採用していない案の検証用）
 python tools/experiments/tiling/eval_tiling.py [--mode baseline|A|B] [--viz-dir DIR] [--diag]  # Overlapping Tiling（4タイル+全体縮小）で前景マップを作る実験。本体には組み込んでいない
@@ -34,12 +35,21 @@ python tools/experiments/dual_cluster_recheck/exp_fgarea.py  # fg_mask の面積
 python tools/experiments/dual_cluster_recheck/report_recheck.py  # 上の結果を outputs/dual_cluster_recheck/index.html に可視化
 python tools/setup/vendor_sam2.py [--src /home/llm/sam2]  # 公式 SAM2.1 を core/torch/sam2_official/ にコピー（パッケージ名を sam2_official に変えるだけ。core/torch/sam2 は EdgeTAM の fork で別物）
 python tools/experiments/sam2/exp_sam2.py --task {mvtec,synthetic,timing,cases,develop} --backend {edgetam,sam2} --points 前景:背景,... [--setting default|ring] [--verify]  # EdgeTAM → SAM2.1 の切り替えと、プロンプト点数の測定（PyTorch版、結果は outputs/sam2/。本体には組み込んでいない）
+python tools/experiments/diagnosis/exp_diagnosis.py --task {floor,oracle,decompose,classes,cases} [--data-set synthetic|mvtec]  # 性能向上の方針のための診断（粗い結果を正解にしたときの上限・粗い誤りと最終マスクの誤りの分解・クラス単位の評価。結果は outputs/diagnosis/。本体には組み込んでいない）
+python tools/experiments/diagnosis/exp_timing.py --task {stages,backbones}  # OpenVINO 版の段階別の時間 / 候補バックボーン（PE-Spatial・DINOv3 など）の OpenVINO 遅延（重みなし）
+python tools/experiments/diagnosis/report_diagnosis.py  # 上の結果を outputs/diagnosis/index.html に可視化
+python tools/experiments/prior_upsample/exp_prior.py --task {oracle,mvtec,synthetic} --modes default,ring,ring_gg4 [--coarse dual_and_embed_L6] [--points 4:4] [--verify]  # 精緻化の事前マスクの縁の実験（外周「不明」+ ガイデッドフィルタ = 手法 D。結果は outputs/prior_upsample/。本体には組み込んでいない）
+python tools/experiments/prior_upsample/viz_prior.py --task {develop,mvtec,synthetic}  # 事前マスクの作り方ごとの事例画像
+python tools/experiments/crop_cls/exp_crop.py --task {components,mvtec,synthetic,classes} --variants crop224_masked_and,...  # 領域の分類を切り抜きの CLIP 埋め込みで行う実験（C1。効果なし。結果は outputs/crop_cls/）
+python tools/experiments/dense_features/exp_dense.py --task {mvtec,synthetic} --variants feat_spatial,feat_pe6+edge,...  # クラスタリングの特徴源の差し替え・連結（C2。PE-Spatial-T など。効果なし。結果は outputs/dense_features/）
+python tools/experiments/phase2/report_phase2.py  # 上の 3 実験の結果を outputs/phase2/index.html に可視化
 python convert_openvino.py --cluster-layers 6 --out-dir ./weights/openvino_models_l6 --pe-only  # クラスタリングに使う層を変えた PE のモデルだけを別フォルダに書き出す（既存のモデルは上書きしない）
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
+- 性能向上が確認できた手法（外周「不明」・外周 + ガイデッドフィルタ・PE と EdgeTAM の統合・点数 4:4）の詳細は `docs/improvement_methods.md`。**外周 + ガイデッドフィルタ（精緻化の初期マスク）・点数 4:4・PE × EdgeTAM の AND（`use_edgetam_clustering`）は本体に組み込み済み**（共通コードなので PyTorch・OpenVINO の両方）。実験用のコード（`tools/experiments/`）は、従来の運用（8:8・外周なし）を基準にしている。
 - `tools/` は用途別のフォルダ: `evaluation/`（評価・診断）, `dataset/`, `gui/`, `experiments/<名前>/`（手法の検証実験。本体には未組み込みで、`outputs/<名前>/` と対）。実験どうしは `from tools.experiments.decontam import exp_decontam as E` の形で import し合う。構成は `tools/README.md`。評価カテゴリは `tools/evaluation/eval_prompts.py` の `OBJECT_CATEGORIES`（10 種。過去の数値はこれ）と `EVAL_CATEGORIES`（zipper を除く 9 種。zipper は fg_mask が画面の 78% で物体として扱う意味が無い）。
 - 実行対象画像は `develop.py` / `test_pytorch.py` 内の `image_paths` リストを直接編集する（CLI 引数なし）。
 - 設定は `configs/ov_config.yaml`（OpenVINO）/ `configs/torch_config.yaml`（PyTorch）。`core.utils.load_config()` の既定は ov_config。
@@ -72,11 +82,11 @@ backend:
 パイプライン（`SegmentationRunner.segment`）:
 
 1. `resize_image` + `normalize_image`（リサイズは CLIP と EdgeTAM で共通、正規化はモデルごと）
-2. `CoarseSegmenter.extract_features`: CLIP 画像特徴（パッチ・fused パッチ）
-3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る
+2. （`use_edgetam_clustering: true` のとき）EdgeTAM エンコーダーを先に 1 回だけ実行（結果は粗い判定と精緻化の両方で使う）。`CoarseSegmenter.extract_features`: CLIP 画像特徴（パッチ・fused パッチ）
+3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る。`use_edgetam_clustering: true` なら、EdgeTAM の `image_embed` でも別に KMeans して同じ判定を行い、前景確信度の小さい方（AND）を採る（誤検出を減らす）
 4. `assign_semantic_labels`: クラスタに対応するプロンプトで粗いセマンティックラベルを付与
 5. `refine_coarse_segmentation`: 穴埋め・細い領域の統合
-6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点）/ 背景（`edgetam_background_point_count` 点）のプロンプト点で EdgeTAM の encoder/decoder を反復し、クラスを統合
+6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点、既定 4）/ 背景（`edgetam_background_point_count` 点、既定 4）のプロンプト点と、初期マスク（粗いマスクの外側 1 パッチを「不明」にし、128×128 に拡大して入力画像の輝度をガイドにしたガイデッドフィルタで縁を整えたもの）で EdgeTAM の decoder を反復し、クラスを統合（encoder は 2 で実行済みなら再実行しない）
 7. `run()` では `ResultSaver` が `output_dir/<画像名>/` に可視化を保存
 
 `core/utils.py` に共通ヘルパー（`Timer` コンテキストマネージャー、`load_image`, `resize_image`, `normalize_image`, `preprocess_image`, `load_config`）。各処理は `with Timer(...)` で ms 計測する流儀。
