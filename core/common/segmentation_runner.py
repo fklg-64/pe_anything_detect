@@ -1,6 +1,8 @@
+"""CLIPによる粗い推定 -> EdgeTAMによる精緻化 の全体の流れ（画像1枚分）をつなぐ。"""
+
 import time
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 
@@ -37,7 +39,7 @@ class SegmentationRunner:
         self.foreground_prompts = self.coarse.foreground_prompts
         self.background_prompts = self.coarse.background_prompts
 
-    def segment(self, image_raw: np.ndarray, debug_dir: Union[Path, None] = None) -> SegmentationResult:
+    def segment(self, image_raw: np.ndarray, debug_dir: Optional[Path] = None) -> SegmentationResult:
         """1枚の画像（RGB）をセグメンテーションする。ファイルへの保存はしない。
 
         debug_dir: デバッグ中間画像の保存先。config の debug が true で、かつ指定されたときだけ保存する。
@@ -55,10 +57,10 @@ class SegmentationRunner:
             image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
 
         # EdgeTAMの特徴量抽出（粗い判定で EdgeTAM の特徴を使うときは、ここで 1 回だけ実行して精緻化にも渡す）
-        edgetam_feats = None
+        edgetam_features = None
         if self.use_edgetam_clustering:
             with Timer("EdgeTAM特徴量抽出処理時間"):
-                edgetam_feats = self.refiner.predict_encoder(resized)
+                edgetam_features = self.refiner.predict_encoder(resized)
 
         # 特徴量抽出
         with Timer("特徴量抽出処理時間"):
@@ -66,11 +68,14 @@ class SegmentationRunner:
 
         # CLIP + KMeans による初期前景マップの推定
         with Timer("粗い前景マスク取得処理時間"):
-            foreground_map, foreground_mask, cluster_labels, cluster_index_list = (
-                self.coarse.generate_foreground_map(
-                    patch_features, fused_patch_features, *((edgetam_feats[2],) if edgetam_feats is not None else ())
+            if edgetam_features is None:
+                coarse_foreground = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
+            else:
+                edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
+                coarse_foreground = self.coarse.generate_foreground_map(
+                    patch_features, fused_patch_features, edgetam_image_embed
                 )
-            )
+            foreground_map, foreground_mask, cluster_labels, cluster_index_list = coarse_foreground
 
         # セマンティックセグメンテーションのラベルを取得
         with Timer("セマンティックセグメンテーション処理時間"):
@@ -84,7 +89,7 @@ class SegmentationRunner:
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             semantic_map, prompt_indices, point_coords, point_labels = self.refiner.refine(
-                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_feats
+                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_features
             )
 
         elapsed_time = time.time() - start

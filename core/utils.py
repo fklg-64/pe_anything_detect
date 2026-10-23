@@ -1,10 +1,13 @@
+"""全体で共有する小さなヘルパー（処理時間の計測、画像の読み込み・前処理、設定ファイルの読み込み）。"""
+
 import cv2
 import time
 import yaml
 import numpy as np
 from PIL import Image
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Union
+
 
 class Timer:
     """ミリ秒単位で処理時間を計測し表示するコンテキストマネージャー"""
@@ -20,6 +23,7 @@ class Timer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.elapsed_ms = (time.perf_counter() - self.start) * 1000
         print(f"{self.name:<{self.width}} : {self.elapsed_ms:6.2f} ms")
+
 
 # 画像読み込み
 def load_image(data: Union[str, Path, Image.Image, np.ndarray]) -> np.ndarray:
@@ -80,7 +84,7 @@ def preprocess_image(
     return normalize_image(resize_image(image, target_size), mean, std)
 
 # yaml設定データの読み込み
-def load_config(config_path: str = "./configs/ov_config.yaml"):
+def load_config(config_path: str = "./configs/ov_config.yaml") -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config

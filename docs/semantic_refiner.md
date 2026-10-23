@@ -211,6 +211,8 @@ flowchart TD
 
 ### 6.1 初期マスク（`prior_map`）：粗い結果を事前確率として与える
 
+実装は `SemanticRefiner._build_prior_map`（`_refine_region` から呼ばれる）。
+
 粗いマスクの中でも、**core（物体の内側）は確実、core の外側（縁）と、粗いマスクのすぐ外側（1 パッチ）は不確か**という前提で確率を作る。
 
 | 領域 | 確率 | 意味 |
@@ -230,7 +232,7 @@ prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
 **縁を画像に沿わせる（ガイデッドフィルタ）**: 外側 1 パッチをまるごと「不明」にすると、小物体では不明の領域が物体と同じ大きさになり、背景へ膨らむ（合成データで悪化）。また、32×32 の事前確率を 128×128 に双一次補間するだけでは、縁の位置が 16px（512 入力）の格子に縛られる。そこで、`prior_map` を 128×128 に拡大し、**入力画像の輝度をガイドにしたガイデッドフィルタ**（`mask_utils.guided_filter`、半径 = 1 パッチ = 128×128 では 4 画素、`GUIDED_FILTER_EPS` = 0.01）にかける。縁の「不明」が、その画素の明るさのパターンが物体側と似ていれば 1 に、背景側と似ていれば 0 に倒れる。
 
 ```python
-size = self.et_high_res_feature_size                                    # 128
+size = self.high_res_feature_size                                    # 128
 prior_map = np.clip(guided_filter(ctx.guide, cv2.resize(prior_map, (size, size), cv2.INTER_LINEAR),
                                   self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)
 ```
@@ -393,7 +395,7 @@ flowchart TD
 | `MIN_ISOLATED_PATCHES` | 3 | 斑点とみなす孤立成分の上限パッチ数 |
 | `PRIOR_LOGIT_RANGE` | 8.0 | 初期マスクのロジット幅 |
 | `PRIOR_NON_CORE_PROBABILITY` | 0.5 | core の外側にある粗いマスクと、その外側 1 パッチの確率 |
-| `GUIDED_FILTER_EPS` | 0.01 | 初期マスクの縁を整えるガイデッドフィルタの正則化（0.001〜0.01 で結果は同じ）。半径は 1 パッチ（`et_high_res_feature_size // feature_size` = 4 画素） |
+| `GUIDED_FILTER_EPS` | 0.01 | 初期マスクの縁を整えるガイデッドフィルタの正則化（0.001〜0.01 で結果は同じ）。半径は 1 パッチ（`high_res_feature_size // feature_size` = 4 画素） |
 | `MASK_LOGIT_THRESHOLD` | 0.0 | 二値化の閾値 |
 | `SCORE_PRIOR_WEIGHT` | 0.5 | スコアに粗い前景らしさを混ぜる割合 |
 | `MEDIAN_BLUR_KSIZE` | 3 | 輪郭の平滑化カーネル |

@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -71,7 +71,7 @@ class ResultSaver:
         class_names: List[str],
     ) -> None:
         height, width = image_raw.shape[:2]
-        size = (width, height)
+        size = (width, height)  # PIL の resize に渡す (幅, 高さ)
 
         # 最終結果
         self._save_semantic_result(save_dir, image_raw, result.semantic_map, class_names)
@@ -153,13 +153,13 @@ class ResultSaver:
     # 粗い推定の中間結果
     # -------------------------------------------------------------------------
 
-    def _colorize_labels(self, labels_2d: np.ndarray, size) -> Image.Image:
+    def _colorize_labels(self, labels_2d: np.ndarray, size: Tuple[int, int]) -> Image.Image:
         """ラベルマップをパレットで着色し、元画像サイズへ拡大する。"""
         image = Image.fromarray(labels_2d.astype(np.uint8))
         image.putpalette(self.color_palette)
         return image.resize(size, resample=Image.Resampling.NEAREST)
 
-    def _save_cluster_maps(self, save_dir: Path, size, result: SegmentationResult) -> None:
+    def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
         """KMeansのクラスタ、整形前後の粗いセマンティックラベルを着色して保存。"""
         grid = (self.feature_size, self.feature_size)
         self._colorize_labels(result.cluster_labels.reshape(grid), size).save(
@@ -172,7 +172,7 @@ class ResultSaver:
             save_dir / "coarse_semantic_segmentation_raw.png"
         )
 
-    def _save_foreground_maps(self, save_dir: Path, size, result: SegmentationResult) -> Image.Image:
+    def _save_foreground_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> Image.Image:
         """前景度合いマップと粗い前景マスクを保存し、マスク画像を返す。"""
         grid = (self.feature_size, self.feature_size)
         foreground_map_2d = (result.foreground_map * 255).astype(np.uint8).reshape(grid)

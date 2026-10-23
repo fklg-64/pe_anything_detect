@@ -1,12 +1,12 @@
 import sys
 from pathlib import Path
 
+# core/torch を sys.path に加える。EdgeTAM のベンダリングコード core/torch/sam2 を、トップレベルのパッケージ `sam2` として import するため
 core_dir = Path(__file__).resolve().parent
 if str(core_dir) not in sys.path:
     sys.path.insert(0, str(core_dir))
 
-import yaml
-from typing import Union, List, Dict, Any, Tuple, Optional
+from typing import Union, List, Tuple, Optional
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -23,26 +23,18 @@ from timm.models.repvit import RepVit
 
 # ベースとした実装（使わない）
 class EdgeTAMPredictor:
-    def __init__(
-        self, 
-        config: yaml
-    ):
+    def __init__(self, config: dict):
         """
         モデルの初期化と重みのロードを行います。
         """
-        # 設定値の初期化
-        self.init_value(config)
-        
-        # モデルとPredictorの構築
-        sam_model = build_sam2(self.onfig_path, self.checkpoint_path, device=self.device)
-        self.predictor = SAM2ImagePredictor(sam_model)
-
-    def init_value(self, config: yaml):
-        # config関係
         self.checkpoint_path = config["edgetam_model_path"]
         self.config_path = config["edgetam_model_config"]
         self.device = config["device"]
         self.dtype = getattr(torch, config["dtype"])
+
+        # モデルとPredictorの構築
+        sam_model = build_sam2(self.config_path, self.checkpoint_path, device=self.device)
+        self.predictor = SAM2ImagePredictor(sam_model)
 
     def set_image(
         self, 
@@ -93,7 +85,9 @@ class EdgeTAMPredictor:
 
 
 class EdgeTamRunner:
-    def __init__(self, config: yaml):
+    """EdgeTAMのエンコーダ・デコーダをまとめたPyTorch版（旧パイプライン core/torch/legacy 用。共通パイプラインは TorchEdgeTamBackend を使う）。"""
+
+    def __init__(self, config: dict):
         self.edgetam_encoder = RepVitModel(config)
         self.edgetam_decoder = DecodeModel(config)
 
@@ -170,15 +164,10 @@ class EdgeTamModel:
 
 
 class BaseModel(nn.Module):
-    def __init__(
-        self, 
-        config: yaml
-    ):
-        super().__init__()
-        self.init_value(config)
+    """EdgeTAMのモデルの重み・設定の場所と、デバイス・精度を設定から受け取る基底クラス。"""
 
-    def init_value(self, config: yaml):
-        # config関係
+    def __init__(self, config: dict):
+        super().__init__()
         self.checkpoint_path = config["edgetam_model_path"]
         self.config_path = config["edgetam_model_config"]
         self.device = config["device"]
@@ -186,11 +175,9 @@ class BaseModel(nn.Module):
 
 
 class RepVitModel(BaseModel):
+    """EdgeTAMの画像エンコーダ（RepViT + FPN）。OpenVINO変換の元モデルも兼ねる。"""
 
-    def __init__(
-        self,
-        config: yaml
-    ):
+    def __init__(self, config: dict):
         super().__init__(config)
         # クラス経由で共有インスタンスを取得（初回のみロードされる）
         self.edgetam_model, self._transforms = EdgeTamModel.get_model(
@@ -235,10 +222,7 @@ class DecodeModel(BaseModel):
     OpenVINO 変換に対応するためのインターフェースおよびグラフ構造を保持しています。
     """
 
-    def __init__(
-        self,
-        config: yaml
-    ):
+    def __init__(self, config: dict):
         super().__init__(config)
         # モデルと画像変換器の共有インスタンスを取得
         self.edgetam_model, self._transforms = EdgeTamModel.get_model(
@@ -393,10 +377,11 @@ class DecodeModel(BaseModel):
 
         return masks, iou_predictions, low_res_masks
 
+
 class TorchEdgeTamBackend(EdgeTamHelper):
     """EdgeTAMのPyTorch backend。共通ロジックに合わせ、入出力は np.ndarray（前後処理は EdgeTamHelper）。"""
 
-    def __init__(self, config: yaml):
+    def __init__(self, config: dict):
         super().__init__(config)
         self.device = config["device"]
         self.edgetam_encoder = RepVitModel(config)

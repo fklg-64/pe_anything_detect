@@ -61,14 +61,14 @@ class SemanticRefiner:
     def __init__(self, edgetam: Union[EdgeTamBackend, EdgeTamHelper], feature_size: int, config: dict):
         self.edgetam = edgetam
         self.feature_size = feature_size
-        self.fg_pt_per_cls = config["edgetam_foreground_points_per_class"]
-        self.bg_pt_cnt = config["edgetam_background_point_count"]
+        self.foreground_points_per_class = config["edgetam_foreground_points_per_class"]
+        self.background_point_count = config["edgetam_background_point_count"]
         self.refine_iterations = config["edgetam_refine_iterations"]
         self.semantic_max_side = config["semantic_max_side"]
-        # edgetamの高解像度特徴量サイズ
-        self.et_high_res_feature_size: int = edgetam.target_size // config["edgetam_high_res_feature_downscale_factor"]
+        # EdgeTAMの高解像度特徴量の一辺の画素数
+        self.high_res_feature_size: int = edgetam.target_size // config["edgetam_high_res_feature_downscale_factor"]
         # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
-        self.guide_radius: int = max(1, self.et_high_res_feature_size // feature_size)
+        self.guide_radius: int = max(1, self.high_res_feature_size // feature_size)
 
         # デバッグ中間画像の保存先。None なら保存しない（画像ごとに SegmentationRunner が設定する）
         self.debug_dir: Optional[Path] = None
@@ -118,14 +118,9 @@ class SemanticRefiner:
             with Timer("    ┌ edgetam特徴量抽出"):
                 feats = self.predict_encoder(resized)
 
-        # 初期マスクの縁を整えるガイド（入力画像の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小）
-        guide = cv2.resize(
-            resized, (self.et_high_res_feature_size, self.et_high_res_feature_size), interpolation=cv2.INTER_AREA
-        ).astype(np.float32).mean(axis=-1) / 255.0
-
         # 背景の負例点は全クラス共通
         background_coords = self.transform_coords(
-            select_background_points(foreground_binary, self.bg_pt_cnt, foreground_map).tolist(), width, height
+            select_background_points(foreground_binary, self.background_point_count, foreground_map).tolist(), width, height
         )
 
         ctx = RefineContext(
@@ -137,7 +132,7 @@ class SemanticRefiner:
             size=(work_w, work_h),
             # 粗いマスクの信頼限界は1パッチ。1パッチ未満の領域はノイズとして扱う
             min_area=max(1, int(MIN_REGION_PATCH_AREA * work_w * work_h / self.feature_size ** 2)),
-            guide=guide,
+            guide=self._make_guide(resized),
             semantic_map=np.zeros((work_h, work_w), dtype=np.uint8),
             best_score=np.full((work_h, work_w), -1.0, dtype=np.float32),
         )
@@ -156,6 +151,11 @@ class SemanticRefiner:
             semantic_map = cv2.resize(semantic_map, (width, height), interpolation=cv2.INTER_NEAREST)
 
         return semantic_map, prompt_indices, ctx.point_coords, ctx.point_labels
+
+    def _make_guide(self, resized: np.ndarray) -> np.ndarray:
+        """初期マスクの縁を整えるガイド。入力画像の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小したもの（float32、0〜1）。"""
+        size = self.high_res_feature_size
+        return cv2.resize(resized, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32).mean(axis=-1) / 255.0
 
     def _refine_classes(
         self,
@@ -176,8 +176,8 @@ class SemanticRefiner:
 
             # 孤立した極小成分（背景クラスタの斑点）はクラスの推定に混ぜない。混ぜると、斑点に置いた点を
             # 経由して物体のマスクが周囲の背景へ広がる。斑点は後段で個別に（範囲を制限して）扱う
-            main = [c for c in comps if c[2].sum() >= MIN_ISOLATED_PATCHES] or comps
-            coarse_main = np.any([c[2] for c in main], axis=0)
+            main = [c for c in comps if c.region.sum() >= MIN_ISOLATED_PATCHES] or comps
+            coarse_main = np.any([c.region for c in main], axis=0)
             binary, score, core = self._refine_region(ctx, coarse_main, main, f"クラス{class_id}")
 
             # 重なり部分はスコアの高いクラスを優先
@@ -195,12 +195,13 @@ class SemanticRefiner:
         """取りこぼし防止: 最内点がどのクラスにも覆われていない粗い連結成分は、単独で再推定する。"""
         work_w, work_h = ctx.size
         for class_id, comps in class_components.items():
-            for peak, core_c, region in comps:
+            for component in comps:
+                peak, region = component.peak, component.region
                 px = min(int((peak[0] + 0.5) * work_w / self.feature_size), work_w - 1)
                 py = min(int((peak[1] + 0.5) * work_h / self.feature_size), work_h - 1)
                 if ctx.semantic_map[py, px] != 0:
                     continue
-                binary, _, _ = self._refine_region(ctx, region, [(peak, core_c, region)], f"クラス{class_id}(再推定)")
+                binary, _, _ = self._refine_region(ctx, region, [component], f"クラス{class_id}(再推定)")
                 if region.sum() < MIN_ISOLATED_PATCHES:
                     # 極小成分は、成分を1パッチ広げた範囲までに制限する
                     allowed = binary_dilation(region, structure=PATCH_STRUCTURE)
@@ -216,44 +217,51 @@ class SemanticRefiner:
         EdgeTAMに与えた点は ctx.point_coords / point_labels に追記する。
         """
         core = np.zeros_like(coarse_mask, dtype=bool)
-        for _, core_c, _ in comps:
-            core |= core_c
+        for component in comps:
+            core |= component.core
         coarse_map = patch_mean(coarse_mask)
-        core_map = patch_mean(core)
-        # core内は前景、core外の粗いマスクとその外側1パッチ(信頼限界)は不明(PRIOR_NON_CORE_PROBABILITY)、それより外は背景。
-        # 外側1パッチを背景にすると、粗いマスクが物体より内側に入ったとき（縁のパッチは物体と背景のトークンが混ざり落ちやすい）縁が削れる
-        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, PATCH_STRUCTURE).astype(np.float32))
-        prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
-        # 不明の縁を、入力画像の縁に沿って物体側・背景側へ倒す（128x128 に拡大してガイデッドフィルタ）。パッチ格子の縛りと、小物体で外周が背景へ膨らむのを避ける
-        size = self.et_high_res_feature_size
-        prior_map = np.clip(
-            guided_filter(
-                ctx.guide, cv2.resize(prior_map, (size, size), interpolation=cv2.INTER_LINEAR), self.guide_radius, GUIDED_FILTER_EPS
-            ),
-            0.0, 1.0,
-        )
+        prior_map = self._build_prior_map(ctx, coarse_mask, coarse_map, core)
 
-        fg_points = prompt_points(core, [c[0] for c in comps], self.fg_pt_per_cls)
+        fg_points = prompt_points(core, [c.peak for c in comps], self.foreground_points_per_class)
         logit, coords, labels = self._estimate_class_logit(
             ctx.feats, prior_map, fg_points, ctx.background_coords, ctx.width, ctx.height, tag
         )
         ctx.point_coords.extend(coords)
         ctx.point_labels.extend(labels)
 
-        coarse_full = resize_map(coarse_mask, ctx.size, cv2.INTER_NEAREST) > 0
+        # 粗い前景らしさ（粗いマスクの周辺平均 × 前景確信度）
+        coarse_foreground_score = (coarse_map * ctx.foreground_map).astype(np.float32)
         if logit is None:
-            return coarse_full, resize_map(coarse_map * ctx.foreground_map, ctx.size, cv2.INTER_LINEAR), core
+            coarse_full = resize_map(coarse_mask, ctx.size, cv2.INTER_NEAREST) > 0
+            return coarse_full, resize_map(coarse_foreground_score, ctx.size, cv2.INTER_LINEAR), core
 
         logit_full = cv2.resize(logit.astype(np.float32), ctx.size, interpolation=cv2.INTER_LINEAR)
         binary = clean_mask(logit_full > MASK_LOGIT_THRESHOLD, ctx.min_area).astype(bool)
 
         # 重なり解決用スコア = EdgeTAMの確信度 × ((1-w) + w × 粗い前景らしさ)
         confidence = 1.0 / (1.0 + np.exp(-logit.astype(np.float32)))
-        prior_low = cv2.resize(
-            (coarse_map * ctx.foreground_map).astype(np.float32), confidence.shape[::-1], interpolation=cv2.INTER_LINEAR
-        )
+        prior_low = cv2.resize(coarse_foreground_score, confidence.shape[::-1], interpolation=cv2.INTER_LINEAR)
         score = confidence * ((1.0 - SCORE_PRIOR_WEIGHT) + SCORE_PRIOR_WEIGHT * prior_low)
         return binary, resize_map(score, ctx.size, cv2.INTER_LINEAR), core
+
+    def _build_prior_map(
+        self, ctx: RefineContext, coarse_mask: np.ndarray, coarse_map: np.ndarray, core: np.ndarray
+    ) -> np.ndarray:
+        """EdgeTAMに初期マスクとして与える、前景確率のマップ（高解像度特徴量と同じ大きさ、0〜1）を作る。
+
+        core内は前景、core外の粗いマスクとその外側1パッチ(信頼限界)は不明(PRIOR_NON_CORE_PROBABILITY)、それより外は背景。
+        外側1パッチを背景にすると、粗いマスクが物体より内側に入ったとき（縁のパッチは物体と背景のトークンが混ざり落ちやすい）縁が削れる。
+        不明の縁は、入力画像の縁に沿って物体側・背景側へ倒す（高解像度特徴量の大きさに拡大してガイデッドフィルタ）。
+        パッチ格子の縛りと、小物体で外周が背景へ膨らむのを避けるため。
+
+        coarse_map: coarse_mask のパッチ近傍平均（patch_mean）。
+        """
+        core_map = patch_mean(core)
+        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, PATCH_STRUCTURE).astype(np.float32))
+        prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
+        size = self.high_res_feature_size
+        upsampled = cv2.resize(prior_map, (size, size), interpolation=cv2.INTER_LINEAR)
+        return np.clip(guided_filter(ctx.guide, upsampled, self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)
 
     def _estimate_class_logit(
         self,
@@ -276,7 +284,7 @@ class SemanticRefiner:
 
         mask_input = cv2.resize(
             (2.0 * prior_map - 1.0) * PRIOR_LOGIT_RANGE,
-            (self.et_high_res_feature_size, self.et_high_res_feature_size),
+            (self.high_res_feature_size, self.high_res_feature_size),
             interpolation=cv2.INTER_LINEAR,
         )[None, ...]
 

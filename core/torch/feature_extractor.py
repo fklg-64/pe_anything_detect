@@ -1,46 +1,45 @@
-import os
-import sys
-
-from typing import List, Union
-
-import yaml
 import types
-import numpy as np
+from typing import List
 
+import numpy as np
+import open_clip
 import torch
 import torch.nn.functional as F
-import open_clip
 from open_clip.model import CustomTextCLIP
 
-from core.torch.monkey_patch import *
+# monkey_patch は import した時点で timm 側へのパッチ（動的な画像サイズ対応）が適用される。モデル生成より前に import すること
+from core.torch.monkey_patch import (
+    attention_rope_forward,
+    attentionpoollatent_forward,
+    custom_attentionpoollatent_forward,
+    encode_image,
+    eva_block_forward,
+    eva_forward,
+    eva_forward_features,
+    eva_forward_head,
+    timmmodel_forward,
+)
+
+# PE-Core / PE-Spatial（ViT）のブロック数。PyTorchで詳細な特徴量を取るときに、この全ブロックをパッチする
+NUM_BLOCKS = 12
 
 
 class TorchCLIPFeatureExtractor:
     """CLIPモデルの初期化、モンキーパッチ適用、および特徴量抽出を担当するクラス"""
 
-    def __init__(
-        self,
-        config: yaml
-    ):
-        self.init_value(config)
-
-        self.model, self.preprocess = self._setup_model()
-        self.tokenizer = open_clip.get_tokenizer(self.model_id)
-
-        # パッチサイズ、特徴マップサイズ
-        self.patch_size = self.model.visual.trunk.patch_embed.patch_size[0]
-        self.feature_size = self.force_image_size // self.patch_size
-
-    def init_value(self, config: yaml):
+    def __init__(self, config: dict):
         self.model_id = config["pe_model_id"]
         self.force_image_size = config["image_size"]
         self.to_openvino = config["to_openvino"]
         # クラスタリングに使う層（第 N ブロックの出力）。OpenVINO モデルの fused_layer_features に連結して出力される
         self.cluster_layers = list(config.get("cluster_layers", [8, 9, 10]))
 
+        self.model, self.preprocess = self._setup_model()
+        self.tokenizer = open_clip.get_tokenizer(self.model_id)
+
         # パッチサイズ、特徴マップサイズ
-        self.patch_size: Union[int, None] = None
-        self.feature_size: Union[int, None] = None
+        self.patch_size: int = self.model.visual.trunk.patch_embed.patch_size[0]
+        self.feature_size: int = self.force_image_size // self.patch_size
 
     def _setup_model(self):
         # モデルの読み込み
@@ -48,38 +47,27 @@ class TorchCLIPFeatureExtractor:
             self.model_id, force_image_size=self.force_image_size
         )
         model: CustomTextCLIP
+        trunk = model.visual.trunk
 
         # モンキーパッチの適用
         model.encode_image = types.MethodType(encode_image, model)
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
         # OpenVINO化の有無で設定変更（pytorchで処理する場合は、詳細な特徴量も取得）
         if not self.to_openvino:
-            for i in range(12):
-                model.visual.trunk.blocks[i].attn.forward = types.MethodType(attention_rope_forward, model.visual.trunk.blocks[i].attn)
-                model.visual.trunk.blocks[i].forward = types.MethodType(eva_block_forward, model.visual.trunk.blocks[i])
-        model.visual.trunk.forward = types.MethodType(eva_forward, model.visual.trunk)
-        model.visual.trunk.forward_head = types.MethodType(eva_forward_head, model.visual.trunk)
-        model.visual.trunk.forward_features = types.MethodType(eva_forward_features, model.visual.trunk)
-        model.visual.trunk.custom_forward = types.MethodType(custom_attentionpoollatent_forward, model.visual.trunk)
-        model.visual.trunk.attn_pool.forward = types.MethodType(attentionpoollatent_forward, model.visual.trunk.attn_pool)
+            for block in trunk.blocks[:NUM_BLOCKS]:
+                block.attn.forward = types.MethodType(attention_rope_forward, block.attn)
+                block.forward = types.MethodType(eva_block_forward, block)
+        trunk.forward = types.MethodType(eva_forward, trunk)
+        trunk.forward_head = types.MethodType(eva_forward_head, trunk)
+        trunk.forward_features = types.MethodType(eva_forward_features, trunk)
+        trunk.custom_forward = types.MethodType(custom_attentionpoollatent_forward, trunk)
+        trunk.attn_pool.forward = types.MethodType(attentionpoollatent_forward, trunk.attn_pool)
 
         # OpenVINO化の有無で設定変更
-        if self.to_openvino:
-            setattr(model.visual, "to_openvino", True)
-            setattr(model.visual.trunk, "to_openvino", True)
-            setattr(
-                model.visual.trunk, 
-                "store_layers", 
-                self.cluster_layers
-            )
-        else:
-            setattr(model.visual, "to_openvino", False)
-            setattr(model.visual.trunk, "to_openvino", False)
-            setattr(
-                model.visual.trunk, 
-                "store_layers", 
-                [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-            )
+        model.visual.to_openvino = self.to_openvino
+        trunk.to_openvino = self.to_openvino
+        # 保持する層。OpenVINO化では cluster_layers だけ、PyTorchの詳細な特徴量では全層
+        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, NUM_BLOCKS + 1))
 
         return model, preprocess
 
@@ -108,7 +96,7 @@ class TorchCLIPBackend(TorchCLIPFeatureExtractor):
     OpenVINOへ変換したモデルと同じグラフ（to_openvino=True）で動かし、出力の形式・正規化を OVCLIPFeatureExtractor に揃える。
     """
 
-    def __init__(self, config: yaml):
+    def __init__(self, config: dict):
         config = {**config, "to_openvino": True}
         super().__init__(config)
         self.device = config["device"]
@@ -148,7 +136,7 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
     全 12 層を生の値で扱うため、OpenVINO 変換用のグラフ（to_openvino=True）ではなく、パッチ済みの非変換経路で動かす。
     """
 
-    def __init__(self, config: yaml):
+    def __init__(self, config: dict):
         super().__init__({**config, "to_openvino": False})
         self.device = config["device"]
         self.model.to(self.device).eval()

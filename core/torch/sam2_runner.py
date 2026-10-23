@@ -10,6 +10,7 @@ EdgeTAM 側（core/torch/sam2、edgetam_runner.py）は変更していない。
 import sys
 from pathlib import Path
 
+# core/torch を sys.path に加える。公式 SAM2.1 のコピー core/torch/sam2_official を、トップレベルのパッケージ `sam2_official` として import するため
 core_dir = Path(__file__).resolve().parent
 if str(core_dir) not in sys.path:
     sys.path.insert(0, str(core_dir))
@@ -18,7 +19,6 @@ from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
-import yaml
 
 from core.common.edgetam_helper import EdgeTamHelper
 from core.torch.edgetam_runner import DecodeModel, RepVitModel, TorchEdgeTamBackend
@@ -47,7 +47,7 @@ class Sam2Model:
         return cls._cache[key]
 
 
-def _load_sam2(module: nn.Module, config: yaml) -> None:
+def _load_sam2(module: nn.Module, config: dict) -> None:
     """EdgeTAM のクラス（RepVitModel / DecodeModel）が読む属性を、公式 SAM2.1 のモデルで埋める。
 
     `edgetam_model` という属性名は EdgeTAM のクラスと共通（中身は SAM2.1 の SAM2Base）。
@@ -65,7 +65,7 @@ class Sam2EncoderModel(RepVitModel):
     """SAM2.1 の画像エンコーダー（Hiera + FPN）。forward は RepVitModel と同じ
     （neck(trunk(x)) → conv_s0 / conv_s1 → no_mem_embed の加算 → [high_res0, high_res1, image_embed]）。"""
 
-    def __init__(self, config: yaml):
+    def __init__(self, config: dict):
         nn.Module.__init__(self)  # RepVitModel.__init__ は EdgeTAM の設定キーを読むので呼ばない
         _load_sam2(self, config)
         self.trunk = self.edgetam_model.image_encoder.trunk
@@ -76,7 +76,7 @@ class Sam2EncoderModel(RepVitModel):
 class Sam2DecoderModel(DecodeModel):
     """SAM2.1 のデコーダー（prompt encoder + mask decoder）。forward / preprocess / postprocess は DecodeModel と同じ。"""
 
-    def __init__(self, config: yaml):
+    def __init__(self, config: dict):
         nn.Module.__init__(self)  # DecodeModel.__init__ は EdgeTAM の設定キーを読むので呼ばない
         _load_sam2(self, config)
         self.mask_threshold: float = self._transforms.mask_threshold
@@ -86,7 +86,7 @@ class Sam2DecoderModel(DecodeModel):
 class TorchSam2Backend(TorchEdgeTamBackend):
     """SAM2.1 の PyTorch backend。TorchEdgeTamBackend と同じ口（encode / decode が np.ndarray で入出力。前後処理は EdgeTamHelper）。"""
 
-    def __init__(self, config: yaml):
+    def __init__(self, config: dict):
         EdgeTamHelper.__init__(self, config)  # TorchEdgeTamBackend.__init__ は EdgeTAM のモデルを作るので呼ばない
         self.device = config["device"]
         self.edgetam_encoder = Sam2EncoderModel(config)

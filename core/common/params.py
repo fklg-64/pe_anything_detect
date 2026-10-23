@@ -16,6 +16,10 @@ CLIP_LOGIT_SCALE = 100.0
 KMEANS_SEED = 42
 FAISS_NUM_THREADS = 2
 
+# --- OpenCV ---
+# OpenVINO backend が起動時に cv2.setNumThreads へ渡すスレッド数
+OPENCV_NUM_THREADS = 2
+
 # --- パッチ単位の幾何（粗い結果はCLIPのパッチ格子上にある） ---
 # 近傍の大きさ。「内側」「細い領域」の判定（この近傍で縮めて残るか）と、粗いマスクの平滑化に使う。
 # 3 = 1パッチ分の近傍。粗いマスクは縁・影で最大1パッチ太るという前提に基づく

@@ -81,18 +81,15 @@ class CoarseSegmenter:
     # =========================================================================
 
     def fit_predict_kmeans(self, features: np.ndarray, k: int = 12, niter: int = 10) -> np.ndarray:
-        N, D = features.shape
-        features_contig = (
-            np.ascontiguousarray(features, dtype=np.float32)
-            if not features.flags["C_CONTIGUOUS"]
-            else features
-        )
+        """features (N, D) を k 個にKMeansでクラスタ分けし、N 個のクラスタ番号（平坦）を返す。"""
+        _, feature_dim = features.shape
+        features = np.ascontiguousarray(features, dtype=np.float32)  # faiss は C 連続の float32 を要求する
         faiss.omp_set_num_threads(FAISS_NUM_THREADS)
         kmeans = faiss.Kmeans(
-            d=D, k=k, niter=niter, spherical=False, verbose=False, seed=KMEANS_SEED
+            d=feature_dim, k=k, niter=niter, spherical=False, verbose=False, seed=KMEANS_SEED
         )
-        kmeans.train(features_contig)
-        _, cluster_labels = kmeans.index.search(features_contig, 1)
+        kmeans.train(features)
+        _, cluster_labels = kmeans.index.search(features, 1)
         return cluster_labels.reshape(-1)
 
     def _classify_cluster(self, cluster_feature: np.ndarray) -> Tuple[float, int]:
@@ -100,14 +97,14 @@ class CoarseSegmenter:
 
         プロンプト番号は 前景プロンプト -> 背景プロンプト の通し番号。
         """
-        fg_prompts_num = len(self.foreground_prompts)
+        num_foreground_prompts = len(self.foreground_prompts)
 
         # 正規化してテキストとの類似度(logits)を得る
         feature = cluster_feature.reshape(1, -1)
         feature = feature / (np.linalg.norm(feature, axis=-1, keepdims=True) + 1e-8)
         logits = CLIP_LOGIT_SCALE * feature @ self.fgbg_text_features.T
-        fg_logits = logits[:, :fg_prompts_num]
-        bg_logits = logits[:, fg_prompts_num:]
+        fg_logits = logits[:, :num_foreground_prompts]
+        bg_logits = logits[:, num_foreground_prompts:]
 
         # グループスコアは最も近いプロンプトの類似度。プロンプトは「言い換え」ではなく「選択肢」の
         # 列挙なので、平均ではなく最大を使う（プロンプト数を増減しても判定が偏らない）
@@ -120,7 +117,7 @@ class CoarseSegmenter:
 
         if foreground_confidence > self.foreground_threshold:
             return foreground_confidence, int(np.argmax(fg_logits, axis=1)[0])
-        return foreground_confidence, fg_prompts_num + int(np.argmax(bg_logits, axis=1)[0])
+        return foreground_confidence, num_foreground_prompts + int(np.argmax(bg_logits, axis=1)[0])
 
     def _judge_clusters(
         self, patch_features: np.ndarray, cluster_labels: np.ndarray
@@ -164,25 +161,11 @@ class CoarseSegmenter:
             confidence, prompt_index = self._judge_clusters(patch_features, cluster_labels)
 
         if edge_embed is not None:
-            with Timer("    ┌ EdgeTAM特徴のKmeansクラスタ処理時間"):
-                edge_features = edge_embed[0].reshape(edge_embed.shape[1], -1).T
-                edge_features = edge_features / (np.linalg.norm(edge_features, axis=-1, keepdims=True) + 1e-8)
-                edge_labels = self.fit_predict_kmeans(edge_features, k=self.k_clusters, niter=self.niter)
-
-            with Timer("    ┌ EdgeTAMクラスタごとのCLSトークン抽出処理時間"):
-                edge_confidence, edge_prompt_index = self._judge_clusters(patch_features, edge_labels)
-
-            # 両方が前景のときだけ前景（確信度の小さい方）。プロンプトは、最終の前景/背景と同じ側で確信が強い見方のものを使う
-            # （どちらの見方も、確信度が閾値を超えるときだけ前景のプロンプトを返すので、前景なら両方、背景なら小さい方が背景のプロンプト）
-            confidences = np.stack([confidence, edge_confidence])
-            prompts = np.stack([prompt_index, edge_prompt_index])
-            confidence = confidences.min(axis=0)
-            pick = np.where(confidence > self.foreground_threshold, confidences.argmax(axis=0), confidences.argmin(axis=0))
-            prompt_index = np.take_along_axis(prompts, pick[None], axis=0)[0]
-
-            # PE × EdgeTAM のクラスタの組ごとに、確信度とプロンプトは一定になる
-            _, cluster_labels = np.unique(cluster_labels * (edge_labels.max() + 1) + edge_labels, return_inverse=True)
-            cluster_labels = cluster_labels.reshape(-1)
+            edge_labels, edge_confidence, edge_prompt_index = self._judge_edgetam_clusters(edge_embed, patch_features)
+            confidence, prompt_index, cluster_labels = self._combine_pe_and_edgetam(
+                (confidence, prompt_index, cluster_labels),
+                (edge_confidence, edge_prompt_index, edge_labels),
+            )
 
         # クラスタ（パッチの組）ごとの対応プロンプト。クラスタの中では一定
         cluster_index_list: List[int] = [
@@ -192,6 +175,43 @@ class CoarseSegmenter:
         foreground_map = confidence.reshape(self.feature_size, self.feature_size).astype(np.float32)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
         return foreground_map, foreground_mask, cluster_labels, cluster_index_list
+
+    def _judge_edgetam_clusters(
+        self, edge_embed: np.ndarray, patch_features: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """EdgeTAM の特徴でKMeansし、PE のトークンをクラスタごとにプールして判定する。(クラスタ番号, 前景確信度, プロンプト番号) を返す。"""
+        with Timer("    ┌ EdgeTAM特徴のKmeansクラスタ処理時間"):
+            edge_features = edge_embed[0].reshape(edge_embed.shape[1], -1).T
+            edge_features = edge_features / (np.linalg.norm(edge_features, axis=-1, keepdims=True) + 1e-8)
+            edge_labels = self.fit_predict_kmeans(edge_features, k=self.k_clusters, niter=self.niter)
+
+        with Timer("    ┌ EdgeTAMクラスタごとのCLSトークン抽出処理時間"):
+            edge_confidence, edge_prompt_index = self._judge_clusters(patch_features, edge_labels)
+        return edge_labels, edge_confidence, edge_prompt_index
+
+    def _combine_pe_and_edgetam(
+        self,
+        pe_view: Tuple[np.ndarray, np.ndarray, np.ndarray],
+        edge_view: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """PE と EdgeTAM の判定を統合する。各 view は (前景確信度, プロンプト番号, クラスタ番号)。
+
+        Returns: 統合後の (前景確信度, プロンプト番号, クラスタ番号)。クラスタ番号は PE × EdgeTAM のクラスタの組ごとに振り直す。
+        """
+        confidence, prompt_index, cluster_labels = pe_view
+        edge_confidence, edge_prompt_index, edge_labels = edge_view
+
+        # 両方が前景のときだけ前景（確信度の小さい方）。プロンプトは、最終の前景/背景と同じ側で確信が強い見方のものを使う
+        # （どちらの見方も、確信度が閾値を超えるときだけ前景のプロンプトを返すので、前景なら両方、背景なら小さい方が背景のプロンプト）
+        confidences = np.stack([confidence, edge_confidence])
+        prompts = np.stack([prompt_index, edge_prompt_index])
+        confidence = confidences.min(axis=0)
+        pick = np.where(confidence > self.foreground_threshold, confidences.argmax(axis=0), confidences.argmin(axis=0))
+        prompt_index = np.take_along_axis(prompts, pick[None], axis=0)[0]
+
+        # PE × EdgeTAM のクラスタの組ごとに、確信度とプロンプトは一定になる
+        _, cluster_labels = np.unique(cluster_labels * (edge_labels.max() + 1) + edge_labels, return_inverse=True)
+        return confidence, prompt_index, cluster_labels.reshape(-1)
 
     # =========================================================================
     # 粗いセマンティックラベル

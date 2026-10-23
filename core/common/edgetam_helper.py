@@ -2,18 +2,12 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-import yaml
 
 
 class EdgeTamHelper:
     """EdgeTAMの入出力の前後処理（NumPy）。backend（OpenVINO / PyTorch）に依存しない。"""
 
-    def __init__(self, config: yaml):
-        # 設定値の初期化
-        self.init_value(config)
-
-    def init_value(self, config: yaml):
-        # config関係
+    def __init__(self, config: dict):
         self.target_size = config["image_size"]
 
         # マスク閾値
@@ -52,9 +46,9 @@ class EdgeTamHelper:
         return boxes
 
     def postprocess_masks(
-        self, 
-        masks: np.ndarray, 
-        orig_hw: Tuple[int, int]
+        self,
+        masks: np.ndarray,
+        orig_hw: Tuple[int, int],
     ) -> np.ndarray:
         """出力マスクを元画像の解像度 (orig_hw) にリサイズします (NumPy/OpenCV版)。"""
         masks = masks.astype(np.float32)
@@ -150,7 +144,7 @@ class EdgeTamHelper:
     def postprocess(
         self,
         low_res_masks: np.ndarray,
-        iou_predictions: np.ndarray, 
+        iou_predictions: np.ndarray,
         orig_hw: Tuple[int, int],
         need_masks: bool = True,
     ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:

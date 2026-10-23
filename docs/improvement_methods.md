@@ -230,14 +230,14 @@ def guided_filter_gray(guide, src, radius, eps):
 `refine_region` での使い方（手法 A の事前確率を作った直後）:
 
 ```python
-size = self.et_high_res_feature_size                                                  # 128
+size = self.high_res_feature_size                                                  # 128
 guide = cv2.resize(image_512, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32).mean(-1) / 255.0
 prior = cv2.resize(prior_map, (size, size), interpolation=cv2.INTER_LINEAR)
 prior_map = np.clip(guided_filter_gray(guide, prior, radius=4, eps=1e-2), 0.0, 1.0)  # 128×128 のまま _estimate_class_logit に渡す
 ```
 
 - `_estimate_class_logit` は事前確率を 128×128 に `cv2.resize` してから logit にするので、128×128 のまま渡せば（同じ大きさへの resize は何もしない）、他は変えずに済む。
-- **パラメータ**: 半径は 1 パッチ分（128×128 では `et_high_res_feature_size / feature_size` = 4 画素）で、粗いマスクの信頼限界。eps は 0.01 に固定（0.001〜0.01 で結果は同じ。正解注入の MVTec で 0.894 / 0.893、0.1 で 0.884）。新しい定数は eps の 1 つだけ。
+- **パラメータ**: 半径は 1 パッチ分（128×128 では `high_res_feature_size / feature_size` = 4 画素）で、粗いマスクの信頼限界。eps は 0.01 に固定（0.001〜0.01 で結果は同じ。正解注入の MVTec で 0.894 / 0.893、0.1 で 0.884）。新しい定数は eps の 1 つだけ。
 - **カラー版**（RGB の 3 チャンネルをガイドに、画素ごとに 3×3 の連立方程式を解く）は、グレー版とほぼ同じ結果（MVTec 0.846 対 0.844、合成 0.565 対 0.566）で、約 91ms と重い。**グレー版（約 3ms）で十分**。
 - **組み込みの差分案**: ① `SemanticRefiner.refine` で、入力画像（`resized`）から 128×128 のガイドを 1 回だけ作り、`RefineContext` に持たせる。② `_refine_region` の `prior_map` を上のように整える。③ 定数 `GUIDED_FILTER_EPS = 1e-2` を `core/common/params.py` に足す。さらに、ガイドのボックスフィルタ（`mean_i`、`var_i`）を画像ごとに 1 回だけ計算しておけば、領域ごとの計算は 4 回のボックスフィルタで済み、時間はさらに減る（未実装）。
 - 共通コード（`core/common/semantic_refiner.py`）の変更なので、OpenVINO 版にも効く（OpenVINO 版での確認は未実施）。
@@ -601,7 +601,7 @@ python tools/experiments/sam2/report_sam2.py                                    
 | ファイル | 変更 |
 |---|---|
 | `core/common/mask_utils.py` | `guided_filter`（輝度ガイドのガイデッドフィルタ。ボックスフィルタのみ）を追加 |
-| `core/common/params.py` | `GUIDED_FILTER_EPS = 0.01`（半径は 1 パッチ = `et_high_res_feature_size // feature_size` = 4 画素で、定数にしない） |
+| `core/common/params.py` | `GUIDED_FILTER_EPS = 0.01`（半径は 1 パッチ = `high_res_feature_size // feature_size` = 4 画素で、定数にしない） |
 | `core/common/semantic_refiner.py` | `_refine_region` の事前マスクを、外周「不明」+ ガイデッドフィルタにした。入力画像の輝度を 128×128 に縮小したガイド（`RefineContext.guide`）を `refine` で 1 回だけ作る。`refine(..., feats=None)` が EdgeTAM の特徴を受け取れる（渡されたらエンコーダーを再実行しない） |
 | `core/common/coarse_segmentation.py` | `generate_foreground_map(..., edge_embed=None)`。`edge_embed` があれば、EdgeTAM の `image_embed` でも KMeans してクラスタの判定を行い、前景確信度の小さい方（AND）を採る。プロンプトは、確信が強い方（背景なら弱い方）の見方 |
 | `core/common/segmentation_runner.py` | `use_edgetam_clustering` のとき、EdgeTAM のエンコードを粗い判定の前に 1 回だけ実行し、粗い判定と精緻化に渡す |

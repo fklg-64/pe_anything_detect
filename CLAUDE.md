@@ -67,13 +67,14 @@ python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・
 - `segmentation_runner.py`: `SegmentationRunner`。`segment(image)`（保存なしのパイプライン、`SegmentationResult` を返す）と `run(path)`（読み込み・`segment`・保存）。
 - `coarse_segmentation.py`: `CoarseSegmenter`。CLIP 特徴量・テキストプロンプトとの照合・faiss KMeans による粗い前景/セマンティック推定と、パッチ単位の整形。
 - `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM backend でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
-- `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分・ノイズ除去などの純粋関数。
+- `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分（`Component` = 最内点 `peak`・`core`・`region` の NamedTuple）・ノイズ除去などの純粋関数。
 - `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
 - `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。
 
 backend:
 
 - OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
+  - `core/openvino/runtime_utils.py`: 2 つの backend 共通の準備。**import するだけで `/opt/intel/openvino` を `sys.path` から外す**ので、各 backend ファイルは `import openvino` より前にこれを import する（順序を保つこと）。コンパイル設定 `make_compile_config` と INT8 の接尾辞 `model_file_suffix` もここ。
 - PyTorch（実験用）: `core/torch/feature_extractor.py` の `TorchCLIPProbe`。全層の hidden・attention 出力を取り出し、後半ブロックを attention マスク付きで再実行できる。`tools/experiments/decontam/exp_decontam*.py` が使う。
 - PyTorch（SAM2.1）: `core/torch/sam2_runner.py` の `TorchSam2Backend`。EdgeTAM のクラス（`RepVitModel` / `DecodeModel` / `TorchEdgeTamBackend`）を継承し、モデルの取得だけを公式 SAM2.1 に差し替える（デコーダーの入出力と特徴量の形状が同じなので、`SegmentationRunner(extractor, TorchSam2Backend(config), config)` でそのままつながる）。`core/torch/sam2_official/` は公式 SAM2.1 のコピー（パッケージ名 `sam2_official`、`UPSTREAM.md` 参照）。`core/torch/sam2/` は EdgeTAM の fork で公式とは別物（同名のパッケージは同時に置けない）。
 - PyTorch: `core/torch/feature_extractor.py`（`TorchCLIPBackend`。変換済みモデルと同じグラフ `to_openvino=True` で動かし、出力を ndarray 化）, `edgetam_runner.py`（`TorchEdgeTamBackend`）

@@ -1,6 +1,6 @@
 """マスク・座標・点サンプリングの純粋なヘルパー関数（状態を持たない）。"""
 
-from typing import Optional, List, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -14,7 +14,13 @@ from core.common.params import (
     PATCH_STRUCTURE,
 )
 
-Component = Tuple[Tuple[int, int], np.ndarray, np.ndarray]
+
+class Component(NamedTuple):
+    """マスクの連結成分1つ分（タプルとしても (peak, core, region) の順に取り出せる）。"""
+
+    peak: Tuple[int, int]   # 最内点 (x, y)。距離変換が最大の位置
+    core: np.ndarray        # 成分を1パッチ内側へ縮めたマスク（縮めると消える細い成分では成分そのもの）
+    region: np.ndarray      # 成分のマスク
 
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -27,7 +33,8 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
 # =============================================================================
 
 def farthest_point_sampling(points: np.ndarray, k: int) -> np.ndarray:
-    """
+    """最遠点サンプリングで k 点を選ぶ。最初は重心に最も近い点で、以降は選択済みの点から最も遠い点を足していく。
+
     points: (M, 2) の座標配列。各行は (x, y)
     k:      抽出する点の数
 
@@ -148,7 +155,7 @@ def connected_components(mask: np.ndarray) -> List[Component]:
         edt = distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
         y, x = np.unravel_index(np.argmax(edt), edt.shape)
         core = binary_erosion(region, structure=PATCH_STRUCTURE, border_value=1)
-        result.append(((int(x), int(y)), core if core.any() else region, region))
+        result.append(Component((int(x), int(y)), core if core.any() else region, region))
     return result
 
 
@@ -159,7 +166,7 @@ def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
 
     return: 0/1 の二値マスク
     """
-    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    binary = (np.asarray(mask) > 0).view(np.uint8)  # bool の 0/1 をコピーせず uint8 として読む
 
     # 小さな独立成分を除去
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -169,7 +176,7 @@ def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
     # 面積が足りる連結成分だけを残す（背景ラベル0は常に除外）
     keep = stats[:, cv2.CC_STAT_AREA] >= min_area
     keep[0] = False
-    cleaned = keep[labels].astype(np.uint8)
+    cleaned = keep.astype(np.uint8)[labels]  # 成分数分の表を先に uint8 にしてから全画素へ引く（全画素の型変換を省く）
 
     # 輪郭の細かなノイズを平滑化
     cleaned = cv2.medianBlur(cleaned, MEDIAN_BLUR_KSIZE)
@@ -184,7 +191,8 @@ def remove_small_regions(semantic_map: np.ndarray, min_area: int) -> None:
     2. 背景に残った小さな穴を、周囲で最も多いクラスで埋める。
     """
     height, width = semantic_map.shape
-    for class_id in np.unique(semantic_map):
+    present_class_ids = np.flatnonzero(np.bincount(semantic_map.ravel()))
+    for class_id in present_class_ids:
         if class_id == 0:
             continue
         region = semantic_map == class_id
