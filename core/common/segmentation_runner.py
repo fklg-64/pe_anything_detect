@@ -2,17 +2,17 @@
 
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 
 from core.utils import Timer, load_image, normalize_image, resize_image
-from core.common.coarse_segmentation import CoarseSegmenter
+from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
-from core.common.visualization import ResultSaver, semantic_class_names
+from core.common.visualization import ResultSaver
 
 
 class SegmentationRunner:
@@ -27,7 +27,6 @@ class SegmentationRunner:
         self.extractor = extractor
         self.edgetam = edgetam
         self.output_dir = config["output_dir"]
-        self.debug = config["debug"]
         # 粗い判定で、PE に加えて EdgeTAM の特徴でもクラスタ分けして前景確信度を AND する（誤検出を減らす。小物体の検出率が少し下がる）
         self.use_edgetam_clustering = config.get("use_edgetam_clustering", False)
 
@@ -39,13 +38,9 @@ class SegmentationRunner:
         self.foreground_prompts = self.coarse.foreground_prompts
         self.background_prompts = self.coarse.background_prompts
 
-    def segment(self, image_raw: np.ndarray, debug_dir: Optional[Path] = None) -> SegmentationResult:
-        """1枚の画像（RGB）をセグメンテーションする。ファイルへの保存はしない。
-
-        debug_dir: デバッグ中間画像の保存先。config の debug が true で、かつ指定されたときだけ保存する。
-        """
+    def segment(self, image_raw: np.ndarray) -> SegmentationResult:
+        """1枚の画像（RGB）をセグメンテーションする。ファイルへの保存はしない（保存は run / ResultSaver）。"""
         height, width = image_raw.shape[:2]
-        self.refiner.debug_dir = debug_dir if self.debug else None
 
         # 計測開始
         start = time.time()
@@ -69,13 +64,14 @@ class SegmentationRunner:
         # CLIP + KMeans による初期前景マップの推定
         with Timer("粗い前景マスク取得処理時間"):
             if edgetam_features is None:
-                coarse_foreground = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
+                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
             else:
                 edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
-                coarse_foreground = self.coarse.generate_foreground_map(
-                    patch_features, fused_patch_features, edgetam_image_embed
-                )
-            foreground_map, foreground_mask, cluster_labels, cluster_index_list = coarse_foreground
+                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features, edgetam_image_embed)
+            # 4 要素のタプルを返す差し替え実装（tools）でも動くよう、名前付きにそろえる
+            coarse_foreground = CoarseForeground(*generated)
+            foreground_map, foreground_mask = coarse_foreground.foreground_map, coarse_foreground.foreground_mask
+            cluster_labels, cluster_index_list = coarse_foreground.cluster_labels, coarse_foreground.cluster_index_list
 
         # セマンティックセグメンテーションのラベルを取得
         with Timer("セマンティックセグメンテーション処理時間"):
@@ -88,7 +84,7 @@ class SegmentationRunner:
 
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
-            semantic_map, prompt_indices, point_coords, point_labels = self.refiner.refine(
+            refined = self.refiner.refine(
                 resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_features
             )
 
@@ -96,15 +92,19 @@ class SegmentationRunner:
         print(f"Inference Time: {elapsed_time * 1000:.2f} ms")
 
         return SegmentationResult(
-            semantic_map=semantic_map,
-            prompt_indices=prompt_indices,
-            point_coords=point_coords,
-            point_labels=point_labels,
+            semantic_map=refined.semantic_map,
+            prompt_indices=refined.prompt_indices,
+            point_coords=refined.point_coords,
+            point_labels=refined.point_labels,
             foreground_map=foreground_map,
             foreground_mask=foreground_mask,
             cluster_labels=cluster_labels,
             raw_semantic_labels=raw_semantic_labels,
             semantic_labels=semantic_labels,
+            cluster_index_list=cluster_index_list,
+            pe_clusters=coarse_foreground.pe_clusters,
+            edge_clusters=coarse_foreground.edge_clusters,
+            debug_images=refined.debug_images,
         )
 
     def run(self, image_path: Union[str, Path]) -> None:
@@ -121,7 +121,6 @@ class SegmentationRunner:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         image_raw = load_image(image_path)
-        result = self.segment(image_raw, debug_dir=save_dir / "debug")
+        result = self.segment(image_raw)
 
-        all_prompts = self.foreground_prompts + self.background_prompts
-        self.saver.save(save_dir, image_raw, result, semantic_class_names(all_prompts, result.prompt_indices))
+        self.saver.save(save_dir, image_raw, result, self.foreground_prompts + self.background_prompts)

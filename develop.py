@@ -8,7 +8,6 @@ if __name__ == "__main__":
     image_paths: list[str] = [
         "/home/llm/datasets/mvtec_anomaly_detection/capsule/test/good/000.png",
         "/home/llm/datasets/mvtec_anomaly_detection/hazelnut/test/good/001.png",
-        # "/home/llm/datasets/mvtec_anomaly_detection/grid/test/bent/002.png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (1).png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (2).png",
         "/home/llm/datasets/01_classification_sample/noodle/noodle (3).png",

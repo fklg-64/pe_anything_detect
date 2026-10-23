@@ -351,13 +351,13 @@ flowchart TD
    1. クラスごとに、`min_area` 未満の連結成分を背景（0）へ戻す。
    2. 背景に残った `min_area` 未満の穴を、周囲（1 画素外側のリング）で最も多いクラスで埋める。
 2. 作業解像度が元画像サイズと異なる場合は、`INTER_NEAREST` で元サイズへ戻す（クラス ID を補間で壊さないため）。
-3. `(semantic_map, prompt_indices, point_coords, point_labels)` を返す。
+3. `RefineOutput(semantic_map, prompt_indices, point_coords, point_labels, debug_images)` を返す。
 
 ---
 
 ## 11. デバッグ画像の読み方
 
-`config` の `debug: true` のとき、`output_dir/<画像名>/debug/` に中間画像が保存される（`debug: false` では保存しない）。クラス番号を `N` とする。
+`SegmentationRunner.run` は、`output_dir/<画像名>/debug/` に中間画像を常に保存する（精緻化は画像を `SegmentationResult.debug_images` に集め、保存は `ResultSaver` が行う）。クラス番号を `N` とする。
 
 | ファイル | 内容 | 見るポイント |
 |---|---|---|

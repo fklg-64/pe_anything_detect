@@ -35,7 +35,7 @@ edgetam_background_point_count: 4
 # 粗い判定で、PEの特徴に加えてEdgeTAMの特徴（image_embed）でもKMeansでクラスタ分けし、両方が前景のパッチだけを前景にする（AND）。
 # 背景の斑点・織り目などの誤検出（小物体・複数物体・雑多な背景の画像）を減らす。代償として小物体の検出率が少し下がる。
 # 大きな単体物体（MVTec型）では効果が無いので、そうした画像だけを扱うときは false にする。EdgeTAMエンコーダは粗い判定の前に1回だけ実行し、精緻化にも使う
-use_edgetam_clustering: false
+use_edgetam_clustering: true
 
 # EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
 edgetam_refine_iterations: 3
@@ -45,9 +45,6 @@ semantic_max_side: 1024
 
 # 元画像に重畳するセマンティックカラーの不透明度
 overlay_alpha: 0.5
-
-# デバッグ中間画像を output_dir/<画像名>/debug に保存するか？
-debug: false
 
 # セマンティックセグメンテーション結果をmatplotlibのウィンドウで表示するか？（Falseでもpngは保存）
 show_result: false

@@ -51,9 +51,6 @@ semantic_max_side: 1024
 # 元画像に重畳するセマンティックカラーの不透明度
 overlay_alpha: 0.5
 
-# デバッグ中間画像を output_dir/<画像名>/debug に保存するか？
-debug: false
-
 # セマンティックセグメンテーション結果をmatplotlibのウィンドウで表示するか？（Falseでもpngは保存）
 show_result: false
 

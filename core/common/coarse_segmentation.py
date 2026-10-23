@@ -1,7 +1,7 @@
 """CLIP特徴量とKMeansによる、パッチ単位の粗い前景/セマンティック推定。"""
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
 import faiss
@@ -18,6 +18,7 @@ from core.common.params import (
     KMEANS_SEED,
     PATCH_STRUCTURE,
 )
+from core.common.result import ClusterView
 
 
 def load_plain_prompts(path: Path) -> List[str]:
@@ -37,6 +38,17 @@ def load_color_shape_prompts(path: Path) -> List[str]:
             article = "an" if color[0].lower() in "aeiou" else "a"
             prompts += [f"a photo of {article} {color} {shape} object."]
     return prompts + data["custom"]
+
+
+class CoarseForeground(NamedTuple):
+    """generate_foreground_map の結果（パッチ格子上）。タプルとして取り出すこともできる。"""
+
+    foreground_map: np.ndarray      # (feature_size, feature_size) 前景確信度
+    foreground_mask: np.ndarray     # 確信度が閾値を超えるパッチを1とした2値マスク
+    cluster_labels: np.ndarray      # パッチごとのクラスタ番号（平坦）。EdgeTAM 併用時は PE × EdgeTAM のクラスタの組
+    cluster_index_list: List[int]   # cluster_labels のクラスタごとの対応プロンプト番号（前景プロンプト -> 背景プロンプトの通し番号）
+    pe_clusters: Optional[ClusterView] = None    # 統合前の PE だけのクラスタ。EdgeTAM を併用しないときは None
+    edge_clusters: Optional[ClusterView] = None  # EdgeTAM 特徴だけのクラスタ。EdgeTAM を併用しないときは None
 
 
 class CoarseSegmenter:
@@ -135,7 +147,7 @@ class CoarseSegmenter:
         patch_features: np.ndarray,
         fused_patch_features: np.ndarray,
         edge_embed: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
+    ) -> CoarseForeground:
         """パッチ特徴をKMeansでクラスタ分けし、クラスタごとの前景確信度と対応プロンプトを求める。
 
         edge_embed（EdgeTAMエンコーダの image_embed (1, C, h, w)）を渡すと、PE のクラスタ結果に加えて、
@@ -146,11 +158,7 @@ class CoarseSegmenter:
         （代償として、小物体の検出率が少し下がる）。EdgeTAM の特徴にテキストとの対応は無いので、EdgeTAM のクラスタに入る
         パッチの PE トークンをプールして、PE 側と同じ照合を行う。
 
-        Returns:
-            foreground_map: (feature_size, feature_size) 前景確信度。
-            foreground_mask: 確信度が閾値を超えるパッチを1とした2値マスク。
-            cluster_labels: パッチごとのクラスタ番号（平坦）。edge_embed があるときは PE × EdgeTAM のクラスタの組。
-            cluster_index_list: クラスタごとの対応プロンプト番号。
+        Returns: CoarseForeground（各フィールドの意味はそちら）。
         """
         patch_tokens = fused_patch_features[0, 1:, :]
 
@@ -160,21 +168,26 @@ class CoarseSegmenter:
         with Timer("    ┌ クラスタごとのCLSトークン抽出処理時間"):
             confidence, prompt_index = self._judge_clusters(patch_features, cluster_labels)
 
+        pe_clusters, edge_clusters = None, None
         if edge_embed is not None:
+            pe_clusters = ClusterView(cluster_labels, self._prompt_per_cluster(cluster_labels, prompt_index))
             edge_labels, edge_confidence, edge_prompt_index = self._judge_edgetam_clusters(edge_embed, patch_features)
+            edge_clusters = ClusterView(edge_labels, self._prompt_per_cluster(edge_labels, edge_prompt_index))
             confidence, prompt_index, cluster_labels = self._combine_pe_and_edgetam(
                 (confidence, prompt_index, cluster_labels),
                 (edge_confidence, edge_prompt_index, edge_labels),
             )
 
-        # クラスタ（パッチの組）ごとの対応プロンプト。クラスタの中では一定
-        cluster_index_list: List[int] = [
-            int(prompt_index[np.argmax(cluster_labels == label_idx)]) for label_idx in range(int(cluster_labels.max()) + 1)
-        ]
+        cluster_index_list = self._prompt_per_cluster(cluster_labels, prompt_index)
 
         foreground_map = confidence.reshape(self.feature_size, self.feature_size).astype(np.float32)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
-        return foreground_map, foreground_mask, cluster_labels, cluster_index_list
+        return CoarseForeground(foreground_map, foreground_mask, cluster_labels, cluster_index_list, pe_clusters, edge_clusters)
+
+    @staticmethod
+    def _prompt_per_cluster(cluster_labels: np.ndarray, prompt_index: np.ndarray) -> List[int]:
+        """クラスタ番号 0~ごとの対応プロンプト番号。プロンプトはクラスタの中では一定なので、先頭のパッチから取る。"""
+        return [int(prompt_index[np.argmax(cluster_labels == label_idx)]) for label_idx in range(int(cluster_labels.max()) + 1)]
 
     def _judge_edgetam_clusters(
         self, edge_embed: np.ndarray, patch_features: np.ndarray

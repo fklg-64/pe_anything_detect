@@ -1,8 +1,7 @@
 """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。"""
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -33,7 +32,6 @@ from core.common.params import (
     PRIOR_NON_CORE_PROBABILITY,
     SCORE_PRIOR_WEIGHT,
 )
-from core.common.visualization import save_debug_image
 
 
 @dataclass
@@ -55,6 +53,17 @@ class RefineContext:
     best_score: np.ndarray                 # 各画素で勝ったクラスのスコア
     point_coords: List[List[float]] = field(default_factory=list)
     point_labels: List[int] = field(default_factory=list)
+    debug_images: Dict[str, np.ndarray] = field(default_factory=dict)  # 中間画像（名前 -> 0〜1 の配列）。保存は呼び出し側
+
+
+class RefineOutput(NamedTuple):
+    """SemanticRefiner.refine の結果。タプルとして取り出すこともできる。"""
+
+    semantic_map: np.ndarray           # (height, width) uint8。0=背景、1~=前景クラス
+    prompt_indices: List[int]          # クラス1~に対応する、前景プロンプトのインデックス
+    point_coords: List[List[float]]    # EdgeTAMに与えたプロンプト点（画像座標、全クラス分）
+    point_labels: List[int]            # 上の点のラベル（1=正例、0=負例）
+    debug_images: Dict[str, np.ndarray]  # 精緻化の中間画像（名前 -> 0〜1 の配列。作業解像度かパッチ格子の大きさ）
 
 
 class SemanticRefiner:
@@ -70,9 +79,6 @@ class SemanticRefiner:
         # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
         self.guide_radius: int = max(1, self.high_res_feature_size // feature_size)
 
-        # デバッグ中間画像の保存先。None なら保存しない（画像ごとに SegmentationRunner が設定する）
-        self.debug_dir: Optional[Path] = None
-
     # =========================================================================
     # メインの流れ
     # =========================================================================
@@ -87,7 +93,7 @@ class SemanticRefiner:
         width: int,
         height: int,
         feats: Optional[Tuple] = None,
-    ) -> Tuple[np.ndarray, List[int], List[List[float]], List[int]]:
+    ) -> RefineOutput:
         """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
 
         クラスごとにEdgeTAMで前景マスクを推定し、重なり部分は
@@ -98,16 +104,13 @@ class SemanticRefiner:
         resized: リサイズ済み（正規化前）の画像。EdgeTAMエンコーダの入力と、初期マスクの縁を整えるガイドになる。
         feats: EdgeTAMエンコーダの出力。粗い判定で既に計算しているときに渡すと、エンコーダを再実行しない（None なら実行する）。
 
-        Returns:
-            semantic_map: (height, width) uint8。0=背景、1~=前景クラス。
-            prompt_indices: クラス1~に対応する、前景プロンプトのインデックス。
-            point_coords / point_labels: EdgeTAMに与えたプロンプト点（画像座標、全クラス分）。
+        Returns: RefineOutput（各フィールドの意味はそちら）。
         """
         foreground_binary = foreground_mask != 0
         semantic_ids: np.ndarray = np.unique(semantic_labels[foreground_binary])
         prompt_indices: List[int] = [int(labels_list[i]) for i in semantic_ids]
         if len(semantic_ids) == 0:
-            return np.zeros((height, width), dtype=np.uint8), prompt_indices, [], []
+            return RefineOutput(np.zeros((height, width), dtype=np.uint8), prompt_indices, [], [], {})
 
         # マスク演算は長辺が semantic_max_side 以下の作業解像度で行い、最後に元画像サイズへ戻す
         scale = min(1.0, self.semantic_max_side / max(width, height))
@@ -140,8 +143,7 @@ class SemanticRefiner:
         class_components = self._refine_classes(ctx, semantic_ids, semantic_labels, foreground_binary)
         self._rescue_uncovered(ctx, class_components)
 
-        if self.debug_dir is not None:
-            self._save_debug(ctx, "semantic_map_before_cleanup", ctx.semantic_map / max(len(semantic_ids), 1))
+        ctx.debug_images["semantic_map_before_cleanup"] = ctx.semantic_map / max(len(semantic_ids), 1)
 
         # 重ね合わせ後のノイズ除去
         remove_small_regions(ctx.semantic_map, ctx.min_area)
@@ -150,7 +152,7 @@ class SemanticRefiner:
         if (work_w, work_h) != (width, height):
             semantic_map = cv2.resize(semantic_map, (width, height), interpolation=cv2.INTER_NEAREST)
 
-        return semantic_map, prompt_indices, ctx.point_coords, ctx.point_labels
+        return RefineOutput(semantic_map, prompt_indices, ctx.point_coords, ctx.point_labels, ctx.debug_images)
 
     def _make_guide(self, resized: np.ndarray) -> np.ndarray:
         """初期マスクの縁を整えるガイド。入力画像の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小したもの（float32、0〜1）。"""
@@ -185,10 +187,10 @@ class SemanticRefiner:
             ctx.semantic_map[win] = class_id
             ctx.best_score[win] = score[win]
 
-            self._save_debug(ctx, f"c{class_id}_coarse_mask", coarse_mask)
-            self._save_debug(ctx, f"c{class_id}_core", core)
-            self._save_debug(ctx, f"c{class_id}_edgetam_mask", binary)
-            self._save_debug(ctx, f"c{class_id}_score", score)
+            ctx.debug_images[f"c{class_id}_coarse_mask"] = coarse_mask
+            ctx.debug_images[f"c{class_id}_core"] = core
+            ctx.debug_images[f"c{class_id}_edgetam_mask"] = binary
+            ctx.debug_images[f"c{class_id}_score"] = score
         return class_components
 
     def _rescue_uncovered(self, ctx: RefineContext, class_components: dict) -> None:
@@ -207,7 +209,7 @@ class SemanticRefiner:
                     allowed = binary_dilation(region, structure=PATCH_STRUCTURE)
                     binary &= resize_map(allowed, ctx.size, cv2.INTER_NEAREST) > 0
                 ctx.semantic_map[binary & (ctx.semantic_map == 0)] = class_id
-                self._save_debug(ctx, f"c{class_id}_rescue_{peak[0]}_{peak[1]}", binary)
+                ctx.debug_images[f"c{class_id}_rescue_{peak[0]}_{peak[1]}"] = binary
 
     def _refine_region(
         self, ctx: RefineContext, coarse_mask: np.ndarray, comps: List[Component], tag: str
@@ -364,11 +366,3 @@ class SemanticRefiner:
             [(x + 0.5) * width / self.feature_size, (y + 0.5) * height / self.feature_size]
             for x, y in pts
         ]
-
-    # =========================================================================
-    # デバッグ
-    # =========================================================================
-
-    def _save_debug(self, ctx: RefineContext, name: str, data: np.ndarray) -> None:
-        if self.debug_dir is not None:
-            save_debug_image(self.debug_dir, name, data, *ctx.size)

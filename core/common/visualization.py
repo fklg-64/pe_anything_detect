@@ -2,13 +2,13 @@
 
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 
-from core.common.result import SegmentationResult
+from core.common.result import ClusterView, SegmentationResult
 
 # セマンティック可視化の色 (RGB)。0番は背景で常にシアン
 SEMANTIC_COLORS = np.array([
@@ -27,6 +27,8 @@ POINT_COLOR_NEGATIVE = (0, 0, 255)
 RESULT_FIGSIZE = (10, 6)
 RESULT_DPI = 150
 LEGEND_FONTSIZE = 9
+# 精緻化の中間画像を入れる、保存先の下のフォルダ名
+DEBUG_DIR_NAME = "debug"
 
 
 def clean_prompt(prompt: str) -> str:
@@ -45,14 +47,6 @@ def semantic_colors(num_classes: int) -> np.ndarray:
     return np.vstack([SEMANTIC_COLORS[:1], fg[np.arange(num_classes - 1) % len(fg)]])[:num_classes]
 
 
-def save_debug_image(debug_dir: Path, name: str, data: np.ndarray, width: int, height: int) -> None:
-    """デバッグ用の中間画像を debug_dir に元画像サイズで保存する。"""
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    image = np.clip(np.asarray(data, dtype=np.float32), 0.0, 1.0)
-    image = cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
-    cv2.imwrite(str(debug_dir / f"{name}.png"), (image * 255).astype(np.uint8))
-
-
 class ResultSaver:
     """処理結果の画像・マスク・オーバーレイの書き出し。"""
 
@@ -68,8 +62,10 @@ class ResultSaver:
         save_dir: Path,
         image_raw: np.ndarray,
         result: SegmentationResult,
-        class_names: List[str],
+        all_prompts: List[str],
     ) -> None:
+        """all_prompts: 前景プロンプト -> 背景プロンプトの順に並べた全プロンプト（プロンプト番号はこの並びの添字）。"""
+        class_names = semantic_class_names(all_prompts, result.prompt_indices)
         height, width = image_raw.shape[:2]
         size = (width, height)  # PIL の resize に渡す (幅, 高さ)
 
@@ -80,8 +76,12 @@ class ResultSaver:
 
         # 粗い推定の中間結果
         self._save_cluster_maps(save_dir, size, result)
+        self._save_cluster_prompts(save_dir, result, all_prompts)
         mask_image = self._save_foreground_maps(save_dir, size, result)
         self._save_foreground_overlay(save_dir, image_raw, mask_image, result)
+
+        # 精緻化の中間結果
+        self._save_debug_images(save_dir / DEBUG_DIR_NAME, size, result.debug_images)
 
         print(f"Saving results to {save_dir}")
 
@@ -160,17 +160,37 @@ class ResultSaver:
         return image.resize(size, resample=Image.Resampling.NEAREST)
 
     def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
-        """KMeansのクラスタ、整形前後の粗いセマンティックラベルを着色して保存。"""
+        """KMeansのクラスタ（EdgeTAM併用時は統合前のPE・EdgeTAMも）、整形前後の粗いセマンティックラベルを着色して保存。"""
         grid = (self.feature_size, self.feature_size)
-        self._colorize_labels(result.cluster_labels.reshape(grid), size).save(
-            save_dir / f"layer_fused_k{self.k_clusters}.png"
-        )
+        for image_name, view in self._cluster_views(result):
+            self._colorize_labels(view.labels.reshape(grid), size).save(save_dir / image_name)
         self._colorize_labels(result.semantic_labels.reshape(grid), size).save(
             save_dir / "coarse_semantic_segmentation.png"
         )
         self._colorize_labels(result.raw_semantic_labels.reshape(grid), size).save(
             save_dir / "coarse_semantic_segmentation_raw.png"
         )
+
+    def _cluster_views(self, result: SegmentationResult) -> List[Tuple[str, ClusterView]]:
+        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。EdgeTAM 併用時は、統合前の PE・EdgeTAM、統合後の順。"""
+        views = []
+        if result.pe_clusters is not None:
+            views.append((f"layer_fused_pe_k{self.k_clusters}.png", result.pe_clusters))
+        if result.edge_clusters is not None:
+            views.append((f"edgetam_embed_k{self.k_clusters}.png", result.edge_clusters))
+        views.append((f"layer_fused_k{self.k_clusters}.png", ClusterView(result.cluster_labels, result.cluster_index_list)))
+        return views
+
+    def _save_cluster_prompts(self, save_dir: Path, result: SegmentationResult, all_prompts: List[str]) -> None:
+        """クラスタごとの分類結果（対応するプロンプトの文）をテキストで保存。クラスタの画像と同じクラスタ番号。"""
+        lines: List[str] = []
+        for image_name, view in self._cluster_views(result):
+            lines.append(f"[{image_name}]")
+            counts = np.bincount(view.labels, minlength=len(view.index_list))
+            for cluster_id, prompt_index in enumerate(view.index_list):
+                lines.append(f"クラスタ{cluster_id} ({counts[cluster_id]}パッチ): {all_prompts[prompt_index]}")
+            lines.append("")
+        (save_dir / "cluster_prompts.txt").write_text("\n".join(lines), encoding="utf-8")
 
     def _save_foreground_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> Image.Image:
         """前景度合いマップと粗い前景マスクを保存し、マスク画像を返す。"""
@@ -200,3 +220,18 @@ class ResultSaver:
                 color = POINT_COLOR_POSITIVE if point_label == 1 else POINT_COLOR_NEGATIVE
                 cv2.circle(overlay, (int(point_coord[0]), int(point_coord[1])), POINT_RADIUS, color, -1)
         cv2.imwrite(str(save_dir / "foreground_overlay.png"), overlay)
+
+    # -------------------------------------------------------------------------
+    # 精緻化の中間結果
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _save_debug_images(debug_dir: Path, size: Tuple[int, int], debug_images: Dict[str, np.ndarray]) -> None:
+        """精緻化の中間画像（0〜1 の2次元配列）を元画像サイズへ拡大して debug_dir に保存する。"""
+        if not debug_images:
+            return
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        for name, data in debug_images.items():
+            image = np.clip(np.asarray(data, dtype=np.float32), 0.0, 1.0)
+            image = cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
+            cv2.imwrite(str(debug_dir / f"{name}.png"), (image * 255).astype(np.uint8))
