@@ -148,7 +148,7 @@ flowchart TD
 ```
 
 - **パラメータ**: `EDGE_PROPAGATION_ALPHA` = 0.8、`EDGE_PROPAGATION_NEIGHBORS` = 8、`EDGE_PROPAGATION_ITERATIONS` = 3（`core/common/params.py`）。α は 0.7〜0.9、k は 4〜8 で結果が同程度、反復 5 回でも変わらない（平坦な範囲から選んだ）。
-- 二回目の KMeans とトークンのプールは**要らない**（以前の AND は要った）。追加の処理は、1024×1024 の類似度と上位 8 個の選択（NumPy で約 10ms。`mask_utils.knn_graph`）と、疎行列での伝播（0.1ms 未満）。プロンプトの文には依らないので、**プロンプトを増やしても（4 倍にしても）結果は保たれる**。
+- 二回目の KMeans とトークンのプールは**要らない**（以前の AND は要った）。追加の処理は、1024×1024 の類似度と上位 8 個の選択（NumPy で約 9ms。`mask_utils.knn_graph`。これ以上は精度を変えずには縮まらない。[performance.md](performance.md) §4）と、疎行列での伝播（0.1ms 未満）。**この類似度の行列積（BLAS）が OpenVINO の推論を遅くしていたので、BLAS のスレッドを 1 に制限している**（[performance.md](performance.md) §2）。プロンプトの文には依らないので、**プロンプトを増やしても（4 倍にしても）結果は保たれる**。
 - 検証（cable を除く MVTec 8 カテゴリ 96 枚 / 独立 48 枚 / 合成 120 枚）: PE のみ 0.825 / 0.851 / 0.613 に対し、伝播 **0.849 / 0.861 / 0.658**。以前の AND は、背景プロンプトに影の語を足した後 0.784 / 0.785 / 0.656 で、MVTec が下がった。詳細は §16、`outputs/coarse_ideas/index.html`。
 - EdgeTAM の特徴を使わないとき（`false`）は、PE の判定のみ（前の PE のみの状態）。
 

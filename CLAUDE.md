@@ -49,6 +49,7 @@ python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --o
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
+- 処理時間の内訳と高速化（BLAS のスレッド制限・NumPy 段の外接矩形処理・効かなかった案）は `docs/performance.md`。
 - 性能向上が確認できた手法（外周「不明」・外周 + ガイデッドフィルタ・PE と EdgeTAM の統合・点数 4:4）の詳細は `docs/improvement_methods.md`。**外周 + ガイデッドフィルタ（精緻化の初期マスク）・点数 4:4・EdgeTAM の特徴での前景確信度の伝播（`use_edgetam_clustering`。以前の AND を置き換えた）・反復 2 回は本体に組み込み済み**（共通コードなので PyTorch・OpenVINO の両方）。実験用のコード（`tools/experiments/`）は、従来の運用（8:8・外周なし）を基準にしている。
 - `tools/` は用途別のフォルダ: `evaluation/`（評価・診断）, `dataset/`, `gui/`, `experiments/<名前>/`（手法の検証実験。本体には未組み込みで、`outputs/<名前>/` と対）。実験どうしは `from tools.experiments.decontam import exp_decontam as E` の形で import し合う。構成は `tools/README.md`。評価カテゴリは `tools/evaluation/eval_prompts.py` の `OBJECT_CATEGORIES`（10 種。過去の数値はこれ）と `EVAL_CATEGORIES`（zipper を除く 9 種。zipper は fg_mask が画面の 78% で物体として扱う意味が無い）。
 - 実行対象画像は `develop.py` / `test_pytorch.py` 内の `image_paths` リストを直接編集する（CLI 引数なし）。
@@ -74,7 +75,7 @@ python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・
 backend:
 
 - OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
-  - `core/openvino/runtime_utils.py`: 2 つの backend 共通の準備。**import するだけで `/opt/intel/openvino` を `sys.path` から外す**ので、各 backend ファイルは `import openvino` より前にこれを import する（順序を保つこと）。コンパイル設定 `make_compile_config` と INT8 の接尾辞 `model_file_suffix` もここ。
+  - `core/openvino/runtime_utils.py`: 2 つの backend 共通の準備。**import するだけで `/opt/intel/openvino` を `sys.path` から外す**ので、各 backend ファイルは `import openvino` より前にこれを import する（順序を保つこと）。コンパイル設定 `make_compile_config` と INT8 の接尾辞 `model_file_suffix` もここ。**NumPy の BLAS のスレッド数も 1 に制限する（`limit_blas_threads`）。BLAS の既定（20 スレッド）は、行列積の後もスピン待ちして OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする（処理時間が約 1/1.5 に）。`docs/performance.md`**
 - PyTorch（実験用）: `core/torch/feature_extractor.py` の `TorchCLIPProbe`。全層の hidden・attention 出力を取り出し、後半ブロックを attention マスク付きで再実行できる。`tools/experiments/decontam/exp_decontam*.py` が使う。
 - PyTorch（SAM2.1）: `core/torch/sam2_runner.py` の `TorchSam2Backend`。EdgeTAM のクラス（`RepVitModel` / `DecodeModel` / `TorchEdgeTamBackend`）を継承し、モデルの取得だけを公式 SAM2.1 に差し替える（デコーダーの入出力と特徴量の形状が同じなので、`SegmentationRunner(extractor, TorchSam2Backend(config), config)` でそのままつながる）。`core/torch/sam2_official/` は公式 SAM2.1 のコピー（パッケージ名 `sam2_official`、`UPSTREAM.md` 参照）。`core/torch/sam2/` は EdgeTAM の fork で公式とは別物（同名のパッケージは同時に置けない）。
 - PyTorch: `core/torch/feature_extractor.py`（`TorchCLIPBackend`。変換済みモデルと同じグラフ `to_openvino=True` で動かし、出力を ndarray 化）, `edgetam_runner.py`（`TorchEdgeTamBackend`）
@@ -87,7 +88,7 @@ backend:
 3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る。`use_edgetam_clustering: true` なら、EdgeTAM の `image_embed` の類似度（kNN）で前景確信度を伝播して揃える（誤検出を減らす。`docs/coarse_segmentation.md` §3.5）
 4. `assign_semantic_labels`: クラスタに対応するプロンプトで粗いセマンティックラベルを付与
 5. `refine_coarse_segmentation`: 穴埋め・細い領域の統合
-6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点、既定 4）/ 背景（`edgetam_background_point_count` 点、既定 4）のプロンプト点と、初期マスク（粗いマスクの外側 1 パッチを「不明」にし、128×128 に拡大して入力画像の輝度をガイドにしたガイデッドフィルタで縁を整えたもの）で EdgeTAM の decoder を反復し、クラスを統合（encoder は 2 で実行済みなら再実行しない）
+6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点、既定 4）/ 背景（`edgetam_background_point_count` 点、既定 4）のプロンプト点と、初期マスク（粗いマスクの外側 1 パッチを「不明」にし、128×128 に拡大して入力画像の輝度をガイドにしたガイデッドフィルタで縁を整えたもの）で EdgeTAM の decoder を反復し、クラスを統合し、前景内部の幅 1 パッチ未満の隙間（クラス境界の割れ）を埋める（`mask_utils.fill_narrow_gaps`。encoder は 2 で実行済みなら再実行しない）
 7. `run()` では `ResultSaver` が `output_dir/<画像名>/` に可視化を保存
 
 `core/utils.py` に共通ヘルパー（`Timer` コンテキストマネージャー、`load_image`, `resize_image`, `normalize_image`, `preprocess_image`, `load_config`）。各処理は `with Timer(...)` で ms 計測する流儀。

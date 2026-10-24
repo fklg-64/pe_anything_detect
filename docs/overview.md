@@ -46,19 +46,20 @@ flowchart TD
     H --> I["整形<br/>・前景に囲まれた背景は前景にする<br/>・幅2パッチ以下のクラス領域は接するクラスに統合"]
 ```
 
-### オプション: EdgeTAM の特徴でも判定して AND（`use_edgetam_clustering`）
+### オプション: EdgeTAM の特徴で前景確信度を伝播（`use_edgetam_clustering`）
 
 ```mermaid
 flowchart LR
-    P["PE の特徴 → KMeans → 判定"] --> AND{"両方が前景のパッチだけ前景<br/>（確信度の小さい方を採る）"}
-    E["EdgeTAM の特徴 → KMeans → 判定<br/>（PE 特徴をクラスタごとにまとめて照合）"] --> AND
+    P["PE の特徴 → KMeans → 判定<br/>（前景確信度 conf0）"] --> PR["伝播（3回）<br/>conf ← 0.2·conf0 + 0.8·近傍の平均"]
+    E["EdgeTAM の image_embed<br/>コサイン類似度が上位8個の近傍（kNN、対称）"] --> PR
+    PR --> OUT["前景確信度 → 前景マスク / クラスタ × プロンプト"]
 ```
 
 | | |
 |---|---|
-| 効果 | 背景の斑点・織り目の誤検出が半減（合成データ IoU +0.05） |
-| 代償 | 小物体の検出率が少し低下。大きな単体物体（cable など）では下がることがある |
-| 注意 | EdgeTAM のエンコードは1回だけ実行し、②にも使い回す |
+| 効果 | 背景の斑点・織り目の誤検出が減る（合成データ IoU 0.613 → 0.658）。前景を消すのではなく確信度をならすので、大きな物体は崩れにくい（以前の AND は cable で下がった） |
+| 代償 | 確信度がしきい値付近の大きな領域が丸ごと落ちることがある（bottle の一部）。伝播の追加時間は約 9ms（類似度 4ms + 上位 8 個の選択 3ms） |
+| 注意 | EdgeTAM のエンコードは1回だけ実行し、②にも使い回す。詳細は [coarse_segmentation.md](coarse_segmentation.md) §3.5 |
 
 ## ② 詳細セグメンテーション（`semantic_refiner.py`）
 
@@ -102,6 +103,8 @@ flowchart LR
 
 斑点（3パッチ未満の孤立成分）はクラスの推定に混ぜない（物体が背景へ広がるのを防ぐ）。
 
+クラスごとの結果の重ね合わせで、1 つの物体が複数クラスに分かれた境界に細い隙間（割れ）ができたときは、最後に前景の内部の幅 1 パッチ未満の隙間だけを埋める（[semantic_refiner.md](semantic_refiner.md) §10.1）。
+
 ### スコア（重なりの解決用）
 
 ```
@@ -116,10 +119,10 @@ flowchart LR
 | `k_clusters` / `n_iter` | 8 / 10 | KMeans |
 | `foreground_threshold` | 0.5 | 前景の確信度の閾値 |
 | `prompts_dir` | `prompts/candidates/color_free_bg` | 前景・背景プロンプト |
-| `use_edgetam_clustering` | false | EdgeTAM 特徴でも判定して AND |
+| `use_edgetam_clustering` | true | EdgeTAM 特徴の類似度で前景確信度を伝播 |
 | `edgetam_foreground_points_per_class` | 4 | クラスごとの正例点 |
 | `edgetam_background_point_count` | 4 | 負例点 |
-| `edgetam_refine_iterations` | 3 | EdgeTAM の反復回数 |
+| `edgetam_refine_iterations` | 2 | EdgeTAM の反復回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度（長辺） |
 | `ov_num_thread` | 4 | OpenVINO のスレッド数 |
 
@@ -127,12 +130,14 @@ flowchart LR
 
 ## 処理時間の目安（OpenVINO・FP32・4スレッド）
 
-[improvement_methods.md](improvement_methods.md) §9.3 の測定値（`use_edgetam_clustering: true`、中央値）。
+[performance.md](performance.md) の測定値（`use_edgetam_clustering: true`、中央値。develop.py のサンプル 17 枚 + 合成 12 枚で約 177ms）。
 
 ```mermaid
 flowchart LR
-    A["PE<br/>86ms"] --> B["EdgeTAM<br/>エンコーダ<br/>34ms"] --> C["粗い判定<br/>11ms"] --> D["デコード<br/>40ms"] --> E["NumPy 後処理<br/>26ms"] --> F["合計 約206ms"]
+    A["EdgeTAM<br/>エンコーダ<br/>32ms"] --> B["PE<br/>83ms"] --> C["粗い判定<br/>15ms"] --> D["デコード<br/>25ms"] --> E["NumPy 後処理<br/>18ms"] --> F["合計 約184ms"]
 ```
+
+NumPy の BLAS のスレッドを 1 に制限している（`core/openvino/runtime_utils.py`）。既定（20 スレッド）のままだと、伝播の行列積の後に OpenVINO の推論が 2〜4 倍遅くなり、合計は約 252ms になる（[performance.md](performance.md) §2）。
 
 ## コードの対応
 

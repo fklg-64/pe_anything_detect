@@ -1,4 +1,4 @@
-from core.openvino.runtime_utils import make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
+from core.openvino.runtime_utils import limit_blas_threads, make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
 
 from pathlib import Path
 from typing import List
@@ -28,6 +28,9 @@ class OVCLIPFeatureExtractor:
 
         # OpenCVの処理に使用するスレッド数
         cv2.setNumThreads(OPENCV_NUM_THREADS)
+
+        # NumPyのBLASのスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
+        limit_blas_threads()
 
         # OpenVINOのモデルを読み込み
         self.load_ov_model()

@@ -14,6 +14,7 @@ from core.common.mask_utils import (
     Component,
     clean_mask,
     connected_components,
+    fill_narrow_gaps,
     guided_filter,
     patch_mean,
     prompt_points,
@@ -147,6 +148,8 @@ class SemanticRefiner:
 
         # 重ね合わせ後のノイズ除去
         remove_small_regions(ctx.semantic_map, ctx.min_area)
+        # クラス境界の割れ（前景の内部の細い隙間）を埋める
+        fill_narrow_gaps(ctx.semantic_map, foreground_binary)
 
         semantic_map = ctx.semantic_map
         if (work_w, work_h) != (width, height):
