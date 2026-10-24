@@ -44,7 +44,7 @@ flowchart TD
 
 ## 2. 処理の流れ（シーケンス）
 
-（`use_edgetam_clustering: true` のときの、EdgeTAM の特徴での 2 回目のクラスタリングと AND は [§3.5](#35-edgetam-の特徴でも別にクラスタ分けして-anduse_edgetam_clustering)）
+（`use_edgetam_clustering: true` のときの、EdgeTAM の特徴での前景確信度の伝播は [§3.5](#35-edgetam-の特徴で前景確信度を伝播するuse_edgetam_clustering)）
 
 ```mermaid
 sequenceDiagram
@@ -126,34 +126,31 @@ p_fg     = softmax([fg_score, bg_score])[0]       # = sigmoid(fg_score - bg_scor
 
 物体（コイン）は 4〜5 ロジットの差で安定して勝つ一方、背景のタオルは前景プロンプト `fabric` と背景プロンプトが **0.1〜0.7 ロジット差**で拮抗し、判定が不安定になっている。**ロジット差が 1 未満のクラスタは、プロンプトの小さな変更で結果が反転する**と考えてよい。
 
-### 3.5 EdgeTAM の特徴でも別にクラスタ分けして AND する（`use_edgetam_clustering`）
+### 3.5 EdgeTAM の特徴で前景確信度を伝播する（`use_edgetam_clustering`）
 
-`use_edgetam_clustering: true`（既定）のとき、`generate_foreground_map` は EdgeTAM エンコーダーの `image_embed`（256 次元・32×32）を受け取り、**PE のクラスタ結果と EdgeTAM のクラスタ結果の前景確信度の小さい方**（AND）を採る。
+`use_edgetam_clustering: true`（既定）のとき、`generate_foreground_map` は EdgeTAM エンコーダーの `image_embed`（256 次元・32×32）を受け取り、PE の判定で得た**前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える**（`_propagate_with_edgetam`）。2026-10-24 に、以前の「EdgeTAM の特徴でも KMeans して前景確信度を AND する」方式から置き換えた。
 
-**なぜ**: 粗い誤りの主因は、背景のクラスタを前景とする判定の誤り（背景の斑点・織り目の一部が前景のクラスタに混ざる）。PE の特徴のクラスタは意味は近いが空間的にばらける（クラスタあたりの連結成分数が平均 40 個）。EdgeTAM の特徴のクラスタは、物体の輪郭・領域に沿ってまとまる（同 7.2 個）。両方が前景としたパッチだけを前景にすると、誤検出が半分以下になる。代償として、小物体の検出率が少し下がる（精緻化の事前マスクの改良と併用すると、ほぼ消える。[improvement_methods.md §4](improvement_methods.md)）。
+**なぜ**: 粗い誤りの主因は、背景のクラスタを前景とする判定の誤り（背景の斑点・織り目の一部が前景のクラスタに混ざる）。PE の特徴のクラスタは意味は近いが空間的にばらける。EdgeTAM の特徴は物体の輪郭・領域に沿ってまとまる。その類似度で確信度を揃えると、背景の斑点が周りの背景に引かれて消える。AND は前景を消す方向にしか働かず、物体の一部が背景のクラスタと混ざるとその部分を失う（cable で大きく下がる）。伝播は確信度をならすだけなので崩れにくい。
 
 ```mermaid
 flowchart TD
     IMG["入力画像 (512x512)"] --> PE["PE: パッチ特徴 fused / patch"]
     IMG --> ET["EdgeTAM エンコーダー<br/>image_embed (1, 256, 32, 32)<br/>(SegmentationRunner が粗い判定の前に 1 回だけ実行。精緻化にも渡す)"]
     PE --> KP["KMeans K=8 → PE ラベル"]
-    ET --> EF["(1024, 256) に並べて L2 正規化"]
-    EF --> KE["KMeans K=8 → EdgeTAM ラベル"]
-    KP --> P1["PE ラベルごとに PE トークンをプール<br/>→ テキストと照合 → conf_pe, prompt_pe"]
-    KE --> P2["EdgeTAM ラベルごとに PE トークンをプール<br/>→ 同じ照合 → conf_ed, prompt_ed"]
+    KP --> P1["クラスタごとに PE トークンをプール<br/>→ テキストと照合 → 前景確信度 conf0, prompt"]
     PE --> P1
-    PE --> P2
-    P1 --> AND["conf = min(conf_pe, conf_ed)<br/>前景 = conf > foreground_threshold"]
-    P2 --> AND
-    AND --> PR["プロンプト: 前景なら確信が強い方、<br/>背景なら確信が弱い方（背景側）の見方"]
-    PR --> OUT["foreground_map / foreground_mask<br/>cluster_labels = PE × EdgeTAM のクラスタの組<br/>cluster_index_list"]
+    ET --> EF["(1024, 256) に並べて L2 正規化"]
+    EF --> G["コサイン類似度が上位 8 個の近傍で kNN グラフ<br/>(対称、行正規化)"]
+    P1 --> PR["conf ← 0.2·conf0 + 0.8·(近傍の平均) を 3 回"]
+    G --> PR
+    PR --> FL["判定が反転したパッチのプロンプト:<br/>反転後と同じ側だった近傍の最頻値"]
+    FL --> OUT["foreground_map / foreground_mask<br/>cluster_labels = PE のクラスタ × 伝播後のプロンプト<br/>cluster_index_list"]
 ```
 
-- EdgeTAM の特徴にテキストとの対応は無いので、EdgeTAM のクラスタに入るパッチの **PE の最終層トークンをプール**して、PE 側と同じ照合（`_classify_cluster`）を行う。プールの OpenVINO モデル（`pe_patch_logits_model`）は PE 側と同じ入出力（ラベル数 K=8）で、新しいモデルは要らない。
-- クラスタの組（PE ラベル × EdgeTAM ラベル、最大 64）の中では、確信度とプロンプトは一定になる。`cluster_labels` にはこの組の番号を返す（デバッグ画像 `cluster_labels` の見え方が変わる）。
-- 追加コストは、EdgeTAM 特徴の KMeans（約 2ms）と PE トークンのプール（約 3ms）。EdgeTAM エンコーダー（約 34ms）は精緻化でも必要なので、粗い判定の前に実行して使い回し、増えない。
-- 検証（合成データ・MVTec）: [improvement_methods.md §4](improvement_methods.md)。MVTec のような大きな単体物体の画像では上乗せにならない（独立 54 枚ではわずかに下がる）ので、そうした画像だけを扱うときは `false` にする。
-- 交差セル（PE ラベル × EdgeTAM ラベルでパッチを分け、セルごとに PE トークンをプールして判定し直す）は、合成データでは AND より誤検出が少ないが、MVTec で下がり、OpenVINO のプールのモデルがラベル数 64 に対応するか未確認なので、実装していない。
+- **パラメータ**: `EDGE_PROPAGATION_ALPHA` = 0.8、`EDGE_PROPAGATION_NEIGHBORS` = 8、`EDGE_PROPAGATION_ITERATIONS` = 3（`core/common/params.py`）。α は 0.7〜0.9、k は 4〜8 で結果が同程度、反復 5 回でも変わらない（平坦な範囲から選んだ）。
+- 二回目の KMeans とトークンのプールは**要らない**（以前の AND は要った）。追加の処理は、1024×1024 の類似度と上位 8 個の選択（NumPy で約 10ms。`mask_utils.knn_graph`）と、疎行列での伝播（0.1ms 未満）。プロンプトの文には依らないので、**プロンプトを増やしても（4 倍にしても）結果は保たれる**。
+- 検証（cable を除く MVTec 8 カテゴリ 96 枚 / 独立 48 枚 / 合成 120 枚）: PE のみ 0.825 / 0.851 / 0.613 に対し、伝播 **0.849 / 0.861 / 0.658**。以前の AND は、背景プロンプトに影の語を足した後 0.784 / 0.785 / 0.656 で、MVTec が下がった。詳細は §16、`outputs/coarse_ideas/index.html`。
+- EdgeTAM の特徴を使わないとき（`false`）は、PE の判定のみ（前の PE のみの状態）。
 
 ---
 
@@ -467,4 +464,17 @@ PE の特徴と EdgeTAM のエンコーダー出力（`image_embed`、256 次元
 **2026-10-22 に、D・点数 4:4・手法 B の AND を本体に組み込んだ**（共通コード。PyTorch・OpenVINO の両方。`use_edgetam_clustering` で B を切り替え）。内容・結果・処理時間・既知の問題（B で cable が下がる）は [improvement_methods.md §9](improvement_methods.md)、レポートは `outputs/implementation/index.html`。
 
 次の手順（候補）: 処理時間の短縮（現在 中央値 206ms。デコードの反復・作業解像度・INT8・並列実行）、B で cable のような大きな物体が崩れる問題の対策。
+
+---
+
+## 16. 追加実験（2026-10-24）: PE × EdgeTAM の統合の深掘りと、詳細側のプロンプト
+
+全表・事例は **`outputs/coarse_ideas/index.html`**（`python tools/experiments/coarse_ideas/report_ideas.py`）。実験は `tools/experiments/coarse_ideas/exp_fusion.py`（粗い側）・`exp_judge.py`（判定方式）、`tools/experiments/prompt_ideas/exp_prompt.py`（詳細側）。**本体は未変更**。評価は cable を除く MVTec 8 カテゴリ（96 枚 + 独立 48 枚）と合成 120 枚。develop.py の画像は使っていない。
+
+- **前提の変化**: 背景プロンプトに影の語が 13 個足された（`prompts/candidates/color_free_bg/background.yaml`）ため、AND の MVTec が 0.855 → 0.784 に下がった（PE のみは 0.834 → 0.825）。以下は現在のプロンプトでの値。
+- **A1 確信度の伝播が有効**: EdgeTAM の `image_embed` のコサイン類似度の kNN グラフ（k=8）で、PE の前景確信度を `conf ← 0.2·conf0 + 0.8·W·conf` で 3 回伝播する。MVTec 0.825 → **0.849**（+0.024 [+0.007, +0.046]）、独立 48 枚 0.851 → 0.861、合成 0.613 → **0.658**（+0.046 [+0.022, +0.074]。AND は 0.656 だが MVTec が下がる）。α=0.7〜0.8・k=4〜8 で同程度。プロンプトを 4 倍にしても 0.828（PE のみ 0.810、AND 0.740）。二回目の KMeans・プールが不要。本体向けの有向 kNN の実装でも近い精度（MVTec 0.838）。
+- **効かなかった**: AND 後の伝播、EdgeTAM の過分割（K=16・32）+ AND（MVTec 0.673・0.249）、高解像度特徴・成分単位の AND・外れ値を除いたプール（§15 以前の結果、旧プロンプト）。
+- **詳細側（プロンプト）**: 近接負例点・正例点の選び方・箱・自己プロンプト・成分ごとの推定は、MVTec と合成の両方で安定して上がるものが無い（正解注入の上限 0.886 / 0.894）。**反復 3 → 2 回は精度が同じ（MVTec −0.002）で、デコードが 7.2 → 4.8 回**。
+
+**2026-10-24 に、A1（確信度の伝播）を本体に組み込み、AND を置き換えた。反復も 3 → 2 回にした**（`edgetam_refine_iterations: 2`）。本体のパイプラインでの測定（PE 第 6 層）: PyTorch は MVTec 0.847 / 独立 48 枚 0.855 / 合成 0.658（実験の 0.847 / 0.857 / 0.656 と一致）、OpenVINO は 0.837 / 0.861 / 0.657。PyTorch と OpenVINO の粗い前景マスクの一致は 99.93%、最終の前景の一致は 98.1%（IoU 0.933）。影の背景プロンプトを外した場合（旧プロンプト）との比較: AND は 0.855 / 0.850 / 0.639、伝播は 0.851 / 0.855 / 0.627、PE のみ 0.834 / 0.838 / 0.590。**伝播は影の語があっても MVTec を保ち、合成は 0.627 → 0.658 に上がる**（AND は影の語で MVTec が下がる）ので、影の語は残してよい。dedup・上位 2 の判定を伝播と組み合わせても、独立 48 枚が下がる（0.798・0.839。伝播のみ 0.861）ので採用しない。
 

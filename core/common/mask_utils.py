@@ -4,6 +4,7 @@ from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
 import numpy as np
+from scipy import sparse
 from scipy.ndimage import binary_erosion, distance_transform_edt
 from scipy.ndimage import label as ndi_label
 
@@ -227,6 +228,25 @@ def patch_mean(patch_map: np.ndarray) -> np.ndarray:
         patch_map.astype(np.float32), (PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD),
         borderType=cv2.BORDER_REFLECT,
     )
+
+
+def knn_graph(features: np.ndarray, k: int) -> sparse.csr_matrix:
+    """特徴 (N, C)（L2 正規化済み）のコサイン類似度が上位 k 個の近傍で、対称の kNN グラフを作る（行を正規化した疎行列）。"""
+    n = len(features)
+    similarity = features @ features.T
+    np.fill_diagonal(similarity, -np.inf)
+    neighbors = np.argpartition(similarity, -k, axis=1)[:, -k:]
+    directed = sparse.csr_matrix((np.ones(n * k, dtype=np.float32), (np.repeat(np.arange(n), k), neighbors.ravel())), shape=(n, n))
+    graph = directed.maximum(directed.T)
+    return sparse.diags(1.0 / np.asarray(graph.sum(axis=1)).ravel()) @ graph
+
+
+def propagate(values: np.ndarray, graph: sparse.csr_matrix, alpha: float, iterations: int) -> np.ndarray:
+    """values (N,) をグラフ上で value ← (1-α)·values0 + α·(近傍の平均) と iterations 回伝播する。"""
+    propagated = values.astype(np.float32)
+    for _ in range(iterations):
+        propagated = (1.0 - alpha) * values + alpha * (graph @ propagated)
+    return propagated
 
 
 def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:

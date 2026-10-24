@@ -120,7 +120,7 @@ sequenceDiagram
 
 `predict_encoder` が `resized` を EdgeTAM 用の mean/std で正規化し、`encode` に渡す。得られる `feats = (high_res_feats0, high_res_feats1, image_embed)` は、以降のすべてのクラス・反復で使い回す。
 
-`use_edgetam_clustering: true`（既定。[coarse_segmentation.md §3.5](coarse_segmentation.md)）のときは、粗い判定が EdgeTAM の `image_embed` を使うので、`SegmentationRunner.segment` が**粗い判定の前に 1 回だけ**エンコードし、`refine(..., feats)` に渡す（精緻化の中では再実行しない）。
+`use_edgetam_clustering: true`（既定。[coarse_segmentation.md §3.5](coarse_segmentation.md)）のときは、粗い判定が EdgeTAM の `image_embed`（前景確信度の伝播）を使うので、`SegmentationRunner.segment` が**粗い判定の前に 1 回だけ**エンコードし、`refine(..., feats)` に渡す（精緻化の中では再実行しない）。
 
 さらに、初期マスクの縁を整えるガイドとして、`resized`（入力画像）を EdgeTAM の高解像度特徴量と同じ大きさ（128×128）に縮小し、RGB の平均（輝度、0〜1）を作る（`RefineContext.guide`。1 枚につき 1 回）。
 
@@ -380,8 +380,8 @@ flowchart TD
 |---|---|---|
 | `edgetam_foreground_points_per_class` | 4 | クラスごとの正例点の数（以前は 8。外周 + ガイデッドフィルタと併用で、8 と同等以上のまま点が約半分） |
 | `edgetam_background_point_count` | 4 | 背景の負例点の数（全クラス共通。以前は 8） |
-| `use_edgetam_clustering` | true | 粗い判定で EdgeTAM の特徴でもクラスタ分けして AND する（[coarse_segmentation.md §3.5](coarse_segmentation.md)）。true のとき EdgeTAM のエンコードを粗い判定の前に 1 回だけ実行して精緻化に渡す |
-| `edgetam_refine_iterations` | 3 | 前回のロジットを入力に再推定する回数 |
+| `use_edgetam_clustering` | true | 粗い判定の前景確信度を、EdgeTAM の特徴の類似度で伝播する（[coarse_segmentation.md §3.5](coarse_segmentation.md)）。true のとき EdgeTAM のエンコードを粗い判定の前に 1 回だけ実行して精緻化に渡す |
+| `edgetam_refine_iterations` | 2 | 前回のロジットを入力に再推定する回数（以前は 3。2 回でも精度はほぼ同じ（MVTec −0.002）で、デコードが約 1/3 減る） |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度の長辺上限 |
 | `edgetam_high_res_feature_downscale_factor` | 4 | 初期マスクの解像度（`image_size` ÷ この値 = 128） |
 

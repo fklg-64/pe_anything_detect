@@ -11,9 +11,12 @@ from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_ed
 
 from core.utils import Timer
 from core.common.backend import CLIPBackend
-from core.common.mask_utils import softmax
+from core.common.mask_utils import knn_graph, propagate, softmax
 from core.common.params import (
     CLIP_LOGIT_SCALE,
+    EDGE_PROPAGATION_ALPHA,
+    EDGE_PROPAGATION_ITERATIONS,
+    EDGE_PROPAGATION_NEIGHBORS,
     FAISS_NUM_THREADS,
     KMEANS_SEED,
     PATCH_STRUCTURE,
@@ -45,10 +48,9 @@ class CoarseForeground(NamedTuple):
 
     foreground_map: np.ndarray      # (feature_size, feature_size) 前景確信度
     foreground_mask: np.ndarray     # 確信度が閾値を超えるパッチを1とした2値マスク
-    cluster_labels: np.ndarray      # パッチごとのクラスタ番号（平坦）。EdgeTAM 併用時は PE × EdgeTAM のクラスタの組
+    cluster_labels: np.ndarray      # パッチごとのクラスタ番号（平坦）。EdgeTAM 併用時は PE のクラスタ × 伝播後のプロンプトの組
     cluster_index_list: List[int]   # cluster_labels のクラスタごとの対応プロンプト番号（前景プロンプト -> 背景プロンプトの通し番号）
-    pe_clusters: Optional[ClusterView] = None    # 統合前の PE だけのクラスタ。EdgeTAM を併用しないときは None
-    edge_clusters: Optional[ClusterView] = None  # EdgeTAM 特徴だけのクラスタ。EdgeTAM を併用しないときは None
+    pe_clusters: Optional[ClusterView] = None    # 伝播前の PE だけのクラスタ。EdgeTAM を併用しないときは None
 
 
 class CoarseSegmenter:
@@ -150,13 +152,8 @@ class CoarseSegmenter:
     ) -> CoarseForeground:
         """パッチ特徴をKMeansでクラスタ分けし、クラスタごとの前景確信度と対応プロンプトを求める。
 
-        edge_embed（EdgeTAMエンコーダの image_embed (1, C, h, w)）を渡すと、PE のクラスタ結果に加えて、
-        EdgeTAM の特徴でも別にクラスタ分けして同じ判定を行い、前景確信度の小さい方（AND）を採る。
-
-        PE の特徴のクラスタは意味は近いが空間的にばらけ、背景の斑点・織り目の一部が前景のクラスタに混ざる（誤検出）。
-        EdgeTAM の特徴のクラスタは物体の輪郭・領域に沿ってまとまる。両方が前景としたパッチだけを前景にして、誤検出を減らす
-        （代償として、小物体の検出率が少し下がる）。EdgeTAM の特徴にテキストとの対応は無いので、EdgeTAM のクラスタに入る
-        パッチの PE トークンをプールして、PE 側と同じ照合を行う。
+        edge_embed（EdgeTAMエンコーダの image_embed (1, C, h, w)）を渡すと、PE の判定で得た前景確信度を、EdgeTAM の特徴の
+        類似度が高いパッチどうしで伝播して揃える（_propagate_with_edgetam）。
 
         Returns: CoarseForeground（各フィールドの意味はそちら）。
         """
@@ -168,63 +165,56 @@ class CoarseSegmenter:
         with Timer("    ┌ クラスタごとのCLSトークン抽出処理時間"):
             confidence, prompt_index = self._judge_clusters(patch_features, cluster_labels)
 
-        pe_clusters, edge_clusters = None, None
+        pe_clusters = None
         if edge_embed is not None:
             pe_clusters = ClusterView(cluster_labels, self._prompt_per_cluster(cluster_labels, prompt_index))
-            edge_labels, edge_confidence, edge_prompt_index = self._judge_edgetam_clusters(edge_embed, patch_features)
-            edge_clusters = ClusterView(edge_labels, self._prompt_per_cluster(edge_labels, edge_prompt_index))
-            confidence, prompt_index, cluster_labels = self._combine_pe_and_edgetam(
-                (confidence, prompt_index, cluster_labels),
-                (edge_confidence, edge_prompt_index, edge_labels),
-            )
+            with Timer("    ┌ EdgeTAM特徴での確信度の伝播処理時間"):
+                confidence, prompt_index = self._propagate_with_edgetam(confidence, prompt_index, edge_embed)
+            # PE のクラスタの中でも、伝播で判定が変わったパッチはプロンプトが違うので、(PE のクラスタ, プロンプト) の組を新しいクラスタにする
+            num_prompts = len(self.foreground_prompts) + len(self.background_prompts)
+            _, cluster_labels = np.unique(cluster_labels * num_prompts + prompt_index, return_inverse=True)
+            cluster_labels = cluster_labels.reshape(-1)
 
         cluster_index_list = self._prompt_per_cluster(cluster_labels, prompt_index)
 
         foreground_map = confidence.reshape(self.feature_size, self.feature_size).astype(np.float32)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
-        return CoarseForeground(foreground_map, foreground_mask, cluster_labels, cluster_index_list, pe_clusters, edge_clusters)
+        return CoarseForeground(foreground_map, foreground_mask, cluster_labels, cluster_index_list, pe_clusters)
 
     @staticmethod
     def _prompt_per_cluster(cluster_labels: np.ndarray, prompt_index: np.ndarray) -> List[int]:
         """クラスタ番号 0~ごとの対応プロンプト番号。プロンプトはクラスタの中では一定なので、先頭のパッチから取る。"""
         return [int(prompt_index[np.argmax(cluster_labels == label_idx)]) for label_idx in range(int(cluster_labels.max()) + 1)]
 
-    def _judge_edgetam_clusters(
-        self, edge_embed: np.ndarray, patch_features: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """EdgeTAM の特徴でKMeansし、PE のトークンをクラスタごとにプールして判定する。(クラスタ番号, 前景確信度, プロンプト番号) を返す。"""
-        with Timer("    ┌ EdgeTAM特徴のKmeansクラスタ処理時間"):
-            edge_features = edge_embed[0].reshape(edge_embed.shape[1], -1).T
-            edge_features = edge_features / (np.linalg.norm(edge_features, axis=-1, keepdims=True) + 1e-8)
-            edge_labels = self.fit_predict_kmeans(edge_features, k=self.k_clusters, niter=self.niter)
+    def _propagate_with_edgetam(
+        self, confidence: np.ndarray, prompt_index: np.ndarray, edge_embed: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える。(前景確信度, プロンプト番号) を返す。
 
-        with Timer("    ┌ EdgeTAMクラスタごとのCLSトークン抽出処理時間"):
-            edge_confidence, edge_prompt_index = self._judge_clusters(patch_features, edge_labels)
-        return edge_labels, edge_confidence, edge_prompt_index
-
-    def _combine_pe_and_edgetam(
-        self,
-        pe_view: Tuple[np.ndarray, np.ndarray, np.ndarray],
-        edge_view: Tuple[np.ndarray, np.ndarray, np.ndarray],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """PE と EdgeTAM の判定を統合する。各 view は (前景確信度, プロンプト番号, クラスタ番号)。
-
-        Returns: 統合後の (前景確信度, プロンプト番号, クラスタ番号)。クラスタ番号は PE × EdgeTAM のクラスタの組ごとに振り直す。
+        PE のクラスタは意味は近いが空間的にばらけ、背景の斑点・織り目の一部が前景のクラスタに混ざる（誤検出）。
+        EdgeTAM の特徴は物体の輪郭・領域に沿ってまとまるので、その類似度の kNN グラフで確信度を平均して、物体の構造に沿って揃える。
+        前景を消す（AND のように）のではなく、確信度をならすだけなので、大きな物体は崩れにくい。判定が反転したパッチの
+        プロンプトは、反転後と同じ側に判定されていた近傍のプロンプトの最頻値にする（無ければ画像全体でその側の最頻値）。
         """
-        confidence, prompt_index, cluster_labels = pe_view
-        edge_confidence, edge_prompt_index, edge_labels = edge_view
+        edge_features = edge_embed[0].reshape(edge_embed.shape[1], -1).T
+        edge_features = edge_features / (np.linalg.norm(edge_features, axis=-1, keepdims=True) + 1e-8)
+        graph = knn_graph(edge_features, EDGE_PROPAGATION_NEIGHBORS)
+        propagated = propagate(confidence, graph, EDGE_PROPAGATION_ALPHA, EDGE_PROPAGATION_ITERATIONS)
 
-        # 両方が前景のときだけ前景（確信度の小さい方）。プロンプトは、最終の前景/背景と同じ側で確信が強い見方のものを使う
-        # （どちらの見方も、確信度が閾値を超えるときだけ前景のプロンプトを返すので、前景なら両方、背景なら小さい方が背景のプロンプト）
-        confidences = np.stack([confidence, edge_confidence])
-        prompts = np.stack([prompt_index, edge_prompt_index])
-        confidence = confidences.min(axis=0)
-        pick = np.where(confidence > self.foreground_threshold, confidences.argmax(axis=0), confidences.argmin(axis=0))
-        prompt_index = np.take_along_axis(prompts, pick[None], axis=0)[0]
-
-        # PE × EdgeTAM のクラスタの組ごとに、確信度とプロンプトは一定になる
-        _, cluster_labels = np.unique(cluster_labels * (edge_labels.max() + 1) + edge_labels, return_inverse=True)
-        return confidence, prompt_index, cluster_labels.reshape(-1)
+        num_foreground_prompts = len(self.foreground_prompts)
+        threshold = self.foreground_threshold
+        old_foreground, new_foreground = confidence > threshold, propagated > threshold
+        prompt_index = prompt_index.copy()
+        for patch in np.nonzero(old_foreground != new_foreground)[0]:
+            neighbors = graph.indices[graph.indptr[patch]:graph.indptr[patch + 1]]
+            candidates = prompt_index[neighbors[old_foreground[neighbors] == new_foreground[patch]]]
+            if not len(candidates):
+                candidates = prompt_index[old_foreground == new_foreground[patch]]
+            if len(candidates):
+                prompt_index[patch] = np.bincount(candidates).argmax()
+            else:
+                prompt_index[patch] = 0 if new_foreground[patch] else num_foreground_prompts
+        return propagated, prompt_index
 
     # =========================================================================
     # 粗いセマンティックラベル

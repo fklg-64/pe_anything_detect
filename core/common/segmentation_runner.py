@@ -27,7 +27,7 @@ class SegmentationRunner:
         self.extractor = extractor
         self.edgetam = edgetam
         self.output_dir = config["output_dir"]
-        # 粗い判定で、PE に加えて EdgeTAM の特徴でもクラスタ分けして前景確信度を AND する（誤検出を減らす。小物体の検出率が少し下がる）
+        # 粗い判定の前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える（誤検出を減らす。EdgeTAM のエンコードを先に 1 回だけ実行する）
         self.use_edgetam_clustering = config.get("use_edgetam_clustering", False)
 
         self.coarse = CoarseSegmenter(extractor, config)
@@ -103,7 +103,6 @@ class SegmentationRunner:
             semantic_labels=semantic_labels,
             cluster_index_list=cluster_index_list,
             pe_clusters=coarse_foreground.pe_clusters,
-            edge_clusters=coarse_foreground.edge_clusters,
             debug_images=refined.debug_images,
         )
 

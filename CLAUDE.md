@@ -49,7 +49,7 @@ python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --o
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
-- 性能向上が確認できた手法（外周「不明」・外周 + ガイデッドフィルタ・PE と EdgeTAM の統合・点数 4:4）の詳細は `docs/improvement_methods.md`。**外周 + ガイデッドフィルタ（精緻化の初期マスク）・点数 4:4・PE × EdgeTAM の AND（`use_edgetam_clustering`）は本体に組み込み済み**（共通コードなので PyTorch・OpenVINO の両方）。実験用のコード（`tools/experiments/`）は、従来の運用（8:8・外周なし）を基準にしている。
+- 性能向上が確認できた手法（外周「不明」・外周 + ガイデッドフィルタ・PE と EdgeTAM の統合・点数 4:4）の詳細は `docs/improvement_methods.md`。**外周 + ガイデッドフィルタ（精緻化の初期マスク）・点数 4:4・EdgeTAM の特徴での前景確信度の伝播（`use_edgetam_clustering`。以前の AND を置き換えた）・反復 2 回は本体に組み込み済み**（共通コードなので PyTorch・OpenVINO の両方）。実験用のコード（`tools/experiments/`）は、従来の運用（8:8・外周なし）を基準にしている。
 - `tools/` は用途別のフォルダ: `evaluation/`（評価・診断）, `dataset/`, `gui/`, `experiments/<名前>/`（手法の検証実験。本体には未組み込みで、`outputs/<名前>/` と対）。実験どうしは `from tools.experiments.decontam import exp_decontam as E` の形で import し合う。構成は `tools/README.md`。評価カテゴリは `tools/evaluation/eval_prompts.py` の `OBJECT_CATEGORIES`（10 種。過去の数値はこれ）と `EVAL_CATEGORIES`（zipper を除く 9 種。zipper は fg_mask が画面の 78% で物体として扱う意味が無い）。
 - 実行対象画像は `develop.py` / `test_pytorch.py` 内の `image_paths` リストを直接編集する（CLI 引数なし）。
 - 設定は `configs/ov_config.yaml`（OpenVINO）/ `configs/torch_config.yaml`（PyTorch）。`core.utils.load_config()` の既定は ov_config。
@@ -84,7 +84,7 @@ backend:
 
 1. `resize_image` + `normalize_image`（リサイズは CLIP と EdgeTAM で共通、正規化はモデルごと）
 2. （`use_edgetam_clustering: true` のとき）EdgeTAM エンコーダーを先に 1 回だけ実行（結果は粗い判定と精緻化の両方で使う）。`CoarseSegmenter.extract_features`: CLIP 画像特徴（パッチ・fused パッチ）
-3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る。`use_edgetam_clustering: true` なら、EdgeTAM の `image_embed` でも別に KMeans して同じ判定を行い、前景確信度の小さい方（AND）を採る（誤検出を減らす）
+3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る。`use_edgetam_clustering: true` なら、EdgeTAM の `image_embed` の類似度（kNN）で前景確信度を伝播して揃える（誤検出を減らす。`docs/coarse_segmentation.md` §3.5）
 4. `assign_semantic_labels`: クラスタに対応するプロンプトで粗いセマンティックラベルを付与
 5. `refine_coarse_segmentation`: 穴埋め・細い領域の統合
 6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点、既定 4）/ 背景（`edgetam_background_point_count` 点、既定 4）のプロンプト点と、初期マスク（粗いマスクの外側 1 パッチを「不明」にし、128×128 に拡大して入力画像の輝度をガイドにしたガイデッドフィルタで縁を整えたもの）で EdgeTAM の decoder を反復し、クラスを統合（encoder は 2 で実行済みなら再実行しない）

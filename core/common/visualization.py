@@ -160,7 +160,7 @@ class ResultSaver:
         return image.resize(size, resample=Image.Resampling.NEAREST)
 
     def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
-        """KMeansのクラスタ（EdgeTAM併用時は統合前のPE・EdgeTAMも）、整形前後の粗いセマンティックラベルを着色して保存。"""
+        """KMeansのクラスタ（EdgeTAM併用時は伝播前のPEも）、整形前後の粗いセマンティックラベルを着色して保存。"""
         grid = (self.feature_size, self.feature_size)
         for image_name, view in self._cluster_views(result):
             self._colorize_labels(view.labels.reshape(grid), size).save(save_dir / image_name)
@@ -172,12 +172,10 @@ class ResultSaver:
         )
 
     def _cluster_views(self, result: SegmentationResult) -> List[Tuple[str, ClusterView]]:
-        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。EdgeTAM 併用時は、統合前の PE・EdgeTAM、統合後の順。"""
+        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。EdgeTAM 併用時は、伝播前の PE、伝播後の順。"""
         views = []
         if result.pe_clusters is not None:
             views.append((f"layer_fused_pe_k{self.k_clusters}.png", result.pe_clusters))
-        if result.edge_clusters is not None:
-            views.append((f"edgetam_embed_k{self.k_clusters}.png", result.edge_clusters))
         views.append((f"layer_fused_k{self.k_clusters}.png", ClusterView(result.cluster_labels, result.cluster_index_list)))
         return views
 
