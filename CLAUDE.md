@@ -47,6 +47,9 @@ python convert_openvino.py --cluster-layers 6 --out-dir ./weights/openvino_model
 python tools/experiments/bg_points/exp_bg_{mechanism,quantile,diverse}.py OUT.json  # 背景の負例点が密集する理由と、ばらしたときの精度の測定（効果なし。結果は outputs/bg_points/）
 python tools/experiments/hires_prior/exp_hires_prior.py --coarse {oracle,pe} --out OUT.json [--variants ...]  # EdgeTAM の 128×128 特徴で事前マスクを高分解能にする案 H1〜H4 の測定（効果なし。結果は outputs/hires_prior/。exp_oracle_gt_prior.py は正解の 128×128 を事前マスクにした上限）
 python tools/experiments/crack_fix/report_crack_fix.py  # クラス境界の割れの対処（前景内部の細い隙間を埋める）と BLAS のスレッド制限のレポート（outputs/crack_fix/）
+cd cppsrc && ./build.sh [--test]  # C++ 版（OpenVINO のみ。AVX2。共有ライブラリ libpe_segmentation.so + サンプル）のビルド。使い方・API・検証結果は cppsrc/README.md
+./cppsrc/build/bin/pe_segmentation_sample [-v] IMAGE...  # C++ 版の実行（リポジトリのルートで。画像のパスを渡す。他の引数は develop.py と同じ既定値）
+python cppsrc/scripts/compare_with_python.py --images-file LIST.txt [--system-openvino]  # C++ 版と Python 版（develop.py と同じ処理）の結果を同じ画像で比較
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
@@ -95,6 +98,10 @@ backend:
 7. `run()` では `ResultSaver` が `output_dir/<画像名>/` に可視化を保存
 
 `core/utils.py` に共通ヘルパー（`Timer` コンテキストマネージャー、`load_image`, `resize_image`, `normalize_image`, `preprocess_image`, `load_config`）。各処理は `with Timer(...)` で ms 計測する流儀。
+
+## C++ 版（cppsrc/）
+
+`core/common` + `core/openvino` を C++ に書き起こしたもの（PyTorch は無し）。`include/pe_segmentation.h` の `extern "C"` API（`pes_create` → `pes_extract_text_features`（`pes_add_prompt` / `pes_remove_prompt` で追加・削除）→ `pes_run`）を共有ライブラリで公開する。scipy は OpenCV に置き換え、faiss の KMeans・CLIP のトークナイザは自前実装（faiss / `pe_tokenizer.xml` と同じ結果を単体テストで確認）、行列積などは AVX2 + FMA。**Python 側の手法（`core/common`）を変えたら、対応する `cppsrc/src` も更新**し、`scripts/compare_with_python.py` で確認すること。詳細は `cppsrc/README.md`。
 
 ## 補足
 

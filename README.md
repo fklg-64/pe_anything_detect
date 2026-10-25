@@ -20,6 +20,15 @@
     python develop.py
     ```
 
+### C++ 版（OpenVINO）
+
+`cppsrc/` に C++ への書き起こし（共有ライブラリ + サンプル）がある。詳細は [cppsrc/README.md](cppsrc/README.md)。
+
+```bash
+cd cppsrc && ./build.sh && cd ..
+./cppsrc/build/bin/pe_segmentation_sample image.png
+```
+
 ### PyTorchモデル
 
 1. モデル実行
