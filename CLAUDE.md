@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## コマンド
 
 ```bash
-python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openvino_models)。実行時は先に必須
+python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openvino_models)。実行時は先に必須。`--edgetam-only` で EdgeTAM だけ（約 30 秒）。デコーダーは画像サイズ可変（変換後に別サイズで PyTorch と照合して確認。docs/semantic_refiner.md §4.4）
 python develop.py            # OpenVINO 版の実行（本命・最新）
 python test_pytorch.py       # PyTorch 版の実行（core/common を共有するので OpenVINO 版と同じ処理。手法の実験用）
 python test_pytorch_sam2.py  # PyTorch 版を SAM2.1（公式 Hiera-T）で精緻化して実行（configs/torch_config_sam2.yaml。EdgeTAM との差し替えの検証用）
@@ -44,6 +44,9 @@ python tools/experiments/crop_cls/exp_crop.py --task {components,mvtec,synthetic
 python tools/experiments/dense_features/exp_dense.py --task {mvtec,synthetic} --variants feat_spatial,feat_pe6+edge,...  # クラスタリングの特徴源の差し替え・連結（C2。PE-Spatial-T など。効果なし。結果は outputs/dense_features/）
 python tools/experiments/phase2/report_phase2.py  # 上の 3 実験の結果を outputs/phase2/index.html に可視化
 python convert_openvino.py --cluster-layers 6 --out-dir ./weights/openvino_models_l6 --pe-only  # クラスタリングに使う層を変えた PE のモデルだけを別フォルダに書き出す（既存のモデルは上書きしない）
+python tools/experiments/bg_points/exp_bg_{mechanism,quantile,diverse}.py OUT.json  # 背景の負例点が密集する理由と、ばらしたときの精度の測定（効果なし。結果は outputs/bg_points/）
+python tools/experiments/hires_prior/exp_hires_prior.py --coarse {oracle,pe} --out OUT.json [--variants ...]  # EdgeTAM の 128×128 特徴で事前マスクを高分解能にする案 H1〜H4 の測定（効果なし。結果は outputs/hires_prior/。exp_oracle_gt_prior.py は正解の 128×128 を事前マスクにした上限）
+python tools/experiments/crack_fix/report_crack_fix.py  # クラス境界の割れの対処（前景内部の細い隙間を埋める）と BLAS のスレッド制限のレポート（outputs/crack_fix/）
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価

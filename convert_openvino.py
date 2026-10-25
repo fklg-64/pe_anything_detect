@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, List, Tuple, Union
 
 import nncf
+import numpy as np
 import openvino as ov
 from openvino_tokenizers import convert_tokenizer
 import torch
@@ -263,11 +264,44 @@ class EdgeTAMOpenVINOExporter(BaseOpenVINOExporter):
 
         self._save_and_compress(ov_decoder, "edgetam_decoder")
 
+    def verify_dynamic_image_size(self, scales: Tuple[Tuple[float, float], ...] = ((1.0, 1.0), (2.0, 2.0), (1.0, 1.5))):
+        """保存した FP32 のエンコーダ・デコーダが、変換時と違う画像サイズ（正方形・非正方形）でも動き、PyTorch と一致することを確認する。
+
+        デコーダのグラフに、変換時の画像サイズで決まる定数（密な位置エンコーディング、座標の正規化の除数など）が焼き込まれていると、
+        他の画像サイズでは形が合わずに失敗するか、値がずれる。失敗したら例外にする。
+        """
+        base = self.edgetam_encoder.edgetam_model.image_size
+        core = ov.Core()
+        encoder = core.compile_model(self.save_dir / "edgetam_encoder.xml", "CPU")
+        decoder = core.compile_model(self.save_dir / "edgetam_decoder.xml", "CPU")
+        rng = np.random.default_rng(0)
+        for scale_h, scale_w in scales:
+            height, width = int(base * scale_h), int(base * scale_w)
+            image = torch.from_numpy(rng.standard_normal((1, 3, height, width)).astype(np.float32)).to(self.device)
+            with torch.no_grad():
+                features = self.edgetam_encoder(image)
+            ov_features = encoder([image.cpu().numpy()])
+            for index, feature in enumerate(features):
+                assert tuple(ov_features[index].shape) == tuple(feature.shape), f"{height}x{width}: エンコーダの出力 {index} の形が PyTorch と違う"
+
+            points = np.array([[[width * 0.3, height * 0.4], [width * 0.7, height * 0.6]]], dtype=np.float32)  # 入力画像の画素座標
+            labels = np.array([[1, 0]], dtype=np.int32)
+            mask_input = rng.standard_normal((1, 1, features[0].shape[2], features[0].shape[3])).astype(np.float32)
+            has_mask = np.array([1.0], dtype=np.float32)
+            with torch.no_grad():
+                expected = self.edgetam_decoder(*features, torch.from_numpy(points), torch.from_numpy(labels), torch.from_numpy(mask_input), torch.from_numpy(has_mask))
+            actual = decoder([*(f.cpu().numpy() for f in features), points, labels, mask_input, has_mask])
+            masks_diff = float(np.abs(actual[0] - expected[0].cpu().numpy()).max())
+            iou_diff = float(np.abs(actual[1] - expected[1].cpu().numpy()).max())
+            print(f"  [verify] {height}x{width}: デコーダの出力の PyTorch との最大差 logits {masks_diff:.2e} iou {iou_diff:.2e}")
+            assert masks_diff < 1e-1 and iou_diff < 2e-2, f"{height}x{width}: デコーダの出力が PyTorch と一致しない（画像サイズに依存する定数が焼き込まれている可能性）"
+
     def export_all(self):
         """全 EdgeTAM モデルの変換を実行"""
         tasks = [
             ("Exporting Encoder Model", self.export_encoder_model),
             ("Exporting Decoder Model", self.export_decoder_model),
+            ("Verifying other image sizes", self.verify_dynamic_image_size),
         ]
         self._run_export_pipeline(tasks)
 
@@ -280,6 +314,7 @@ if __name__ == "__main__":
                         help="クラスタリングに使う PE の層（fused_layer_features に連結する層）。既定は設定値の [8, 9, 10]")
     parser.add_argument("--out-dir", default=None, help="保存先。既定は設定の ov_model_dir（既存のモデルを上書きしない場合に指定する）")
     parser.add_argument("--pe-only", action="store_true", help="PE（CLIP）だけを変換し、EdgeTAM は変換しない")
+    parser.add_argument("--edgetam-only", action="store_true", help="EdgeTAM だけを変換し、PE（CLIP）は変換しない")
     args = parser.parse_args()
 
     # 設定データ
@@ -292,13 +327,14 @@ if __name__ == "__main__":
         config["ov_model_dir"] = args.out_dir
 
     # Extractor / EdgeTAM モデルの初期化
-    extractor = TorchCLIPFeatureExtractor(config)
     edgetam_encoder = RepVitModel(config)
     edgetam_decoder = DecodeModel(config)
 
     # CLIP モデルのエクスポート
-    exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=config["ov_model_dir"])
-    exporter_pe.export_all()
+    if not args.edgetam_only:
+        extractor = TorchCLIPFeatureExtractor(config)
+        exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=config["ov_model_dir"])
+        exporter_pe.export_all()
 
     if args.pe_only:
         raise SystemExit(0)

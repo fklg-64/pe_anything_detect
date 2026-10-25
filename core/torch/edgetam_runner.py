@@ -235,6 +235,29 @@ class DecodeModel(BaseModel):
         """マスク入力のダウンスケーリングエンコーディング"""
         return self.edgetam_model.sam_prompt_encoder.mask_downscaling(masks)
 
+    def _dense_pe(self, image_embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """画像埋め込みと同じ大きさの密な位置エンコーディング (1, C, H, W) と、H・W（0 次元テンソル）を返す。
+
+        `sam_prompt_encoder.get_dense_pe()` は、モデルの設定の画像サイズ（例: 512 → 32×32）で固定の大きさになり、OpenVINO 変換でも
+        定数として焼き込まれて、他の画像サイズでは加算の形が合わなくなる。ここでは形を image_embed のテンソルから求める
+        （`.shape` の整数ではなく、全て 1 のベクトルの和で H・W を得るので、トレース時にも定数にならない）。
+
+        位置エンコーディング sin / cos(2π (x'·g_x + y'·g_y))（x'・y' は格子の中心を [-1, 1] にした座標、g はガウス行列）は、x と y に分けられる。
+        加法定理で、列ごと（W 個）・行ごと（H 個）に sin / cos を求めて、掛け合わせる（H×W 個の sin / cos を毎回計算しない。
+        デコードのたびに実行されるので、512 で約 0.5ms の差になる）。PositionEmbeddingRandom._pe_encoding と同じ値（誤差 1e-6 程度）。
+        """
+        ones_y, ones_x = torch.ones_like(image_embed[0, 0, :, 0]), torch.ones_like(image_embed[0, 0, 0, :])
+        height, width = ones_y.sum(), ones_x.sum()
+        y = 2 * ((ones_y.cumsum(dim=0) - 0.5) / height) - 1  # (H,)
+        x = 2 * ((ones_x.cumsum(dim=0) - 0.5) / width) - 1  # (W,)
+        gaussian = self.edgetam_model.sam_prompt_encoder.pe_layer.positional_encoding_gaussian_matrix  # (2, F)
+        angle_y = 2 * np.pi * y[:, None] * gaussian[1][None, :]  # (H, F)
+        angle_x = 2 * np.pi * x[:, None] * gaussian[0][None, :]  # (W, F)
+        sin_y, cos_y = torch.sin(angle_y)[:, None, :], torch.cos(angle_y)[:, None, :]  # (H, 1, F)
+        sin_x, cos_x = torch.sin(angle_x)[None, :, :], torch.cos(angle_x)[None, :, :]  # (1, W, F)
+        pe = torch.cat([sin_y * cos_x + cos_y * sin_x, cos_y * cos_x - sin_y * sin_x], dim=-1)  # (H, W, 2F)
+        return pe.permute(2, 0, 1).unsqueeze(0), height, width
+
     @torch.no_grad()
     def forward(
         self,
@@ -246,19 +269,32 @@ class DecodeModel(BaseModel):
         mask_input: torch.Tensor,
         has_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """OpenVINO 変換に対応した forward 推論。
-        
+        """OpenVINO 変換に対応した forward 推論。入力の画像サイズ（image_embed の大きさ）は可変。
+
         注意: dense_embeddings の計算処理 (has_mask_b を使用したゲート演算) は
         ONNX/OpenVINO 変換時の動的条件分岐エラーを防ぐための必須処理です。
+
+        画像サイズに依存する 2 か所（密な位置エンコーディング、点の座標の正規化）は、モデルの設定の画像サイズを使わず、
+        image_embed の大きさから求める。point_coords は入力画像の画素座標（EdgeTamHelper.transform_coords の出力）。
         """
         concat_points = (point_coords, point_labels)
+        prompt_encoder = self.edgetam_model.sam_prompt_encoder
+
+        # 画像サイズ依存の部分: 密な位置エンコーディングと、点の座標の正規化に使う入力画像の大きさ（埋め込みの大きさ × ストライド）
+        dense_pe, embed_height, embed_width = self._dense_pe(image_embed)
+        stride = prompt_encoder.input_image_size[0] // prompt_encoder.image_embedding_size[0]  # 設定の画像サイズでの比（16）。定数でよい
+        configured_input_size = prompt_encoder.input_image_size
 
         # 1. 疎プロンプト (ポイント) のエンコード
-        sparse_embeddings, _ = self.edgetam_model.sam_prompt_encoder(
-            points=concat_points,
-            boxes=None,
-            masks=None,
-        )
+        prompt_encoder.input_image_size = (embed_height * stride, embed_width * stride)
+        try:
+            sparse_embeddings, _ = prompt_encoder(
+                points=concat_points,
+                boxes=None,
+                masks=None,
+            )
+        finally:
+            prompt_encoder.input_image_size = configured_input_size
 
         # 2. 密プロンプト (マスク) のエンコード (OpenVINO 互換のゲート演算)
         has_mask_b = has_mask.reshape(-1, 1, 1, 1)
@@ -272,7 +308,7 @@ class DecodeModel(BaseModel):
         batched_mode = concat_points[0].shape[0] > 1
         low_res_masks, iou_predictions, _, _ = self.edgetam_model.sam_mask_decoder(
             image_embeddings=image_embed,
-            image_pe=self.edgetam_model.sam_prompt_encoder.get_dense_pe(),
+            image_pe=dense_pe,
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=True,

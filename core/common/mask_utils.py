@@ -118,6 +118,7 @@ def select_background_points(
     foreground_map を渡すと、背景と判定された中でも前景確信度が最も低い（背景だと最も確信できる）
     パッチから選ぶ。確信の弱い「背景」は、実際は物体（例: 濃い布）のことがあり、そこに負例を置くと
     物体を打ち消してしまうため。
+    確信度が連続値だと、候補は最も低い count パッチそのものになる（点が隅に寄る）。広げても精度は上がらない（docs/semantic_refiner.md §4.3）。
     """
     background = ~foreground_binary
     labeled, _ = ndi_label(background)

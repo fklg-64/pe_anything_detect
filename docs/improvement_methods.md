@@ -655,4 +655,5 @@ python tools/experiments/sam2/report_sam2.py                                    
 
 - **クラスの境界の割れ**（`capsule/test/good/000.png` の「500」の下の切れ目）: 最終マップで、粗い前景の内部の幅 1 パッチ未満で、両側が 2 クラス以上に接する背景の隙間を、最寄りのクラスで埋める（[semantic_refiner.md](semantic_refiner.md) §10.1）。この画像の核の穴 2.06% → 0.05%。前景だった画素は変えない（マスクのシャープさは同じ）。IoU は MVTec 0.8373 → 0.8380、合成は同じ。事前マスクで他クラスの前景を「不明」にする案（IoU +0.0035）は、マスクが周囲へ広がるので採らなかった。
 - **処理時間**: 伝播の行列積が BLAS の 20 スレッドを起こし、OpenVINO の推論とコアを取り合っていた。BLAS を 1 スレッドに制限して 約 252ms → 約 180ms、NumPy 段の外接矩形処理と隙間埋めで約 177ms（[performance.md](performance.md)）。OpenVINO のスレッド数は 4 のまま。
+- **背景の負例点・128×128 の事前マスク（2026-10-24。効果なし）**: 背景の負例点が隅に密集するのは、伝播で確信度が連続値になり、候補が「最も低い count パッチ」になるため。ばらしても精度は上がらない（[semantic_refiner.md](semantic_refiner.md) §4.3）。EdgeTAM の 128×128 特徴で事前マスクを高分解能にする案 H1〜H4 は、正解注入でも合成が下がり、採用しない。上限（正解の 128×128）は MVTec 6 カテゴリで差なし、合成 +0.026（[coarse_segmentation.md](coarse_segmentation.md) §17）。
 
