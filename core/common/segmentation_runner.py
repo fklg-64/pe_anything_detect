@@ -10,6 +10,7 @@ from core.utils import Timer, load_image, normalize_image, resize_image
 from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
+from core.common.instance_splitter import InstanceSplitter
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
 from core.common.visualization import ResultSaver
@@ -33,6 +34,8 @@ class SegmentationRunner:
         self.coarse = CoarseSegmenter(extractor, config)
         self.refiner = SemanticRefiner(edgetam, extractor.feature_size, config)
         self.saver = ResultSaver(config, extractor.feature_size)
+        # 同じクラスの接触した物体を 1 個ずつに分ける（docs/instance_segmentation.md。EdgeTAM のデコーダーを多く使うので既定は無効）
+        self.instance_splitter = InstanceSplitter(self.refiner, config) if config.get("instance_split", False) else None
 
         # tools から参照されるプロンプト一覧
         self.foreground_prompts = self.coarse.foreground_prompts
@@ -54,6 +57,11 @@ class SegmentationRunner:
         # EdgeTAMの特徴量抽出（粗い判定で EdgeTAM の特徴を使うときは、ここで 1 回だけ実行して精緻化にも渡す）
         edgetam_features = None
         if self.use_edgetam_clustering:
+            with Timer("EdgeTAM特徴量抽出処理時間"):
+                edgetam_features = self.refiner.predict_encoder(resized)
+
+        # インスタンス分離でも EdgeTAM の特徴を使うので、まだなら先に 1 回だけ実行して精緻化と共有する
+        if edgetam_features is None and self.instance_splitter is not None:
             with Timer("EdgeTAM特徴量抽出処理時間"):
                 edgetam_features = self.refiner.predict_encoder(resized)
 
@@ -88,6 +96,12 @@ class SegmentationRunner:
                 resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_features
             )
 
+        # 同じクラスの領域を、物体 1 個ずつに分ける
+        instance_map, instance_classes = None, None
+        if self.instance_splitter is not None:
+            with Timer("インスタンス分離処理時間"):
+                instance_map, instance_classes = self.instance_splitter.split(refined.semantic_map, edgetam_features)
+
         elapsed_time = time.time() - start
         print(f"Inference Time: {elapsed_time * 1000:.2f} ms")
 
@@ -103,6 +117,8 @@ class SegmentationRunner:
             semantic_labels=semantic_labels,
             cluster_index_list=cluster_index_list,
             pe_clusters=coarse_foreground.pe_clusters,
+            instance_map=instance_map,
+            instance_classes=instance_classes,
             debug_images=refined.debug_images,
         )
 

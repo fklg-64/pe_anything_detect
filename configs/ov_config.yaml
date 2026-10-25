@@ -37,6 +37,12 @@ edgetam_background_point_count: 4
 # EdgeTAMエンコーダは粗い判定の前に1回だけ実行し、精緻化にも使う
 use_edgetam_clustering: true
 
+# 同じクラスの接触した物体を 1 個ずつに分ける（インスタンス分離。docs/instance_segmentation.md。結果は SegmentationResult.instance_map）。
+# EdgeTAMのデコーダーを物体の数だけ追加で実行するので、既定は無効。重なった物体は分けられない
+instance_split: false
+# 分け方: proposals（点ごとに提案を作って選別。接触した同種の物体で最も安定）/ merge（過分割 → デコーダーの一貫性とくびれで結合。離れた物体を過分割しにくい）
+instance_method: "proposals"
+
 # EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
 edgetam_refine_iterations: 2
 

@@ -49,6 +49,8 @@ python tools/experiments/hires_prior/exp_hires_prior.py --coarse {oracle,pe} --o
 python tools/experiments/crack_fix/report_crack_fix.py  # クラス境界の割れの対処（前景内部の細い隙間を埋める）と BLAS のスレッド制限のレポート（outputs/crack_fix/）
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
+python tools/dataset/make_touching_dataset.py --parts DIR --backgrounds DIR --out DIR --split dev|verify  # 接触・近接・重なり・離れた物体の合成データ（インスタンス分離の評価用）
+python tools/experiments/instance_split/exp_instance.py --split dev --semantic gt|pred --methods B0,B1,MG:rule=dec_and_neck,PR  # インスタンス分離の手法を比べる（本体には proposals / merge を組み込み済み（instance_split: true）。結果は outputs/instance_split/。docs/instance_segmentation.md）
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
@@ -72,6 +74,7 @@ python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・
 - `coarse_segmentation.py`: `CoarseSegmenter`。CLIP 特徴量・テキストプロンプトとの照合・faiss KMeans による粗い前景/セマンティック推定と、パッチ単位の整形。
 - `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM backend でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
 - `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分（`Component` = 最内点 `peak`・`core`・`region` の NamedTuple）・ノイズ除去などの純粋関数。
+- `instance_splitter.py`: `InstanceSplitter`。`instance_split: true` のとき、semantic_map のクラスごとの領域を、EdgeTAM のデコーダーで物体 1 個ずつに分ける（`instance_method`: proposals / merge）。結果は `SegmentationResult.instance_map`。既定は無効。docs/instance_segmentation.md
 - `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
 - `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。
 

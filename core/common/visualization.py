@@ -23,6 +23,10 @@ FOREGROUND_OVERLAY_ALPHA = 0.3
 POINT_RADIUS = 20
 POINT_COLOR_POSITIVE = (0, 255, 0)
 POINT_COLOR_NEGATIVE = (0, 0, 255)
+# インスタンス可視化: 色相の刻み（HSV の H は 0〜179。黄金角に近い値で、隣り合う番号の色が離れる）、重畳の不透明度、番号の文字の大きさ
+INSTANCE_HUE_STEP = 47
+INSTANCE_OVERLAY_ALPHA = 0.5
+INSTANCE_LABEL_SCALE = 1.0
 # セマンティック結果（重畳 + 凡例）のmatplotlib図
 RESULT_FIGSIZE = (10, 6)
 RESULT_DPI = 150
@@ -81,6 +85,8 @@ class ResultSaver:
         self._save_foreground_overlay(save_dir, image_raw, mask_image, result)
 
         # 精緻化の中間結果
+        if result.instance_map is not None:
+            self._save_instance_result(save_dir, image_raw, result.instance_map)
         self._save_debug_images(save_dir / DEBUG_DIR_NAME, size, result.debug_images)
 
         print(f"Saving results to {save_dir}")
@@ -88,6 +94,36 @@ class ResultSaver:
     # -------------------------------------------------------------------------
     # 最終結果
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _save_instance_result(save_dir: Path, image_raw: np.ndarray, instance_map: np.ndarray) -> None:
+        """インスタンスの ID 画像（パレット付き PNG）と、元画像への重畳（輪郭と番号つき）を保存する。"""
+        count = int(instance_map.max())
+        hues = (np.arange(count + 1) * INSTANCE_HUE_STEP % 180).astype(np.uint8)
+        hsv = np.stack([hues, np.full_like(hues, 200), np.full_like(hues, 255)], axis=-1)[:, None, :]
+        colors = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[:, 0, :]
+        colors[0] = 0
+
+        index_image = Image.fromarray(instance_map.astype(np.uint8), mode="P") if count < 256 else None
+        if index_image is not None:
+            index_image.putpalette(colors.flatten().tolist())
+            index_image.save(save_dir / "instance_map.png")
+
+        overlay = image_raw.copy()
+        foreground = instance_map > 0
+        overlay[foreground] = (INSTANCE_OVERLAY_ALPHA * colors[instance_map][foreground]
+                               + (1 - INSTANCE_OVERLAY_ALPHA) * image_raw[foreground]).astype(np.uint8)
+        for k in range(1, count + 1):
+            body = (instance_map == k).astype(np.uint8)
+            contours, _ = cv2.findContours(body, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(overlay, contours, -1, (255, 255, 255), 2)
+            ys, xs = np.nonzero(body)
+            if len(ys):
+                cv2.putText(overlay, str(k), (int(xs.mean()), int(ys.mean())), cv2.FONT_HERSHEY_SIMPLEX,
+                            INSTANCE_LABEL_SCALE, (0, 0, 0), 4)
+                cv2.putText(overlay, str(k), (int(xs.mean()), int(ys.mean())), cv2.FONT_HERSHEY_SIMPLEX,
+                            INSTANCE_LABEL_SCALE, (255, 255, 255), 2)
+        cv2.imwrite(str(save_dir / "instance_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
     def _save_semantic_result(
         self,

@@ -66,3 +66,19 @@ GAP_FILL_PIXELS_PER_PATCH = 8
 # --- ノイズ除去 ---
 # マスクの輪郭を平滑化するメディアンフィルタのカーネルサイズ
 MEDIAN_BLUR_KSIZE = 3
+
+# --- インスタンス分離（instance_split。同じクラスの接触した物体を 1 個ずつに分ける。docs/instance_segmentation.md） ---
+# 画像面積に対する、インスタンスの最小面積の割合（これ未満は捨てる）
+INSTANCE_MIN_AREA_RATIO = 0.0002
+# 距離変換の watershed を、この倍率に縮小して行う（全解像度では重いため）
+INSTANCE_EDT_SCALE = 0.25
+# 過分割に使う距離変換の山の高さ（領域の最大半径に対する割合）。小さいほど細かく分ける。どちらの方式も、ここで分けた断片が出発点になる
+INSTANCE_OVERSEG_H_FRAC = 0.1
+# 提案方式（proposals）: 提案のマスクのうち、クラスの領域に収まる割合の下限 / 既に採った物体に覆われていない新しい面積の割合の下限 / 重複とみなす IoU
+INSTANCE_PROPOSAL_INSIDE = 0.85
+INSTANCE_PROPOSAL_NEW_FRACTION = 0.5
+INSTANCE_PROPOSAL_NMS_IOU = 0.5
+# 結合方式（merge）: 隣り合う断片の一方を指したときのマスクが、もう一方の面積をこの割合以上覆えば同じ物体の候補。
+# かつ、断片の境界の長さが小さい方の直径のこの割合以上（くびれが無い）なら結合する
+INSTANCE_MERGE_COVER = 0.5
+INSTANCE_MERGE_NECK = 0.7

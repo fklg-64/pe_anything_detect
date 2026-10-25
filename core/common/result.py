@@ -31,5 +31,9 @@ class SegmentationResult:
     # EdgeTAM 併用時（use_edgetam_clustering）だけ、伝播前の PE だけのクラスタ分けと分類結果。併用しなければ None
     pe_clusters: Optional[ClusterView] = None
 
+    # インスタンス分離（instance_split: true のときだけ）。semantic_map の同じクラスの領域を、物体 1 個ずつに分けたもの
+    instance_map: Optional[np.ndarray] = None       # (height, width) int32。0=背景、1~=インスタンス
+    instance_classes: Optional[List[int]] = None    # インスタンス k（1~）のクラス（semantic_map の値）。instance_classes[k - 1]
+
     # 精緻化の中間結果（名前 -> 0〜1 の2次元配列。保存時に元画像サイズへ拡大する）
     debug_images: Dict[str, np.ndarray] = field(default_factory=dict)
