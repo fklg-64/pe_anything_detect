@@ -13,9 +13,8 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 | `docs/overview.md` | 全体像。粗い・詳細の流れ（フローチャート）、シーケンス図、2 段階にした理由、各段階の入出力、設定、処理時間、コードの対応 |
 | `docs/coarse_segmentation.md` | ① 粗いセマンティックセグメンテーション（`core/common/coarse_segmentation.py`） |
 | `docs/detailed_segmentation.md` | ② 詳細セグメンテーション（`core/common/semantic_refiner.py`） |
-| `docs/method_history.md` | 手法の変遷（試した手法・採用/不採用・現在の手法とのメリット/デメリット）。**手法を変えたら、「採用した変更」と「試して採用しなかった手法」を更新する**（数値は `docs/tmp/` と `outputs/<実験名>/` の記録から、条件つきで写す） |
+| `docs/method_history.md` | 手法の変遷（試した手法・採用/不採用・現在の手法とのメリット/デメリット）。**手法を変えたら、「採用した変更」と「試して採用しなかった手法」を更新する**（数値は、既存の記載と `outputs/<実験名>/` のレポートから、測定条件つきで写す） |
 | `docs/images/` | 資料の画像（JPEG）。`tools/docs/make_doc_images.py` が作る |
-| `docs/tmp/` | 旧資料（実験の記録・経緯）。**更新しない**。過去の実験を引くときだけリンクする |
 
 ## 書き方（守る）
 

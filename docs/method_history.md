@@ -2,7 +2,7 @@
 
 現在の手法（[overview.md](overview.md)）に至るまでに、**何を変え、何が良くなり、何が悪くなったか**を 1 枚にまとめる。試して採用しなかった手法も、同じ案を繰り返さないために残す。
 
-詳しい実験記録は `docs/tmp/`（[coarse_segmentation.md](tmp/coarse_segmentation.md)・[semantic_refiner.md](tmp/semantic_refiner.md)・[improvement_methods.md](tmp/improvement_methods.md)・[performance.md](tmp/performance.md)）と `outputs/<実験名>/index.html`。
+詳しい実験記録は `outputs/<実験名>/index.html`（各実験のレポート）。
 
 ## 要点
 
@@ -62,7 +62,7 @@ flowchart TD
 
 ### 精度の推移（本体のパイプライン、同じ条件）
 
-PE 第 6 層・当時のプロンプト・OpenVINO/PyTorch の測定値（[improvement_methods.md](tmp/improvement_methods.md) §9.2）。IoU の棒は 0.5〜0.9 を 20 マスで表した。
+PE 第 6 層・当時のプロンプト・OpenVINO/PyTorch の測定値（本体のパイプラインで測り直した値）。IoU の棒は 0.5〜0.9 を 20 マスで表した。
 
 | 段階 | MVTec 108 枚 | 合成 120 枚 | 背景の誤検出 | 点 / 枚 |
 |---|---|---|---|---|
@@ -191,7 +191,7 @@ flowchart LR
 | 粗い誤りは直せない | 背景を前景と判定したクラスには、正例点が背景に置かれ、EdgeTAM もそれに従う。再判定で消す案はすべて悪化した | 詳細段階の試行 |
 | 伝播が大きな領域を落とす | 確信度がしきい値付近の大きな領域が、丸ごと落ちることがある（bottle の一部） | 伝播の検証 |
 | まとまった誤検出が残る | 星印のロゴなど、EdgeTAM の特徴でもまとまる誤検出は、伝播で消えない。さらに、取りこぼしの再推定がそれを前景として足すことがある（カップ麺の例、[detailed_segmentation.md](detailed_segmentation.md)） | 今回の資料作成で確認 |
-| 取りこぼしの再推定の効果が未測定 | 発生頻度と IoU への寄与は測っていない。無効にしたときの差は、`eval_pipeline.py` で比べられる | [rescue_reestimation.md](tmp/rescue_reestimation.md) |
+| 取りこぼしの再推定の効果が未測定 | 発生頻度と IoU への寄与は測っていない。無効にしたときの差は、`eval_pipeline.py` で比べられる | 取りこぼしの再推定 |
 | クラス単位の区別が弱い | 部品の種類が複数ある画像で、正解の種類 3.6 に対し予測クラス 1.5。結果はほぼ前景 / 背景 | 診断 Phase 0 |
 | 負例点が端に寄る | 画像の中央の背景には置かれない（精度への影響は確認できていない） | 負例点の検証 |
 | 縁の手がかりが輝度だけ | 透明・低コントラストの物体は、背景への広がりが残る | ガイデッドフィルタの検証 |

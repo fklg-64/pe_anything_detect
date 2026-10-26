@@ -67,7 +67,7 @@ EDGETAM_MASK_DOWNSCALE = 8
 SCORE_PRIOR_WEIGHT = 0.5
 
 # --- 前景内部の細い隙間の穴埋め ---
-# 粗い前景の内部（core）にある背景の隙間は、幅が 1 パッチ未満なら粗い判定の分解能以下なので前景にする（クラス境界の割れ。docs/semantic_refiner.md §6.4）。
+# 粗い前景の内部（core）にある背景の隙間は、幅が 1 パッチ未満なら粗い判定の分解能以下なので前景にする（クラス境界の割れ。docs/detailed_segmentation.md §8）。
 # 隙間は 1 パッチ = この画素数に縮小したマスクの閉処理で探す（全解像度の閉処理は約 10ms かかるため。位置は ±1 画素程度の差）
 GAP_FILL_PIXELS_PER_PATCH = 8
 

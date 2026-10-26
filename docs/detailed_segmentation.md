@@ -388,4 +388,4 @@ flowchart TD
 - **透明・低コントラストの物体**は、ガイデッドフィルタの手がかり（輝度の縁）が弱く、背景への広がりが残ることがある。
 - 処理時間: デコード（1 回 約 6〜7ms）の回数は「クラス数 × 反復回数 +（再推定した成分数 × 反復回数）」。クラスが多い画像ほど遅い。
 
-過去の実験（外周「不明」・ガイデッドフィルタ・SAM2.1 への切り替え・点数・割れの穴埋めなど）の記録は [tmp/semantic_refiner.md](tmp/semantic_refiner.md)・[tmp/improvement_methods.md](tmp/improvement_methods.md)。
+過去の実験（外周「不明」・ガイデッドフィルタ・SAM2.1 への切り替え・点数・割れの穴埋めなど）の記録は [method_history.md](method_history.md)。

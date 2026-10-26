@@ -27,14 +27,21 @@
         "a photo of a wire.",
         "a photo of a pill.",
         "a photo of a capsule.",
-        "a photo of a food item.",
-        "a photo of a package.",
         "a photo of a label.",
-        "a photo of a fabric.",
+        # "a photo of a fabric.",  # タオル・カーペット等の背景が前景になるため無効化（zipperのIoUは0.96->0.92）
         "a photo of a tool.",
         "a photo of a coin.",
+
+        "a photo of a noodle.",
+        "a photo of a food item.",
+        "a photo of a package.",
         "a photo of a plastic cup.",
         "a photo of a foil lid.",
+        "a photo of a white plastic lid.", 
+        "a photo of a round white food container.",
+
+        # 実験用
+        "a photo of a animal."
 
         # --- 旧プロンプト（無効化。比較用に残している） ---
         # "a photo of a fastener.",

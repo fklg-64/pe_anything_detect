@@ -121,7 +121,7 @@ sequenceDiagram
 | `image_size` / `resize_mode` | 512 / `fit` | モデル入力の大きさ・アスペクト比の扱い |
 | `k_clusters` / `n_iter` | 8 / 10 | KMeans |
 | `foreground_threshold` | 0.5 | 前景の確信度のしきい値 |
-| `prompts_dir` | `prompts/candidates/color_free_bg` | 前景・背景プロンプト |
+| `prompts_dir` | `prompts` | 前景・背景プロンプト |
 | `use_edgetam_clustering` | true | EdgeTAM の特徴で前景確信度を伝播 |
 | `edgetam_foreground_points_per_class` | 4 | クラスごとの正例点 |
 | `edgetam_background_point_count` | 4 | 負例点 |
@@ -138,7 +138,7 @@ flowchart LR
     A["EdgeTAM<br/>エンコーダ<br/>約 35ms"] --> B["PE<br/>約 80ms"] --> C["粗い判定<br/>約 14ms"] --> D["詳細<br/>約 31ms"] --> E["合計<br/>約 162ms"]
 ```
 
-上の値は、このコイン画像を連続実行したときの 1 枚分（実行ごとに ±15ms 程度ばらつく）。複数画像の中央値は約 177ms（[tmp/performance.md](tmp/performance.md)）。
+上の値は、このコイン画像を連続実行したときの 1 枚分（実行ごとに ±15ms 程度ばらつく）。複数画像（実画像 17 枚 + 合成 12 枚）の中央値は約 177ms（[method_history.md](method_history.md) の #7）。
 
 NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runtime_utils.py`）。既定の 20 スレッドは、行列積の後も待機して OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする。
 

@@ -255,7 +255,7 @@ flowchart TD
 
 ## プロンプトの設計
 
-`prompts_dir`（`prompts/candidates/color_free_bg/`）の `foreground.yaml` と `background.yaml`。
+`prompts_dir`（`prompts/`）の `foreground.yaml` と `background.yaml`。
 
 ```mermaid
 flowchart LR
@@ -287,7 +287,7 @@ flowchart LR
 |---|---|---|
 | `k_clusters` / `n_iter` | 8 / 10 | KMeans のクラスタ数・反復回数 |
 | `foreground_threshold` | 0.5 | 前景のしきい値 |
-| `prompts_dir` | `prompts/candidates/color_free_bg` | プロンプト |
+| `prompts_dir` | `prompts` | プロンプト |
 | `use_edgetam_clustering` | true | 伝播を使うか。`false` なら PE の判定だけ |
 | `model_dir` | `weights/openvino_models_l6` | PE のクラスタリングに使う層（第 6 層）が固定されたモデル |
 
@@ -310,4 +310,4 @@ flowchart LR
 - **粗い誤りは②で直せない。** 背景を前景と判定したクラスには正例点が背景に置かれ、EdgeTAM もそれに従う。
 - 処理時間: 特徴抽出（PE 約 80ms・EdgeTAM 約 35ms）が大半で、判定・伝播・整形は合計 約 14ms。
 
-過去の実験（パッチごとの照合・Tiling・背景混入の軽減・PE と EdgeTAM の別々のクラスタリングなど）の記録は [tmp/coarse_segmentation.md](tmp/coarse_segmentation.md)。
+過去の実験（パッチごとの照合・Tiling・背景混入の軽減・PE と EdgeTAM の別々のクラスタリングなど）の記録は [method_history.md](method_history.md)。
