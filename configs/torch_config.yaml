@@ -1,6 +1,12 @@
 # 処理画像サイズ
 image_size: 512
 
+# モデルに入力する画像サイズの決め方
+#   square: アスペクト比を無視して image_size x image_size にリサイズする（従来どおり）
+#   fit   : アスペクト比を保ち、長辺を image_size に合わせる（短辺は同じ倍率に近いパッチサイズ(16)の倍数）。image_size x image_size に収まる
+#   pad   : fit と同じ大きさにリサイズし、短辺側の下／右を端の画素の複製で image_size x image_size まで埋める。特徴量の抽出後、パディング部分は無視する
+resize_mode: "square"
+
 # Kmeansのクラスタ数
 k_clusters: 8
 
@@ -8,7 +14,7 @@ k_clusters: 8
 n_iter: 10
 
 # プロンプトが保存されているディレクトリ
-prompts_dir: "./prompts/candidates/color_free_bg"
+prompts_dir: "./prompts"
 
 # peモデル名（timmからロード）
 pe_model_id: "hf-hub:timm/PE-Core-T-16-384"

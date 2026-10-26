@@ -1,150 +1,165 @@
-# セグメンテーションの手法（現状のまとめ）
+# 全体像
 
-テキストプロンプトだけで（学習なしで）、画像から「何がどこにあるか」を求める。
-**①粗く当たりを付け → ②細かく切り出す**の2段階。経緯・実験結果は [coarse_segmentation.md](coarse_segmentation.md) / [semantic_refiner.md](semantic_refiner.md) / [improvement_methods.md](improvement_methods.md)。
+テキストプロンプトだけで（学習なしで）、画像から「何がどこにあるか」を CPU 上で ~200ms で求める。
 
-## 全体像
+**① 粗いセグメンテーション（PE）で当たりを付け、② 詳細セグメンテーション（EdgeTAM）で輪郭を切り出す。**
 
-```mermaid
-flowchart TD
-    IMG[画像] --> PRE[リサイズ 512 + 正規化]
-    PRE --> C
-
-    subgraph C["① 粗いセグメンテーション（PE）"]
-        direction TB
-        C1[パッチ特徴] --> C2[KMeans k=8]
-        C2 --> C3[クラスタごとにテキストと照合]
-        C3 --> C4[整形: 穴埋め・細い領域の統合]
-    end
-
-    C -->|"前景マスク / 前景らしさ / 粗いラベル"| R
-
-    subgraph R["② 詳細セグメンテーション（EdgeTAM）"]
-        direction TB
-        R1[クラスごとに点 + 初期マスクで切り出す] --> R2[重なりをスコアで解決]
-        R2 --> R3[取りこぼしを再推定]
-        R3 --> R4[ノイズ除去]
-    end
-
-    R --> OUT["semantic_map<br/>0=背景 / 1〜=前景クラス"]
-```
-
-コード: `core/common/segmentation_runner.py` の `segment`。各処理は `with Timer(...)` で計測。
-
-## ① 粗いセグメンテーション（`coarse_segmentation.py`）
-
-```mermaid
-flowchart TD
-    A[PE のパッチ特徴] --> B["KMeans で k=8 クラスタに分ける"]
-    B --> C["クラスタの代表ベクトルを作る"]
-    C --> D["前景/背景プロンプトとの類似度<br/>各グループの最大値を比較（softmax）"]
-    D --> E{"前景確信度 > 0.5 ?"}
-    E -->|はい| F["前景。最も近い前景プロンプトがラベル"]
-    E -->|いいえ| G["背景。最も近い背景プロンプトがラベル"]
-    F --> H["前景らしさマップ / 前景マスク / 粗いラベル"]
-    G --> H
-    H --> I["整形<br/>・前景に囲まれた背景は前景にする<br/>・幅2パッチ以下のクラス領域は接するクラスに統合"]
-```
-
-### オプション: EdgeTAM の特徴で前景確信度を伝播（`use_edgetam_clustering`）
-
-```mermaid
-flowchart LR
-    P["PE の特徴 → KMeans → 判定<br/>（前景確信度 conf0）"] --> PR["伝播（3回）<br/>conf ← 0.2·conf0 + 0.8·近傍の平均"]
-    E["EdgeTAM の image_embed<br/>コサイン類似度が上位8個の近傍（kNN、対称）"] --> PR
-    PR --> OUT["前景確信度 → 前景マスク / クラスタ × プロンプト"]
-```
-
-| | |
+| 資料 | 内容 |
 |---|---|
-| 効果 | 背景の斑点・織り目の誤検出が減る（合成データ IoU 0.613 → 0.658）。前景を消すのではなく確信度をならすので、大きな物体は崩れにくい（以前の AND は cable で下がった） |
-| 代償 | 確信度がしきい値付近の大きな領域が丸ごと落ちることがある（bottle の一部）。伝播の追加時間は約 9ms（類似度 4ms + 上位 8 個の選択 3ms） |
-| 注意 | EdgeTAM のエンコードは1回だけ実行し、②にも使い回す。詳細は [coarse_segmentation.md](coarse_segmentation.md) §3.5 |
+| **この資料** | 全体の流れ・2 段階にした理由・設定・処理時間 |
+| [coarse_segmentation.md](coarse_segmentation.md) | ① 粗いセマンティックセグメンテーションの詳細 |
+| [detailed_segmentation.md](detailed_segmentation.md) | ② 詳細セグメンテーションの詳細 |
+| [method_history.md](method_history.md) | これまでに試した手法と、現在の手法との比較（メリット・デメリット） |
 
-## ② 詳細セグメンテーション（`semantic_refiner.py`）
+以降の説明は、同じ 1 枚（コイン 9 枚、3024×3024）を例にする。各資料の末尾に、前景が複数クラスの画像（カップ麺）の例もある。
 
-### 全体
+![overview](images/coin_overview.jpg)
+
+カップ麺（4 クラス）の例:
+
+![noodle overview](images/noodle_overview.jpg)
+
+## 入力と出力
+
+| | 内容 |
+|---|---|
+| 入力 | RGB 画像 1 枚、前景/背景のテキストプロンプト（`prompts/`） |
+| 出力 | `semantic_map`（元画像と同じ大きさ。0 = 背景、1〜 = 前景クラス）。クラスは前景プロンプトに対応 |
+
+## 全体フロー
 
 ```mermaid
 flowchart TD
-    S0["準備（全クラス共通）<br/>・作業解像度 長辺 ≤1024<br/>・負例点4点: 端につながる背景のうち前景から離れ、前景確信度が最も低い所"]
-    S0 --> L
+    IMG["画像"] --> PRE["前処理<br/>512 にリサイズ・正規化"]
+    PRE --> ET["EdgeTAM エンコーダ<br/>（1 回だけ実行）"]
+    PRE --> PE["PE エンコーダ<br/>パッチ特徴 32×32"]
 
-    subgraph L["クラスごと（粗いマスクの連結成分ごとに点を置く）"]
+    subgraph C["① 粗いセグメンテーション（パッチ単位 32×32）"]
         direction TB
-        L1["正例点4点 + 負例点 + 初期マスクを作る"] --> L2["EdgeTAM で3回反復<br/>（前回のロジットを次の初期マスクに）"]
-        L2 --> L3["ロジット > 0 を前景に → 小さな成分を除去"]
-        L3 --> L4["スコアを計算"]
+        C1["KMeans で似たパッチを 8 クラスタに"] --> C2["クラスタごとにテキストと照合<br/>前景か背景か・どのプロンプトか"]
+        C2 --> C3["EdgeTAM の特徴で前景確信度をならす<br/>背景の斑点を消す"]
+        C3 --> C4["整形<br/>穴埋め・細い領域の統合"]
     end
 
-    L --> M["重なる画素はスコアが高いクラスに"]
-    M --> N{"最内点がどのクラスにも<br/>覆われていない成分がある?"}
-    N -->|はい| O["その成分だけで再推定<br/>（極小成分は1パッチ広げた範囲まで）"]
-    N -->|いいえ| P
-    O --> P["小領域ノイズ除去 → 元画像サイズへ"]
+    subgraph R["② 詳細セグメンテーション（画素単位）"]
+        direction TB
+        R1["クラスごとに<br/>点 + 初期マスクを作る"] --> R2["EdgeTAM デコーダで切り出す<br/>2 回反復"]
+        R2 --> R3["重なりをスコアで解決"]
+        R3 --> R4["取りこぼしを再推定"]
+        R4 --> R5["ノイズ除去・隙間埋め"]
+    end
+
+    PE --> C
+    ET --> C3
+    C -->|"前景マスク・前景らしさ・粗いラベル"| R
+    ET -->|"特徴を使い回す"| R
+    R --> OUT["semantic_map"]
 ```
 
-### 入力の作り方
+- 粗い段階は **「だいたいどこに何があるか」**、詳細な段階は **「その正確な輪郭」** を決める。
+- EdgeTAM エンコーダは 1 回だけ実行し、①の伝播と②のデコードで使い回す。
+
+## 処理の流れ（シーケンス）
 
 ```mermaid
-flowchart LR
-    subgraph POS["正例点（クラスごと4点）"]
-        direction TB
-        P1["各連結成分の最内点を必ず含める"] --> P2["残りは成分の内側から最遠点サンプリング"]
+sequenceDiagram
+    participant U as segment()
+    participant PE as PE（CLIP）
+    participant ET as EdgeTAM
+    participant C as CoarseSegmenter
+    participant R as SemanticRefiner
+
+    U->>U: make_layout / apply / normalize
+    U->>ET: encode(画像)
+    ET-->>U: high_res_feats0, high_res_feats1, image_embed
+    U->>PE: extract_image_features(画像)
+    PE-->>U: patch_features, fused_patch_features
+    U->>C: generate_foreground_map(特徴, image_embed)
+    C->>C: KMeans
+    C->>PE: extract_cluster_tokens(クラスタ)
+    PE-->>C: クラスタの代表ベクトル
+    C->>C: プロンプトと照合 → 前景確信度
+    C->>C: image_embed の kNN で確信度を伝播
+    C-->>U: foreground_map, foreground_mask, クラスタ
+    U->>C: assign_semantic_labels / refine_coarse_segmentation
+    C-->>U: 粗いラベル（整形済み）
+    U->>R: refine(粗い結果, EdgeTAM の特徴)
+    loop クラスごと
+        R->>ET: decode(点, 初期マスク) × 2 回
+        ET-->>R: マスクのロジット
     end
-
-    subgraph PRIOR["初期マスク"]
-        direction TB
-        M1["内側 core = 前景 (p=1)"] --> M2["粗いマスクの外側1パッチまで = 不明 (p=0.5)<br/>それより外 = 背景 (p=0)"]
-        M2 --> M3["入力画像の輝度でガイデッドフィルタ<br/>→ 不明の縁を画像の縁に沿わせる"]
-        M3 --> M4["logit = (2p-1) × 8"]
-    end
+    R-->>U: semantic_map
 ```
 
-斑点（3パッチ未満の孤立成分）はクラスの推定に混ぜない（物体が背景へ広がるのを防ぐ）。
+## なぜ 2 段階にしたのか
 
-クラスごとの結果の重ね合わせで、1 つの物体が複数クラスに分かれた境界に細い隙間（割れ）ができたときは、最後に前景の内部の幅 1 パッチ未満の隙間だけを埋める（[semantic_refiner.md](semantic_refiner.md) §10.1）。
+| 課題 | 1 段階だとどうなるか | 2 段階の解決 |
+|---|---|---|
+| 学習なしで物体の種類を知りたい | EdgeTAM は「点を置いた物体」を切り出すだけで、種類は分からない | PE（CLIP 系）が画像とテキストを比べて、種類と場所を決める |
+| 輪郭を画素単位で正確にしたい | PE の特徴は 16px = 1 パッチ。32×32 の格子では輪郭が荒く、縁・影で太る | EdgeTAM が画像を見て輪郭を決める |
+| EdgeTAM に点を置く場所が要る | 点を自動で決める手がかりが無い | PE の粗い結果の「内側」に正例点、「遠い背景」に負例点を置く |
+| 速く動かしたい | 画像全体を重いモデルで画素単位に判定すると遅い | 粗い段階は 8 クラスタを 8 回判定するだけ。EdgeTAM はエンコーダ 1 回 + クラスごとに軽いデコーダ |
 
-### スコア（重なりの解決用）
+**粗い結果は「正解」ではなく「ヒント」** として渡す。内側は確実、縁は不明として扱うので、粗い段階の太りや欠けを引き継がない（[detailed_segmentation.md](detailed_segmentation.md)）。
 
-```
-スコア = EdgeTAM の確信度 × (0.5 + 0.5 × 粗い前景らしさ)
-```
+## 各段階の入出力
+
+| 段階 | 入力 | 出力 | 解像度 |
+|---|---|---|---|
+| 前処理 | 元画像 | モデル入力（512 付近） | 画素 |
+| PE | モデル入力 | パッチ特徴 | 32×32 |
+| EdgeTAM エンコーダ | モデル入力 | `image_embed`（256ch）・高解像度特徴 2 つ（32ch・64ch） | 32×32・64×64・128×128 |
+| ① 粗い | PE 特徴・`image_embed` | 前景確信度・前景マスク・粗いラベル | 32×32 |
+| ② 詳細 | ①の出力・EdgeTAM の特徴 | `semantic_map` | 元画像 |
 
 ## 設定
 
-| キー（`configs/ov_config.yaml`） | 値 | 意味 |
+`configs/ov_config.yaml`（PyTorch 版は `torch_config.yaml`）。
+
+| キー | 値 | 意味 |
 |---|---|---|
-| `image_size` | 512 | リサイズ後の一辺 |
+| `image_size` / `resize_mode` | 512 / `fit` | モデル入力の大きさ・アスペクト比の扱い |
 | `k_clusters` / `n_iter` | 8 / 10 | KMeans |
-| `foreground_threshold` | 0.5 | 前景の確信度の閾値 |
-| `prompts_dir` | `prompts/candidates/color_free_bg` | 前景・背景プロンプト |
-| `use_edgetam_clustering` | true | EdgeTAM 特徴の類似度で前景確信度を伝播 |
+| `foreground_threshold` | 0.5 | 前景の確信度のしきい値 |
+| `prompts_dir` | `prompts` | 前景・背景プロンプト |
+| `use_edgetam_clustering` | true | EdgeTAM の特徴で前景確信度を伝播 |
 | `edgetam_foreground_points_per_class` | 4 | クラスごとの正例点 |
 | `edgetam_background_point_count` | 4 | 負例点 |
-| `edgetam_refine_iterations` | 2 | EdgeTAM の反復回数 |
+| `edgetam_refine_iterations` | 2 | EdgeTAM デコーダの反復回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度（長辺） |
 | `ov_num_thread` | 4 | OpenVINO のスレッド数 |
 
-コードに固定した値（近傍3・logit幅8・スコア重み0.5 など）は `core/common/params.py`。
+コードに固定した値（近傍 3・logit 幅 8・スコア重み 0.5 など）は `core/common/params.py`。
 
-## 処理時間の目安（OpenVINO・FP32・4スレッド）
-
-[performance.md](performance.md) の測定値（`use_edgetam_clustering: true`、中央値。develop.py のサンプル 17 枚 + 合成 12 枚で約 177ms）。
+## 処理時間（OpenVINO・FP32・4 スレッド）
 
 ```mermaid
 flowchart LR
-    A["EdgeTAM<br/>エンコーダ<br/>32ms"] --> B["PE<br/>83ms"] --> C["粗い判定<br/>15ms"] --> D["デコード<br/>25ms"] --> E["NumPy 後処理<br/>18ms"] --> F["合計 約184ms"]
+    A["EdgeTAM<br/>エンコーダ<br/>約 35ms"] --> B["PE<br/>約 80ms"] --> C["粗い判定<br/>約 14ms"] --> D["詳細<br/>約 31ms"] --> E["合計<br/>約 162ms"]
 ```
 
-NumPy の BLAS のスレッドを 1 に制限している（`core/openvino/runtime_utils.py`）。既定（20 スレッド）のままだと、伝播の行列積の後に OpenVINO の推論が 2〜4 倍遅くなり、合計は約 252ms になる（[performance.md](performance.md) §2）。
+上の値は、このコイン画像を連続実行したときの 1 枚分（実行ごとに ±15ms 程度ばらつく）。複数画像（実画像 17 枚 + 合成 12 枚）の中央値は約 177ms（[method_history.md](method_history.md) の #7）。
+
+NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runtime_utils.py`）。既定の 20 スレッドは、行列積の後も待機して OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする。
 
 ## コードの対応
 
 | 処理 | ファイル |
 |---|---|
-| 全体の流れ | `core/common/segmentation_runner.py` |
-| ① 粗い推定 | `core/common/coarse_segmentation.py` |
-| ② 精緻化 | `core/common/semantic_refiner.py` |
-| 点の選択・連結成分・ガイデッドフィルタ | `core/common/mask_utils.py` |
-| モデル推論の口 | `core/openvino/` / `core/torch/` |
+| 全体の流れ | `core/common/segmentation_runner.py`（`segment`） |
+| 入力サイズの決め方 | `core/common/image_layout.py` |
+| ① 粗い推定 | `core/common/coarse_segmentation.py`（`CoarseSegmenter`） |
+| ② 詳細 | `core/common/semantic_refiner.py`（`SemanticRefiner`） |
+| 点の選択・連結成分・ガイデッドフィルタ・隙間埋め | `core/common/mask_utils.py` |
+| 固定ハイパーパラメータ | `core/common/params.py` |
+| モデル推論の口 | `core/openvino/`（OpenVINO）・`core/torch/`（PyTorch） |
+
+手法の開発は backend 非依存の `core/common/` で行えば、OpenVINO・PyTorch の両方に反映される。
+
+## この資料の画像の作り方
+
+```bash
+python tools/docs/make_doc_images.py [--image PATH] [--prefix coin]   # docs/images/ に JPEG で出力（幅 1200px 以下）
+```
+
+本体の `segment` と同じ処理を段階ごとに呼び、中間結果を画像にする（最後に `semantic_map` が本体と一致することを確かめる）。

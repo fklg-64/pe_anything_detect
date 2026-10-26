@@ -6,10 +6,11 @@ from typing import Union
 
 import numpy as np
 
-from core.utils import Timer, load_image, normalize_image, resize_image
+from core.utils import Timer, load_image, normalize_image
 from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
+from core.common.image_layout import RESIZE_MODES, make_layout
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
 from core.common.visualization import ResultSaver
@@ -29,6 +30,10 @@ class SegmentationRunner:
         self.output_dir = config["output_dir"]
         # 粗い判定の前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える（誤検出を減らす。EdgeTAM のエンコードを先に 1 回だけ実行する）
         self.use_edgetam_clustering = config.get("use_edgetam_clustering", False)
+        # モデルへ入力する画像サイズの決め方（square / fit / pad。image_layout.py）
+        self.resize_mode = config.get("resize_mode", "square")
+        if self.resize_mode not in RESIZE_MODES:
+            raise ValueError(f"resize_mode は {RESIZE_MODES} のいずれかにしてください: {self.resize_mode!r}")
 
         self.coarse = CoarseSegmenter(extractor, config)
         self.refiner = SemanticRefiner(edgetam, extractor.feature_size, config)
@@ -47,19 +52,24 @@ class SegmentationRunner:
 
         # 画像前処理
         with Timer("画像前処理時間"):
-            # リサイズはCLIPとEdgeTAMで共通（正規化だけがモデルごとに異なる）
-            resized = resize_image(image_raw, self.extractor.target_size)
+            # リサイズ（パディング込み）はCLIPとEdgeTAMで共通（正規化だけがモデルごとに異なる）
+            layout = make_layout((height, width), self.extractor.target_size, int(self.extractor.patch_size), self.resize_mode)
+            resized = layout.apply(image_raw)
             image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
+            # 以降のパッチ格子は、パディングを除いた（元画像の全体を覆う）領域
+            self.coarse.grid = layout.valid_grid
 
         # EdgeTAMの特徴量抽出（粗い判定で EdgeTAM の特徴を使うときは、ここで 1 回だけ実行して精緻化にも渡す）
         edgetam_features = None
         if self.use_edgetam_clustering:
             with Timer("EdgeTAM特徴量抽出処理時間"):
-                edgetam_features = self.refiner.predict_encoder(resized)
+                edgetam_features = layout.crop_edgetam(self.refiner.predict_encoder(resized))
 
         # 特徴量抽出
         with Timer("特徴量抽出処理時間"):
             _, patch_features, fused_patch_features = self.coarse.extract_features(image_tensor)
+            # パディング部分のトークンは捨てる
+            patch_features, fused_patch_features = layout.crop_tokens(patch_features), layout.crop_tokens(fused_patch_features)
 
         # CLIP + KMeans による初期前景マップの推定
         with Timer("粗い前景マスク取得処理時間"):
@@ -85,7 +95,7 @@ class SegmentationRunner:
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             refined = self.refiner.refine(
-                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_features
+                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_features, layout
             )
 
         elapsed_time = time.time() - start

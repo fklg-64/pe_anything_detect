@@ -22,8 +22,12 @@ class EdgeTamHelper:
         coords: np.ndarray,
         normalize: bool = False,
         orig_hw: Optional[Tuple[int, int]] = None,
+        input_hw: Optional[Tuple[int, int]] = None,
     ) -> np.ndarray:
-        """入力座標 (NumPy配列) の正規化解除を行います。"""
+        """入力座標 (NumPy配列) の正規化解除を行います。
+
+        input_hw: モデルに入力した画像の内容の大きさ (高さ, 幅)。None なら image_size 四方（アスペクト比を維持するモードでは長方形になる）。
+        """
         coords = coords.astype(np.float32).copy()
 
         if normalize:
@@ -32,7 +36,9 @@ class EdgeTamHelper:
             coords[..., 0] = coords[..., 0] / w
             coords[..., 1] = coords[..., 1] / h
 
-        coords = coords * self.target_size  # unnormalize coords
+        input_h, input_w = input_hw if input_hw is not None else (self.target_size, self.target_size)
+        coords[..., 0] *= input_w  # unnormalize coords
+        coords[..., 1] *= input_h
         return coords
 
     def transform_boxes(
@@ -40,9 +46,10 @@ class EdgeTamHelper:
         boxes: np.ndarray,
         normalize: bool = False,
         orig_hw: Optional[Tuple[int, int]] = None,
+        input_hw: Optional[Tuple[int, int]] = None,
     ) -> np.ndarray:
         """バウンディングボックス (NumPy配列) の変換を行います。"""
-        boxes = self.transform_coords(boxes.reshape(-1, 2, 2), normalize, orig_hw)
+        boxes = self.transform_coords(boxes.reshape(-1, 2, 2), normalize, orig_hw, input_hw)
         return boxes
 
     def postprocess_masks(
@@ -75,6 +82,7 @@ class EdgeTamHelper:
         box: Optional[np.ndarray] = None,
         mask_logits: Optional[np.ndarray] = None,
         normalize_coords: bool = True,
+        input_hw: Optional[Tuple[int, int]] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
         """入力プロンプト (ポイント、ボックス、マスク) の前処理と結合を行います (NumPy版)。"""
         unnorm_coords: Optional[np.ndarray] = None
@@ -88,7 +96,7 @@ class EdgeTamHelper:
                 raise ValueError("point_labels must be supplied if point_coords is supplied.")
 
             unnorm_coords = self.transform_coords(
-                point_coords, normalize=normalize_coords, orig_hw=orig_hw
+                point_coords, normalize=normalize_coords, orig_hw=orig_hw, input_hw=input_hw
             )
             labels = point_labels
             if unnorm_coords.ndim == 2:
@@ -98,7 +106,7 @@ class EdgeTamHelper:
         # --- 2. ボックスプロンプトの処理 ---
         if box is not None:
             unnorm_box = self.transform_boxes(
-                box, normalize=normalize_coords, orig_hw=orig_hw
+                box, normalize=normalize_coords, orig_hw=orig_hw, input_hw=input_hw
             )  # B x 2 x 2
 
         # --- 3. マスクプロンプトの処理 ---
@@ -108,9 +116,9 @@ class EdgeTamHelper:
             elif mask_logits.ndim == 1:
                 # フラグ等で空マスクが必要な場合のゼロ埋め配列生成
                 batch_size = mask_logits.shape[0]
-                feature_size = self.target_size // 4
+                input_h, input_w = input_hw if input_hw is not None else (self.target_size, self.target_size)
                 mask_input = np.zeros(
-                    (batch_size, 1, feature_size, feature_size),
+                    (batch_size, 1, input_h // 4, input_w // 4),
                     dtype=np.float32,
                 )
             has_mask = np.ones((1,), dtype=np.float32)

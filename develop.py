@@ -23,6 +23,10 @@ if __name__ == "__main__":
         "/home/llm/datasets/02_object_detection/coin/001_crop.png", 
         "/home/llm/datasets/02_object_detection/clip/002_crop.png", 
         "/home/llm/datasets/02_object_detection/clip/003_crop.png", 
+        "/home/llm/datasets/coco128/images/train2017/000000000009.jpg", 
+        "/home/llm/datasets/coco128/images/train2017/000000000030.jpg", 
+        "/home/llm/datasets/coco128/images/train2017/000000000073.jpg", 
+        "/home/llm/datasets/coco128/images/train2017/000000000283.jpg", 
     ]
 
     # 設定データ

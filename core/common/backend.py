@@ -11,6 +11,7 @@ import numpy as np
 class CLIPBackend(Protocol):
     target_size: int
     feature_size: int
+    patch_size: int
     mean: np.ndarray  # (3, 1, 1)
     std: np.ndarray   # (3, 1, 1)
 

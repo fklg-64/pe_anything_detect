@@ -21,7 +21,7 @@ class SegmentationResult:
     point_coords: List[List[float]]    # EdgeTAMに与えたプロンプト点（画像座標、全クラス分）
     point_labels: List[int]            # 上の点のラベル（1=正例、0=負例）
 
-    # 粗い推定の中間結果（パッチ格子 feature_size x feature_size 上）
+    # 粗い推定の中間結果（パッチ格子（高さ x 幅。アスペクト比を維持するモードでは正方形とは限らず、元画像の全体を覆う）上）
     foreground_map: np.ndarray         # 前景らしさ
     foreground_mask: np.ndarray        # 整形後の粗い前景マスク
     cluster_labels: np.ndarray         # KMeansのクラスタ番号（平坦）。EdgeTAM 併用時は PE のクラスタ × 伝播後のプロンプトの組

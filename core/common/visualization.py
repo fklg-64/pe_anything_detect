@@ -161,7 +161,7 @@ class ResultSaver:
 
     def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
         """KMeansのクラスタ（EdgeTAM併用時は伝播前のPEも）、整形前後の粗いセマンティックラベルを着色して保存。"""
-        grid = (self.feature_size, self.feature_size)
+        grid = result.foreground_map.shape  # パッチ格子（アスペクト比を維持するモードでは正方形とは限らない）
         for image_name, view in self._cluster_views(result):
             self._colorize_labels(view.labels.reshape(grid), size).save(save_dir / image_name)
         self._colorize_labels(result.semantic_labels.reshape(grid), size).save(
@@ -192,7 +192,7 @@ class ResultSaver:
 
     def _save_foreground_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> Image.Image:
         """前景度合いマップと粗い前景マスクを保存し、マスク画像を返す。"""
-        grid = (self.feature_size, self.feature_size)
+        grid = result.foreground_map.shape
         foreground_map_2d = (result.foreground_map * 255).astype(np.uint8).reshape(grid)
         Image.fromarray(foreground_map_2d).resize(size, resample=Image.Resampling.BILINEAR).save(
             save_dir / "foreground_map.png"
