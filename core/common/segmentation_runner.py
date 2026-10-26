@@ -28,6 +28,8 @@ class SegmentationRunner:
         self.extractor = extractor
         self.edgetam = edgetam
         self.output_dir = config["output_dir"]
+        # 保存先フォルダ名 -> 画像パス（同名の別画像が上書きされないようにする）
+        self._save_names: dict[str, Path] = {}
         # 粗い判定の前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える（誤検出を減らす。EdgeTAM のエンコードを先に 1 回だけ実行する）
         self.use_edgetam_clustering = config.get("use_edgetam_clustering", False)
         # モデルへ入力する画像サイズの決め方（square / fit / pad。image_layout.py）
@@ -116,6 +118,15 @@ class SegmentationRunner:
             debug_images=refined.debug_images,
         )
 
+    def _save_name(self, image_path: Path) -> str:
+        """保存先のフォルダ名。画像名が別の画像と重なるときは 親フォルダ名_ファイル名 にする。"""
+        resolved = image_path.resolve()
+        name = image_path.stem
+        if self._save_names.setdefault(name, resolved) != resolved:
+            name = f"{image_path.parent.name}_{image_path.stem}"
+            self._save_names.setdefault(name, resolved)
+        return name
+
     def run(self, image_path: Union[str, Path]) -> None:
         """画像ファイルをセグメンテーションし、結果を output_dir/<画像名>/ に保存する。"""
         image_path = Path(image_path)
@@ -126,7 +137,7 @@ class SegmentationRunner:
             print(f"====== 存在しません: {image_path.name} ======")
             return
 
-        save_dir = Path(self.output_dir) / image_path.stem
+        save_dir = Path(self.output_dir) / self._save_name(image_path)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         image_raw = load_image(image_path)

@@ -88,3 +88,19 @@ def load_config(config_path: str = "./configs/ov_config.yaml") -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".bmp"}
+
+# データセット定義yamlから画像パスの一覧を作る（ディレクトリは再帰的に探索）
+def load_dataset_paths(dataset_path: str = "./configs/dataset.yaml") -> list[Path]:
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        entries = yaml.safe_load(f)["image_paths"]
+
+    image_paths: list[Path] = []
+    for entry in entries:
+        entry = Path(entry)
+        if entry.is_dir():
+            image_paths.extend(sorted(p for p in entry.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS))
+        else:
+            image_paths.append(entry)
+    return image_paths
