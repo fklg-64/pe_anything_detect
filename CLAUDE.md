@@ -71,6 +71,7 @@ python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・
 - `segmentation_runner.py`: `SegmentationRunner`。`segment(image)`（保存なしのパイプライン、`SegmentationResult` を返す）と `run(path)`（読み込み・`segment`・保存）。
 - `coarse_segmentation.py`: `CoarseSegmenter`。CLIP 特徴量・テキストプロンプトとの照合・faiss KMeans による粗い前景/セマンティック推定と、パッチ単位の整形。
 - `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM backend でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
+- `image_layout.py`: モデル入力のリサイズモード（config の `resize_mode`: `square`（既定・アスペクト比を無視）/ `fit`（アスペクト比を保ち長辺を image_size、短辺はパッチサイズの倍数）/ `pad`（fit の大きさを下・右に Replication で image_size 四方まで埋め、特徴抽出後にパディング部分を捨てる））。`ImageLayout` が入力画像・パッチ格子・元画像の対応を持つ。**以降のパッチ格子は長方形になりうる**ので、格子の大きさは `feature_size` ではなく `layout.valid_grid`（`CoarseSegmenter.grid`）を使う。プロンプト点・マスクは常に元画像の座標・大きさ。C++ 版（cppsrc/）は未対応（既定の `square` のみ）。
 - `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分（`Component` = 最内点 `peak`・`core`・`region` の NamedTuple）・ノイズ除去などの純粋関数。
 - `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
 - `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。

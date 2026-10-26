@@ -254,14 +254,14 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
 
     foreground: 粗い前景マスク（パッチ格子、全クラス）。
     """
-    n = foreground.shape[0]
+    grid_h, grid_w = foreground.shape
     core = binary_erosion(foreground, structure=PATCH_STRUCTURE, border_value=1)
     if not core.any():
         return
     # 1 パッチ = GAP_FILL_PIXELS_PER_PATCH 画素に縮小したマスクで、閉処理で埋まる画素（隙間）を求める
-    side = n * GAP_FILL_PIXELS_PER_PATCH
+    small_size = (grid_w * GAP_FILL_PIXELS_PER_PATCH, grid_h * GAP_FILL_PIXELS_PER_PATCH)
     height, width = semantic_map.shape
-    union = cv2.resize((semantic_map > 0).view(np.uint8) * 255, (side, side), interpolation=cv2.INTER_AREA) >= 128
+    union = cv2.resize((semantic_map > 0).view(np.uint8) * 255, small_size, interpolation=cv2.INTER_AREA) >= 128
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (GAP_FILL_PIXELS_PER_PATCH + 1,) * 2)
     closed = cv2.morphologyEx(union.view(np.uint8), cv2.MORPH_CLOSE, kernel).view(bool)
     core_small = np.kron(core, np.ones((GAP_FILL_PIXELS_PER_PATCH,) * 2, dtype=bool))
@@ -272,7 +272,7 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
     if not gap.any():
         return
     # 隙間ごとに、外接矩形（最寄りのクラスが入るよう 1 パッチ分広げる）の中で、最寄りの前景画素のクラスを与える
-    margin = int(np.ceil(max(height, width) / n))
+    margin = int(np.ceil(max(height / grid_h, width / grid_w)))
     ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin | 1, margin | 1))  # 半径 約 半パッチ
     count, labels, stats, _ = cv2.connectedComponentsWithStats(gap.view(np.uint8), connectivity=8)
     for i in range(1, count):

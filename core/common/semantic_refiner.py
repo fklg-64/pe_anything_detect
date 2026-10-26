@@ -10,6 +10,7 @@ from scipy.ndimage import binary_dilation
 from core.utils import Timer, normalize_image
 from core.common.backend import EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
+from core.common.image_layout import ImageLayout
 from core.common.mask_utils import (
     Component,
     clean_mask,
@@ -48,6 +49,8 @@ class RefineContext:
     size: Tuple[int, int]                  # 作業解像度 (幅, 高さ)
     min_area: int                          # ノイズとして除去する最小面積（作業解像度の画素数）
     guide: np.ndarray                      # 初期マスクの縁を整えるガイド（入力画像の輝度。EdgeTAMの高解像度特徴量と同じ大きさ、float32、0〜1）
+    grid: Tuple[int, int]                  # パッチ格子 (高さ, 幅)。画像の全体を覆う（パディングは含まない）
+    input_hw: Tuple[int, int]              # モデルに入力した画像の内容の大きさ (高さ, 幅)。プロンプト点の座標変換に使う
 
     # 結果（段階ごとに更新する）
     semantic_map: np.ndarray               # 作業解像度。0=背景、1~=前景クラス
@@ -75,10 +78,10 @@ class SemanticRefiner:
         self.background_point_count = config["edgetam_background_point_count"]
         self.refine_iterations = config["edgetam_refine_iterations"]
         self.semantic_max_side = config["semantic_max_side"]
-        # EdgeTAMの高解像度特徴量の一辺の画素数
-        self.high_res_feature_size: int = edgetam.target_size // config["edgetam_high_res_feature_downscale_factor"]
+        # EdgeTAMの高解像度特徴量の縮小倍率（入力画像に対する分母）
+        self.high_res_downscale: int = config["edgetam_high_res_feature_downscale_factor"]
         # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
-        self.guide_radius: int = max(1, self.high_res_feature_size // feature_size)
+        self.guide_radius: int = max(1, (edgetam.target_size // self.high_res_downscale) // feature_size)
 
     # =========================================================================
     # メインの流れ
@@ -94,6 +97,7 @@ class SemanticRefiner:
         width: int,
         height: int,
         feats: Optional[Tuple] = None,
+        layout: Optional[ImageLayout] = None,
     ) -> RefineOutput:
         """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
 
@@ -103,7 +107,10 @@ class SemanticRefiner:
         どのクラスのマスクにも入らなかった粗い連結成分は、その成分だけで再推定する。
 
         resized: リサイズ済み（正規化前）の画像。EdgeTAMエンコーダの入力と、初期マスクの縁を整えるガイドになる。
-        feats: EdgeTAMエンコーダの出力。粗い判定で既に計算しているときに渡すと、エンコーダを再実行しない（None なら実行する）。
+        feats: EdgeTAMエンコーダの出力（layout がパディングを持つときは、有効な領域に切り出し済み）。
+               粗い判定で既に計算しているときに渡すと、エンコーダを再実行しない（None なら実行する）。
+        layout: モデル入力のレイアウト。None なら image_size 四方（従来どおり）。パッチ格子・ロジット・プロンプト点はすべて、
+                パディングを除いた画像の内容（元画像の全体に対応する）を基準にする。
 
         Returns: RefineOutput（各フィールドの意味はそちら）。
         """
@@ -117,14 +124,20 @@ class SemanticRefiner:
         scale = min(1.0, self.semantic_max_side / max(width, height))
         work_w, work_h = max(1, round(width * scale)), max(1, round(height * scale))
 
+        grid = (self.feature_size, self.feature_size) if layout is None else layout.valid_grid
+        content = resized if layout is None else layout.content(resized)
+        input_hw = content.shape[:2]
+
         # EdgeTAMの特徴量抽出（全クラス共通）
         if feats is None:
             with Timer("    ┌ edgetam特徴量抽出"):
                 feats = self.predict_encoder(resized)
+                if layout is not None:
+                    feats = layout.crop_edgetam(feats)
 
         # 背景の負例点は全クラス共通
         background_coords = self.transform_coords(
-            select_background_points(foreground_binary, self.background_point_count, foreground_map).tolist(), width, height
+            select_background_points(foreground_binary, self.background_point_count, foreground_map).tolist(), width, height, grid
         )
 
         ctx = RefineContext(
@@ -135,8 +148,10 @@ class SemanticRefiner:
             height=height,
             size=(work_w, work_h),
             # 粗いマスクの信頼限界は1パッチ。1パッチ未満の領域はノイズとして扱う
-            min_area=max(1, int(MIN_REGION_PATCH_AREA * work_w * work_h / self.feature_size ** 2)),
-            guide=self._make_guide(resized),
+            min_area=max(1, int(MIN_REGION_PATCH_AREA * work_w * work_h / (grid[0] * grid[1]))),
+            guide=self._make_guide(content),
+            grid=grid,
+            input_hw=input_hw,
             semantic_map=np.zeros((work_h, work_w), dtype=np.uint8),
             best_score=np.full((work_h, work_w), -1.0, dtype=np.float32),
         )
@@ -157,10 +172,13 @@ class SemanticRefiner:
 
         return RefineOutput(semantic_map, prompt_indices, ctx.point_coords, ctx.point_labels, ctx.debug_images)
 
-    def _make_guide(self, resized: np.ndarray) -> np.ndarray:
-        """初期マスクの縁を整えるガイド。入力画像の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小したもの（float32、0〜1）。"""
-        size = self.high_res_feature_size
-        return cv2.resize(resized, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32).mean(axis=-1) / 255.0
+    def _high_res_size(self, input_hw: Tuple[int, int]) -> Tuple[int, int]:
+        """EdgeTAMの高解像度特徴量の大きさ (幅, 高さ)。cv2.resize に渡す向き。"""
+        return input_hw[1] // self.high_res_downscale, input_hw[0] // self.high_res_downscale
+
+    def _make_guide(self, content: np.ndarray) -> np.ndarray:
+        """初期マスクの縁を整えるガイド。入力画像（パディングを除いた内容）の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小したもの（float32、0〜1）。"""
+        return cv2.resize(content, self._high_res_size(content.shape[:2]), interpolation=cv2.INTER_AREA).astype(np.float32).mean(axis=-1) / 255.0
 
     def _refine_classes(
         self,
@@ -202,8 +220,9 @@ class SemanticRefiner:
         for class_id, comps in class_components.items():
             for component in comps:
                 peak, region = component.peak, component.region
-                px = min(int((peak[0] + 0.5) * work_w / self.feature_size), work_w - 1)
-                py = min(int((peak[1] + 0.5) * work_h / self.feature_size), work_h - 1)
+                grid_h, grid_w = ctx.grid
+                px = min(int((peak[0] + 0.5) * work_w / grid_w), work_w - 1)
+                py = min(int((peak[1] + 0.5) * work_h / grid_h), work_h - 1)
                 if ctx.semantic_map[py, px] != 0:
                     continue
                 binary, _, _ = self._refine_region(ctx, region, [component], f"クラス{class_id}(再推定)")
@@ -229,7 +248,7 @@ class SemanticRefiner:
 
         fg_points = prompt_points(core, [c.peak for c in comps], self.foreground_points_per_class)
         logit, coords, labels = self._estimate_class_logit(
-            ctx.feats, prior_map, fg_points, ctx.background_coords, ctx.width, ctx.height, tag
+            ctx.feats, prior_map, fg_points, ctx.background_coords, ctx.width, ctx.height, tag, ctx.grid, ctx.input_hw
         )
         ctx.point_coords.extend(coords)
         ctx.point_labels.extend(labels)
@@ -264,8 +283,7 @@ class SemanticRefiner:
         core_map = patch_mean(core)
         unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, PATCH_STRUCTURE).astype(np.float32))
         prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
-        size = self.high_res_feature_size
-        upsampled = cv2.resize(prior_map, (size, size), interpolation=cv2.INTER_LINEAR)
+        upsampled = cv2.resize(prior_map, self._high_res_size(ctx.input_hw), interpolation=cv2.INTER_LINEAR)
         return np.clip(guided_filter(ctx.guide, upsampled, self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)
 
     def _estimate_class_logit(
@@ -277,20 +295,22 @@ class SemanticRefiner:
         width: int,
         height: int,
         tag: str,
+        grid: Optional[Tuple[int, int]] = None,
+        input_hw: Optional[Tuple[int, int]] = None,
     ) -> Tuple[Optional[np.ndarray], List[List[float]], List[int]]:
         """正例点と共通の負例点でEdgeTAMを反復実行し、低解像度ロジット(128x128)を返す。
 
         prior_map: 初期マスクの前景確率（EdgeTAMの高解像度特徴量と同じ大きさ）。ロジットは (2p-1)*PRIOR_LOGIT_RANGE（0.5=不明）。
+        grid, input_hw: パッチ格子 (高さ, 幅) と、モデルに入力した画像の内容の大きさ (高さ, 幅)。None なら image_size 四方。
         """
-        coords = self.transform_coords(foreground_points.tolist(), width, height)
+        coords = self.transform_coords(foreground_points.tolist(), width, height, grid)
         labels = [1] * len(coords)
         coords = coords + background_coords
         labels = labels + [0] * len(background_coords)
 
+        high_res_size = self._high_res_size(input_hw or (self.edgetam.target_size, self.edgetam.target_size))
         mask_input = cv2.resize(
-            (2.0 * prior_map - 1.0) * PRIOR_LOGIT_RANGE,
-            (self.high_res_feature_size, self.high_res_feature_size),
-            interpolation=cv2.INTER_LINEAR,
+            (2.0 * prior_map - 1.0) * PRIOR_LOGIT_RANGE, high_res_size, interpolation=cv2.INTER_LINEAR,
         )[None, ...]
 
         # 前回のロジットを入力にして再推定を繰り返す
@@ -304,6 +324,7 @@ class SemanticRefiner:
                     height=height,
                     width=width,
                     mask_input=mask_input,
+                    input_hw=input_hw,
                 )
             if len(scores) == 0:
                 break
@@ -330,6 +351,7 @@ class SemanticRefiner:
         height: int,
         width: int,
         mask_input: Optional[np.ndarray] = None,
+        input_hw: Optional[Tuple[int, int]] = None,
     ) -> Tuple[None, np.ndarray, np.ndarray]:
         """EdgeTAM Decoder の実行。(masks=None, scores, 低解像度logits) を返す。
 
@@ -345,6 +367,7 @@ class SemanticRefiner:
             point_coords=np.array(point_coords, dtype=np.float32),
             point_labels=np.array(point_labels, dtype=np.int32),
             mask_logits=mask_logits_tensor,
+            input_hw=input_hw,
         )
 
         with Timer("    ┌ デコード"):
@@ -363,9 +386,12 @@ class SemanticRefiner:
                 need_masks=False,
             )
 
-    def transform_coords(self, pts: List[List[int]], width: int, height: int) -> List[List[float]]:
-        """パッチ格子の座標 (x, y) を、各パッチの中心に当たる画像座標へ変換する。"""
+    def transform_coords(
+        self, pts: List[List[int]], width: int, height: int, grid: Optional[Tuple[int, int]] = None
+    ) -> List[List[float]]:
+        """パッチ格子の座標 (x, y) を、各パッチの中心に当たる元画像の座標へ変換する。grid は (高さ, 幅)。None なら正方形の格子。"""
+        grid_h, grid_w = grid or (self.feature_size, self.feature_size)
         return [
-            [(x + 0.5) * width / self.feature_size, (y + 0.5) * height / self.feature_size]
+            [(x + 0.5) * width / grid_w, (y + 0.5) * height / grid_h]
             for x, y in pts
         ]

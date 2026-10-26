@@ -46,7 +46,7 @@ def load_color_shape_prompts(path: Path) -> List[str]:
 class CoarseForeground(NamedTuple):
     """generate_foreground_map の結果（パッチ格子上）。タプルとして取り出すこともできる。"""
 
-    foreground_map: np.ndarray      # (feature_size, feature_size) 前景確信度
+    foreground_map: np.ndarray      # (格子の高さ, 格子の幅) 前景確信度
     foreground_mask: np.ndarray     # 確信度が閾値を超えるパッチを1とした2値マスク
     cluster_labels: np.ndarray      # パッチごとのクラスタ番号（平坦）。EdgeTAM 併用時は PE のクラスタ × 伝播後のプロンプトの組
     cluster_index_list: List[int]   # cluster_labels のクラスタごとの対応プロンプト番号（前景プロンプト -> 背景プロンプトの通し番号）
@@ -63,6 +63,8 @@ class CoarseSegmenter:
         self.niter = config["n_iter"]
         self.foreground_threshold = config["foreground_threshold"]
         self.feature_size: int = extractor.feature_size
+        # 処理する画像のパッチ格子 (高さ, 幅)。アスペクト比を維持するモードでは画像ごとに変わるので、segment の前に runner が設定する
+        self.grid: Tuple[int, int] = (self.feature_size, self.feature_size)
 
         # プロンプトとそのテキスト特徴量（前景プロンプト -> 背景プロンプトの順に並べる）
         self.foreground_prompts: List[str] = []
@@ -177,7 +179,7 @@ class CoarseSegmenter:
 
         cluster_index_list = self._prompt_per_cluster(cluster_labels, prompt_index)
 
-        foreground_map = confidence.reshape(self.feature_size, self.feature_size).astype(np.float32)
+        foreground_map = confidence.reshape(self.grid).astype(np.float32)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
         return CoarseForeground(foreground_map, foreground_mask, cluster_labels, cluster_index_list, pe_clusters)
 
@@ -229,11 +231,11 @@ class CoarseSegmenter:
 
         Returns:
             labels_list: 連番 -> プロンプト番号。
-            semantic_labels: (feature_size, feature_size) のパッチごとの連番ラベル。
+            semantic_labels: (格子の高さ, 格子の幅) のパッチごとの連番ラベル。
         """
         semantic_indices = np.asarray(cluster_index_list)[cluster_labels]
         labels_list, semantic_labels = np.unique(semantic_indices, return_inverse=True)
-        return labels_list, semantic_labels.reshape(self.feature_size, self.feature_size)
+        return labels_list, semantic_labels.reshape(self.grid)
 
     def refine_coarse_segmentation(
         self, semantic_labels: np.ndarray, foreground_mask: np.ndarray
