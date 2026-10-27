@@ -11,6 +11,7 @@ from core.utils import Timer, normalize_image
 from core.common.backend import EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
 from core.common.image_layout import ImageLayout
+from core.common.lattice_separator import LatticeSeparator
 from core.common.mask_utils import (
     Component,
     clean_mask,
@@ -58,6 +59,7 @@ class RefineContext:
     best_score: np.ndarray                 # 各画素で勝ったクラスのスコア
     point_coords: List[List[float]] = field(default_factory=list)
     point_labels: List[int] = field(default_factory=list)
+    logits: List[np.ndarray] = field(default_factory=list)  # EdgeTAM の低解像度ロジット（入力の 1/4）。クラス・再推定ごと
     debug_images: Dict[str, np.ndarray] = field(default_factory=dict)  # 中間画像（名前 -> 0〜1 の配列）。保存は呼び出し側
 
 
@@ -79,6 +81,8 @@ class SemanticRefiner:
         self.background_point_count = config["edgetam_background_point_count"]
         self.refine_iterations = config["edgetam_refine_iterations"]
         self.semantic_max_side = config["semantic_max_side"]
+        # 格子状に並んだ小物体を 1 個ずつに分ける（lattice_separator.py）
+        self.lattice_separator = LatticeSeparator(edgetam, config["foreground_threshold"])
         # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
         self.guide_radius: int = max(1, (edgetam.target_size // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE) // feature_size)
 
@@ -164,6 +168,13 @@ class SemanticRefiner:
         remove_small_regions(ctx.semantic_map, ctx.min_area)
         # クラス境界の割れ（前景の内部の細い隙間）を埋める
         fill_narrow_gaps(ctx.semantic_map, foreground_binary)
+        # 格子状に並んだ小物体（隙間が 1 パッチ未満で、1 つの塊になる）を、セルごとに 1 個ずつに分ける
+        if ctx.logits:
+            lattice = self.lattice_separator.separate(
+                ctx.semantic_map, content, np.maximum.reduce(ctx.logits), feats, foreground_map
+            )
+            if lattice is not None:
+                ctx.debug_images["lattice_instances"] = (lattice["instance_logit"] > 0).astype(np.float32)
 
         semantic_map = ctx.semantic_map
         if (work_w, work_h) != (width, height):
@@ -251,6 +262,8 @@ class SemanticRefiner:
         )
         ctx.point_coords.extend(coords)
         ctx.point_labels.extend(labels)
+        if logit is not None:
+            ctx.logits.append(logit)
 
         # 粗い前景らしさ（粗いマスクの周辺平均 × 前景確信度）
         coarse_foreground_score = (coarse_map * ctx.foreground_map).astype(np.float32)

@@ -20,6 +20,7 @@
         "a photo of a bottle.",
         "a photo of a cap.",
         "a photo of a tube.",
+        "a photo of transparent tubes.",  # 透明な筒（巣・トレイに並んだシリンジ・バイアル）。複数形でないと効かない（クラスタに複数の筒が入る）。tools/experiments/small_objects
         "a photo of an electronic component.",
         "a photo of a circuit board.",
         "a photo of an electrical connector.",

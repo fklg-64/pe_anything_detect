@@ -47,6 +47,7 @@ flowchart TD
         R2 --> R3["重なりをスコアで解決"]
         R3 --> R4["取りこぼしを再推定"]
         R4 --> R5["ノイズ除去・隙間埋め"]
+        R5 --> R6["格子状の小物体を 1 個ずつに<br/>（格子を検出したときだけ）"]
     end
 
     PE --> C
@@ -140,6 +141,8 @@ flowchart LR
 
 上の値は、このコイン画像を連続実行したときの 1 枚分（実行ごとに ±15ms 程度ばらつく）。複数画像（実画像 17 枚 + 合成 12 枚）の中央値は約 177ms（[method_history.md](method_history.md) の #7）。
 
+格子状に並んだ小物体（巣・トレイ）を検出したときだけ、② の最後に **約 +150ms**（006 の 80 個: 検出 30・位相補正 23・セルごとのデコード 95ms）。検出したかを毎回判定するコストは約 6ms（MVTec 中央値 234 → 237ms）。
+
 NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runtime_utils.py`）。既定の 20 スレッドは、行列積の後も待機して OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする。
 
 ## コードの対応
@@ -150,6 +153,7 @@ NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runti
 | 入力サイズの決め方 | `core/common/image_layout.py` |
 | ① 粗い推定 | `core/common/coarse_segmentation.py`（`CoarseSegmenter`） |
 | ② 詳細 | `core/common/semantic_refiner.py`（`SemanticRefiner`） |
+| ② 格子状に並んだ小物体の分離 | `core/common/lattice.py`（格子の検出）・`core/common/lattice_separator.py`（`LatticeSeparator`） |
 | 点の選択・連結成分・ガイデッドフィルタ・隙間埋め | `core/common/mask_utils.py` |
 | 固定ハイパーパラメータ | `core/common/params.py` |
 | モデル推論の口 | `core/openvino/`（OpenVINO）・`core/torch/`（PyTorch） |
