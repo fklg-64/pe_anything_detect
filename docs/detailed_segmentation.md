@@ -365,7 +365,6 @@ flowchart TD
 | `edgetam_background_point_count` | 4 | 背景の負例点 |
 | `edgetam_refine_iterations` | 2 | デコーダの反復回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度（長辺） |
-| `edgetam_high_res_feature_downscale_factor` | 4 | 高解像度特徴量の縮小倍率（初期マスク・ガイドの大きさ。512 入力で 128×128） |
 
 `core/common/params.py` の固定値:
 
@@ -374,6 +373,7 @@ flowchart TD
 | `PRIOR_LOGIT_RANGE` | 8 | 初期マスクのロジット幅（ロジット = (2p − 1) × 8） |
 | `PRIOR_NON_CORE_PROBABILITY` | 0.5 | 「不明」の確率 |
 | `GUIDED_FILTER_EPS` | 0.01 | ガイデッドフィルタの正則化（0.001〜0.01 で結果は同じ） |
+| `EDGETAM_HIGH_RES_FEATURE_DOWNSCALE` | 4 | 高解像度特徴量の縮小倍率（初期マスク・ガイドの大きさ。512 入力で 128×128） |
 | `MIN_ISOLATED_PATCHES` | 3 | これ未満の孤立成分は、クラスの推定に混ぜない |
 | `BACKGROUND_POINT_MARGIN` | 2 | 負例点を前景から離す距離（パッチ） |
 | `SCORE_PRIOR_WEIGHT` | 0.5 | スコアで、粗い前景らしさに置く重み |

@@ -1,6 +1,7 @@
 """CLIPによる粗い推定 -> EdgeTAMによる精緻化 の全体の流れ（画像1枚分）をつなぐ。"""
 
 import time
+import shutil
 from pathlib import Path
 from typing import Union
 
@@ -13,7 +14,7 @@ from core.common.edgetam_helper import EdgeTamHelper
 from core.common.image_layout import RESIZE_MODES, make_layout
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
-from core.common.visualization import ResultSaver
+from core.common.visualization import ORIGINAL_STEM, ResultSaver, write_gallery_html
 
 
 class SegmentationRunner:
@@ -40,6 +41,8 @@ class SegmentationRunner:
         self.coarse = CoarseSegmenter(extractor, config)
         self.refiner = SemanticRefiner(edgetam, extractor.feature_size, config)
         self.saver = ResultSaver(config, extractor.feature_size)
+        self.save_gallery_html = config.get("save_gallery_html", False)
+        self._gallery_times: dict[Path, float] = {}  # 一覧HTML用の 保存先 -> 処理時間(ms)
 
         # tools から参照されるプロンプト一覧
         self.foreground_prompts = self.coarse.foreground_prompts
@@ -141,6 +144,14 @@ class SegmentationRunner:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         image_raw = load_image(image_path)
+        start = time.time()
         result = self.segment(image_raw)
+        elapsed_ms = (time.time() - start) * 1000
 
         self.saver.save(save_dir, image_raw, result, self.foreground_prompts + self.background_prompts)
+
+        # 処理済みの画像の一覧HTMLを output_dir 直下に更新する（途中でも見られる）
+        if self.save_gallery_html:
+            shutil.copy2(image_path, save_dir / f"{ORIGINAL_STEM}{image_path.suffix}")
+            self._gallery_times[save_dir] = elapsed_ms
+            print(f"一覧HTML: {write_gallery_html(Path(self.output_dir), self._gallery_times)}")

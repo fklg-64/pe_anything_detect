@@ -62,6 +62,9 @@ MASK_LOGIT_THRESHOLD = 0.0
 # EdgeTAMのデコーダ出力マスクを縮小する倍率（分母。高さ・幅を 1/N にする）
 EDGETAM_MASK_DOWNSCALE = 8
 
+# EdgeTAMの高解像度特徴量の縮小倍率（入力画像に対する分母。縦横それぞれ 1/N。512 入力で 128×128）。初期マスク・ガイデッドフィルタのガイドの大きさ
+EDGETAM_HIGH_RES_FEATURE_DOWNSCALE = 4
+
 # --- 重なり解決 ---
 # スコア = EdgeTAMの確信度 × ((1 - w) + w × 粗い前景らしさ) の w。0.5で両者を等しく扱う
 SCORE_PRIOR_WEIGHT = 0.5

@@ -24,6 +24,7 @@ from core.common.mask_utils import (
     select_background_points,
 )
 from core.common.params import (
+    EDGETAM_HIGH_RES_FEATURE_DOWNSCALE,
     EDGETAM_MASK_DOWNSCALE,
     GUIDED_FILTER_EPS,
     MASK_LOGIT_THRESHOLD,
@@ -78,10 +79,8 @@ class SemanticRefiner:
         self.background_point_count = config["edgetam_background_point_count"]
         self.refine_iterations = config["edgetam_refine_iterations"]
         self.semantic_max_side = config["semantic_max_side"]
-        # EdgeTAMの高解像度特徴量の縮小倍率（入力画像に対する分母）
-        self.high_res_downscale: int = config["edgetam_high_res_feature_downscale_factor"]
         # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
-        self.guide_radius: int = max(1, (edgetam.target_size // self.high_res_downscale) // feature_size)
+        self.guide_radius: int = max(1, (edgetam.target_size // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE) // feature_size)
 
     # =========================================================================
     # メインの流れ
@@ -174,7 +173,7 @@ class SemanticRefiner:
 
     def _high_res_size(self, input_hw: Tuple[int, int]) -> Tuple[int, int]:
         """EdgeTAMの高解像度特徴量の大きさ (幅, 高さ)。cv2.resize に渡す向き。"""
-        return input_hw[1] // self.high_res_downscale, input_hw[0] // self.high_res_downscale
+        return input_hw[1] // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE, input_hw[0] // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE
 
     def _make_guide(self, content: np.ndarray) -> np.ndarray:
         """初期マスクの縁を整えるガイド。入力画像（パディングを除いた内容）の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小したもの（float32、0〜1）。"""

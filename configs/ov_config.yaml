@@ -29,9 +29,6 @@ device: "cpu"
 et_use_int8: false
 pe_use_int8: false
 
-# EdgeTAMの高解像度特徴量のダウンサンプリング倍率（縦横それぞれ1/4）
-edgetam_high_res_feature_downscale_factor: 4
-
 # EdgeTAMに入力するポイント数
 # 前景：粗いセマンティックセグメンテーションのクラスごとに抽出する数
 edgetam_foreground_points_per_class: 4
@@ -55,11 +52,14 @@ overlay_alpha: 0.5
 # セマンティックセグメンテーション結果をmatplotlibのウィンドウで表示するか？（Falseでもpngは保存）
 show_result: false
 
+# output_dir直下に結果の一覧HTML（index.html。元画像と各結果画像・処理時間）を出力するか？
+save_gallery_html: true
+
 # 前景と判断するための自信度合い
 foreground_threshold: 0.5
 
 # 結果を出力するディレクトリ
-output_dir: "./outputs/experiment_results"
+output_dir: "./outputs/experiment_results_20261027"
 
 # カラーパレット
 color_palette: [

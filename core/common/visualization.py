@@ -233,3 +233,126 @@ class ResultSaver:
             image = np.clip(np.asarray(data, dtype=np.float32), 0.0, 1.0)
             image = cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
             cv2.imwrite(str(debug_dir / f"{name}.png"), (image * 255).astype(np.uint8))
+
+
+# 一覧HTMLに並べる画像（列見出し, ファイル名）。元画像は保存先ではなく入力画像のパスを参照する
+GALLERY_IMAGES = [
+    ("foreground_map", "foreground_map.png"),
+    ("coarse_semantic_segmentation", "coarse_semantic_segmentation.png"),
+    ("foreground_overlay", "foreground_overlay.png"),
+    ("semantic_result", "semantic_result.png"),
+]
+GALLERY_FILE_NAME = "index.html"
+# 元画像を保存先へコピーするときのファイル名（拡張子は元のまま）。output_dir ごと移動しても参照が切れないようにする
+ORIGINAL_STEM = "original"
+# 一覧HTMLの列の最小幅(px)。列は画面幅に合わせて等分され、画像は列幅に合わせて拡縮する（足りなければ横スクロール）
+GALLERY_MIN_COLUMN_WIDTH = 280
+# 一覧HTMLの1ページあたりの表示枚数の選択肢（先頭が既定）
+GALLERY_PAGE_SIZES = [50, 100, 200]
+
+
+def write_gallery_html(output_dir: Path, elapsed_ms: Dict[Path, float]) -> Path:
+    """処理した画像ごとに 元画像と各結果画像を横に並べた一覧HTMLを output_dir 直下に書く。
+
+    elapsed_ms: 画像ごとの保存先フォルダ -> 処理時間(ms)（元画像は save_dir/original.* にコピー済みのものを使う）。
+    画像は埋め込まず相対パスで参照する（枚数が多くてもHTMLが小さく、画像を差し替えても反映される）。
+    各画像の下にそのパスも表示する。
+    表示は1ページ GALLERY_PAGE_SIZES から選んだ枚数ずつで、ページを変えると前のページの <img> を
+    DOM ごと捨てて読み込み直す（大きな画像を全部メモリに載せ続けない）。
+    """
+    import json
+    from os.path import relpath
+
+    output_dir = Path(output_dir)
+
+    rows = []
+    for save_dir, ms in elapsed_ms.items():
+        save_dir = Path(save_dir)
+        original = next(iter(sorted(save_dir.glob(f"{ORIGINAL_STEM}.*"))), save_dir / ORIGINAL_STEM)
+        images = [("original", original)] + [(label, save_dir / file) for label, file in GALLERY_IMAGES]
+        rows.append({
+            "name": save_dir.name,
+            "ms": round(ms, 1),
+            "images": [
+                {"label": label, "path": Path(relpath(path.resolve(), output_dir.resolve())).as_posix(),
+                 "exists": path.exists()}
+                for label, path in images
+            ],
+        })
+
+    # </script> などでデータがHTMLを壊さないよう "<" をエスケープする
+    data = json.dumps(rows, ensure_ascii=False).replace("<", "\\u003c")
+    html = (GALLERY_TEMPLATE
+            .replace("__DATA__", data)
+            .replace("__PAGE_SIZES__", json.dumps(GALLERY_PAGE_SIZES))
+            .replace("__COLUMNS__", str(len(GALLERY_IMAGES) + 1))
+            .replace("__MIN_COLUMN_WIDTH__", str(GALLERY_MIN_COLUMN_WIDTH)))
+    out_path = output_dir / GALLERY_FILE_NAME
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
+
+
+GALLERY_TEMPLATE = """<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8"><title>セグメンテーション結果一覧</title>
+<style>
+body { font-family: sans-serif; font-size: 18px; margin: 16px; }
+button, select { font-size: 18px; }
+.nav { margin: 8px 0; display: flex; gap: 12px; align-items: center; }
+#wrap { overflow-x: auto; }
+.grid { display: grid; grid-template-columns: repeat(__COLUMNS__, minmax(__MIN_COLUMN_WIDTH__px, 1fr)); gap: 8px; align-items: start; min-width: calc(__COLUMNS__ * __MIN_COLUMN_WIDTH__px); }
+.head { font-weight: bold; font-size: 20px; padding: 6px 0; border-bottom: 2px solid #333; }
+h2 { font-size: 22px; margin: 20px 0 6px; }
+h2 .ms { font-weight: normal; color: #06c; margin-left: 12px; }
+figure { margin: 0; min-width: 0; }
+img { width: 100%; height: auto; display: block; }
+code { font-size: 14px; color: #555; word-break: break-all; display: block; }
+.missing { padding: 40px 0; text-align: center; color: #999; }
+</style></head><body>
+<h1>セグメンテーション結果一覧</h1>
+<div class="nav" id="nav-top"></div>
+<div id="wrap"><div class="grid head-row" id="heads"></div><div id="list"></div></div>
+<div class="nav" id="nav-bottom"></div>
+<script>
+const ROWS = __DATA__;
+const PAGE_SIZES = __PAGE_SIZES__;
+let pageSize = PAGE_SIZES[0], page = 0;
+
+function el(tag, props, children) {
+  const e = Object.assign(document.createElement(tag), props || {});
+  (children || []).forEach(c => e.append(c));
+  return e;
+}
+
+function render() {
+  document.getElementById("heads").replaceChildren(
+    ...(ROWS[0] ? ROWS[0].images : []).map(im => el("div", {className: "head", textContent: im.label})));
+  const pages = Math.max(1, Math.ceil(ROWS.length / pageSize));
+  page = Math.min(page, pages - 1);
+  const list = document.getElementById("list");
+  // 前のページの img は src を空にしてから捨て、デコード済みの画像をブラウザに解放させる
+  list.querySelectorAll("img").forEach(img => { img.removeAttribute("src"); });
+  list.replaceChildren();
+  ROWS.slice(page * pageSize, (page + 1) * pageSize).forEach(row => {
+    const figs = row.images.map(im => el("figure", {}, [
+      im.exists ? el("img", {src: im.path, loading: "lazy", decoding: "async", alt: im.label})
+                : el("div", {className: "missing", textContent: "(なし)"}),
+      el("code", {textContent: im.path}),
+    ]));
+    list.append(el("section", {}, [
+      el("h2", {textContent: row.name}, [el("span", {className: "ms", textContent: `${row.ms.toFixed(1)} ms`})]),
+      el("div", {className: "grid"}, figs)]));
+  });
+  ["nav-top", "nav-bottom"].forEach(id => {
+    const prev = el("button", {textContent: "前へ", disabled: page === 0, onclick: () => go(page - 1)});
+    const next = el("button", {textContent: "次へ", disabled: page >= pages - 1, onclick: () => go(page + 1)});
+    const sel = el("select", {onchange: e => { pageSize = Number(e.target.value); page = 0; render(); }},
+      PAGE_SIZES.map(n => el("option", {value: n, textContent: n + " 枚/ページ", selected: n === pageSize})));
+    document.getElementById(id).replaceChildren(prev,
+      el("span", {textContent: `${page + 1} / ${pages} ページ（全 ${ROWS.length} 枚）`}), next, sel);
+  });
+}
+
+function go(p) { page = p; render(); window.scrollTo(0, 0); }
+render();
+</script></body></html>
+"""
