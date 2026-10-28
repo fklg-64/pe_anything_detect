@@ -52,12 +52,17 @@ python tools/experiments/small_objects/regress.py  # 変更前（元のプロン
 python tools/experiments/small_objects/timing.py  # 変更前と現在の処理時間を、同じ画像で交互に測る（静かな状態で）
 python tools/experiments/small_objects/cache_coarse.py && python tools/experiments/small_objects/prompt_candidates.py  # 前景プロンプトの候補の効果と副作用（粗い判定のキャッシュ screen.py で EdgeTAM なしに速く比べ、最終結果で確かめる）
 python tools/experiments/small_objects/make_report_images.py  # outputs/small_objects/index.html 用の画像（006 の入力・正解・段階ごとの結果など）
+python tools/experiments/semantic_merge/runall.py --name {current,orig,core,tie1.0,tie1_obj08,allone_post08,...} --sets single,typed,free [--suffix S]  # 1 つの物体が複数クラスに割れる問題（tube / transparent tubes など）の変種比較（PyTorch/OV 共通の本体を直接動かす。結果は outputs/semantic_merge/rows_<名前>.json）。`python tools/experiments/semantic_merge/compare.py 名前...` で表に。変種は variants.py / coarse_variants.py。`current` は本体の統合を切った基準、`core` が本体の既定
+python tools/experiments/semantic_merge/regress_classes.py  # 実画像・COCO128・D2S でクラスの数・名前の変化（orig / 前回 / 現在）
+python tools/experiments/semantic_merge/montage_classes.py --paths P... --out OUT.jpg --variants current,core  # クラス分けの比較画像
+python tools/experiments/semantic_merge/timing.py  # 統合の有無の処理時間（OpenVINO）
+python tools/experiments/semantic_merge/report_semantic_merge.py  # 上の結果を outputs/semantic_merge/index.html に可視化
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
 ```
 
-- 説明資料は `docs/`: 全体像 `overview.md`・粗い段階 `coarse_segmentation.md`・詳細段階 `detailed_segmentation.md`・手法の変遷と比較 `method_history.md`（コイン画像の中間結果つき。画像は JPEG（幅 1200px 以下・合計 5MB 以下。git に載せるため）で、`python tools/docs/make_doc_images.py` で `docs/images/` に再生成し、`tools/docs/lint_docs.py` で検査、`tools/docs/shrink_images.py` で縮める。処理を変えたら資料と画像も更新する。更新は `.claude/agents/docs-writer.md`（docs-writer エージェント）に任せられる）。
+- 説明資料は `docs/`: 全体像 `overview.md`・粗い段階 `coarse_segmentation.md`・詳細段階 `detailed_segmentation.md`・格子の検出方法 `lattice_detection.md`（シリンジの巣の画像つき。画像は `python tools/docs/make_lattice_doc_images.py` で `docs/images/latdet_*.jpg` に再生成。本体と一致するか確かめる）・手法の変遷と比較 `method_history.md`（コイン画像の中間結果つき。画像は JPEG（幅 1200px 以下・合計 5MB 以下。git に載せるため）で、`python tools/docs/make_doc_images.py` で `docs/images/` に再生成し、`tools/docs/lint_docs.py` で検査、`tools/docs/shrink_images.py` で縮める。処理を変えたら資料と画像も更新する。更新は `.claude/agents/docs-writer.md`（docs-writer エージェント）に任せられる）。
 - 処理時間の内訳は `docs/overview.md`、高速化（BLAS のスレッド制限・NumPy 段の外接矩形処理）と効かなかった案は `docs/method_history.md`。
 - 性能向上が確認できた手法（外周「不明」・外周 + ガイデッドフィルタ・PE と EdgeTAM の統合・点数 4:4）の詳細は `docs/method_history.md`。**外周 + ガイデッドフィルタ（精緻化の初期マスク）・点数 4:4・EdgeTAM の特徴での前景確信度の伝播（`use_edgetam_clustering`。以前の AND を置き換えた）・反復 2 回は本体に組み込み済み**（共通コードなので PyTorch・OpenVINO の両方）。実験用のコード（`tools/experiments/`）は、従来の運用（8:8・外周なし）を基準にしている。
 - **006_syringe（透明な筒が格子に並ぶ巣）への対応（2026-10-27〜28）**: 前景プロンプト `a photo of transparent tubes.`（複数形が必須）と、格子状に並んだ小物体を 1 個ずつに分ける `core/common/lattice.py`・`lattice_separator.py`（`SemanticRefiner.refine` の最後。画像の勾配の自己相関で格子を検出したときだけ、セルごとの箱プロンプトで EdgeTAM を窓で切り出した特徴で一括デコード）を本体に組み込み済み（PyTorch・OpenVINO 共通）。006 の IoU 0.0 → 0.91。MVTec・独立 48 枚・合成は悪化なし。作動は巣のような画像に限る。報告は `outputs/small_objects/index.html`、説明は `docs/detailed_segmentation.md`「格子状に並んだ小物体の分離」。**C++ 版（cppsrc/）は未追従**。
@@ -78,8 +83,9 @@ python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・
 - `segmentation_runner.py`: `SegmentationRunner`。`segment(image)`（保存なしのパイプライン、`SegmentationResult` を返す）と `run(path)`（読み込み・`segment`・保存）。
 - `coarse_segmentation.py`: `CoarseSegmenter`。CLIP 特徴量・テキストプロンプトとの照合・faiss KMeans による粗い前景/セマンティック推定と、パッチ単位の整形。
 - `semantic_refiner.py`: `SemanticRefiner`。クラスごとに EdgeTAM backend でマスクを推定し、スコアで重なりを解決して 1 枚のセマンティックマップにする。
-- `image_layout.py`: モデル入力のリサイズモード（config の `resize_mode`: `square`（既定・アスペクト比を無視）/ `fit`（アスペクト比を保ち長辺を image_size、短辺はパッチサイズの倍数）/ `pad`（fit の大きさを下・右に Replication で image_size 四方まで埋め、特徴抽出後にパディング部分を捨てる））。`ImageLayout` が入力画像・パッチ格子・元画像の対応を持つ。**以降のパッチ格子は長方形になりうる**ので、格子の大きさは `feature_size` ではなく `layout.valid_grid`（`CoarseSegmenter.grid`）を使う。プロンプト点・マスクは常に元画像の座標・大きさ。C++ 版（cppsrc/）は未対応（既定の `square` のみ）。
+- `image_layout.py`: モデル入力のリサイズモード（config の `resize_mode`: `square`（既定・アスペクト比を無視）/ `fit`（アスペクト比を保ち長辺を image_size、短辺はパッチサイズの倍数）/ `pad`（fit の大きさを下・右に Replication で image_size 四方まで埋め、特徴抽出後にパディング部分を捨てる））。`ImageLayout` が入力画像・パッチ格子・元画像の対応を持つ。**以降のパッチ格子は長方形になりうる**ので、格子の大きさは `feature_size` ではなく `layout.valid_grid`（`CoarseSegmenter.grid`）を使う。プロンプト点・マスクは常に元画像の座標・大きさ。C++ 版（cppsrc/）は未対応（既定の `square` のみ）。格子分離・クラスのまとめ（`semantic_merge.py`）も C++ 版は未追従。
 - `lattice.py` / `lattice_separator.py`: 規則的に並んだ同じ物体（巣・トレイ・ブリスター）の格子の検出（画像の勾配の自己相関。`detect`）と、セルごとの箱プロンプトによる物体の分離（`LatticeSeparator.separate`）。クラス単位のデコードは、隙間が 1 パッチ未満の物体の集まりを 1 つの塊にする（EdgeTAM は点に従い、事前マスクはほとんど効かない）ため。デコーダーが画像サイズ可変なので、特徴を箱の周りの窓（`LATTICE_WINDOW_TOKENS`）で切り出して全セルを一括実行する（80 個で約 95ms）。予測 IoU の下位 4 分位点が 0.5 未満なら何も変えない。定数は `params.py` の `LATTICE_*`。
+- `semantic_merge.py`: 1 つの物体が似たプロンプトの別クラスに割れるのを防ぐ。`merge_near_ties`（PE のクラスタのロジットが僅差 `PROMPT_TIE_TOLERANCE` 以内のプロンプトを、より大きいクラスへ統合）、`merge_synonyms_in_objects`（1 つの連結成分の中の、テキスト埋め込みの距離 `PROMPT_SYNONYM_DISTANCE` 以内のクラスをまとめる。組は `synonym_representatives` で前景プロンプトから作る）。`CoarseSegmenter.generate_foreground_map` の伝播の後で呼ぶ（`tie_tolerance` / `synonym_representative` はインスタンスの属性で、実験で切れる）。
 - `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分（`Component` = 最内点 `peak`・`core`・`region` の NamedTuple）・ノイズ除去などの純粋関数。
 - `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
 - `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。
@@ -98,6 +104,7 @@ backend:
 1. `resize_image` + `normalize_image`（リサイズは CLIP と EdgeTAM で共通、正規化はモデルごと）
 2. （`use_edgetam_clustering: true` のとき）EdgeTAM エンコーダーを先に 1 回だけ実行（結果は粗い判定と精緻化の両方で使う）。`CoarseSegmenter.extract_features`: CLIP 画像特徴（パッチ・fused パッチ）
 3. `generate_foreground_map`: テキストプロンプト（`prompts_dir` の `foreground.yaml` / `background.yaml`）との類似度 + faiss KMeans のクラスタで粗い前景マスクとクラスタ分割を得る。`use_edgetam_clustering: true` なら、EdgeTAM の `image_embed` の類似度（kNN）で前景確信度を伝播して揃える（誤検出を減らす。`docs/coarse_segmentation.md` §4）
+   その後、`merge_near_ties` / `merge_synonyms_in_objects` で、1 つの物体の似たプロンプト（tube と transparent tubes など）のクラスをまとめる（別の部品を指す noodle / package などは保つ。`docs/coarse_segmentation.md` §5）。**前景プロンプトを足したら、前景マスクだけでなくクラスの数・名前も確認する**（`transparent tubes` の追加で cap の画像が 2 クラスに割れた）
 4. `assign_semantic_labels`: クラスタに対応するプロンプトで粗いセマンティックラベルを付与
 5. `refine_coarse_segmentation`: 穴埋め・細い領域の統合
 6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点、既定 4）/ 背景（`edgetam_background_point_count` 点、既定 4）のプロンプト点と、初期マスク（粗いマスクの外側 1 パッチを「不明」にし、128×128 に拡大して入力画像の輝度をガイドにしたガイデッドフィルタで縁を整えたもの）で EdgeTAM の decoder を反復し、クラスを統合し、前景内部の幅 1 パッチ未満の隙間（クラス境界の割れ）を埋める（`mask_utils.fill_narrow_gaps`。encoder は 2 で実行済みなら再実行しない）。最後に、物体が格子状に並んでいれば、セルごとに 1 個ずつに分ける（`LatticeSeparator`。作動は稀で、約 +150ms。判定は毎回 約 6ms）

@@ -99,3 +99,13 @@ LATTICE_PHASE_BINS = 16
 LATTICE_WINDOW_TOKENS = 12
 # 格子の位相（物体の中心）を、デコード結果の重心で直すときに使うセルの数の上限（全セルではなく、等間隔に選んだ一部で足りる）
 LATTICE_PHASE_PROBES = 16
+
+# --- セマンティック（クラス）のまとめ方（semantic_merge.py） ---
+# プロンプトのロジットの差がこれ以内なら「違う」とは言えない（ノイズの範囲）。1 つの物体の領域（連結成分）のパッチを半分ずつにして、それぞれで
+# attention pool したトークンで求めたロジットの差は、中央値 0.47・75 パーセンタイル 0.91・90 パーセンタイル 1.37（MVTec・実画像・合成 660 組）。
+# 2 を超えると、カップ麺のクラス（麺・容器・ふた・包装）まで統合されはじめる
+PROMPT_TIE_TOLERANCE = 1.0
+# 同義語とみなす前景プロンプトの、テキスト埋め込みのコサイン距離（平均連結の階層クラスタリングを、この距離で切る）。0.08 は類似度 約 0.92。
+# tube / transparent tubes（0.94）・pill / capsule（0.93）・cable / wire（0.95）・plastic part / rubber part（0.96）を同義語とし、
+# white plastic lid / round white food container（0.92）・noodle / package（0.85）・bottle / cap（0.87）は別のものとする
+PROMPT_SYNONYM_DISTANCE = 0.08

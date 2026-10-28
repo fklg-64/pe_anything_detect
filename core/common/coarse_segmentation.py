@@ -20,7 +20,10 @@ from core.common.params import (
     FAISS_NUM_THREADS,
     KMEANS_SEED,
     PATCH_STRUCTURE,
+    PROMPT_SYNONYM_DISTANCE,
+    PROMPT_TIE_TOLERANCE,
 )
+from core.common.semantic_merge import merge_near_ties, merge_synonyms_in_objects, synonym_representatives
 from core.common.result import ClusterView
 
 
@@ -80,6 +83,9 @@ class CoarseSegmenter:
         fg_feats = self.extractor.extract_text_features(self.foreground_prompts)
         bg_feats = self.extractor.extract_text_features(self.background_prompts)
         self.fgbg_text_features = np.vstack([fg_feats, bg_feats])
+        # 同義語の前景プロンプトの代表（1 つの物体の中で、同義語のクラスをまとめるのに使う）
+        self.synonym_representative = synonym_representatives(fg_feats, PROMPT_SYNONYM_DISTANCE)
+        self.tie_tolerance = PROMPT_TIE_TOLERANCE   # 実験で runner ごとに変えられるよう、インスタンスの属性にしてある（yaml には出さない）
 
     # =========================================================================
     # CLIP特徴量
@@ -108,6 +114,12 @@ class CoarseSegmenter:
         _, cluster_labels = kmeans.index.search(features, 1)
         return cluster_labels.reshape(-1)
 
+    def _prompt_logits(self, cluster_feature: np.ndarray) -> np.ndarray:
+        """クラスタの代表トークンと全プロンプト（前景 -> 背景の順）との類似度 × CLIP_LOGIT_SCALE。"""
+        feature = cluster_feature.reshape(1, -1)
+        feature = feature / (np.linalg.norm(feature, axis=-1, keepdims=True) + 1e-8)
+        return (CLIP_LOGIT_SCALE * feature @ self.fgbg_text_features.T)[0]
+
     def _classify_cluster(self, cluster_feature: np.ndarray) -> Tuple[float, int]:
         """クラスタの代表トークンを前景/背景プロンプトと照合し、(前景確信度, 最も近いプロンプト番号) を返す。
 
@@ -115,10 +127,7 @@ class CoarseSegmenter:
         """
         num_foreground_prompts = len(self.foreground_prompts)
 
-        # 正規化してテキストとの類似度(logits)を得る
-        feature = cluster_feature.reshape(1, -1)
-        feature = feature / (np.linalg.norm(feature, axis=-1, keepdims=True) + 1e-8)
-        logits = CLIP_LOGIT_SCALE * feature @ self.fgbg_text_features.T
+        logits = self._prompt_logits(cluster_feature)[None, :]
         fg_logits = logits[:, :num_foreground_prompts]
         bg_logits = logits[:, num_foreground_prompts:]
 
@@ -138,12 +147,18 @@ class CoarseSegmenter:
     def _judge_clusters(
         self, patch_features: np.ndarray, cluster_labels: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """クラスタごとのトークンをテキストと照合し、パッチごとの (前景確信度, プロンプト番号) を返す。"""
+        """クラスタごとのトークンをテキストと照合し、パッチごとの (前景確信度, プロンプト番号) を返す。
+
+        クラスタごとの前景プロンプトのロジットは self.cluster_logits (クラスタ数, 前景プロンプト数) に残す（僅差のクラスのまとめで使う）。
+        """
         cluster_tokens: List[np.ndarray] = self.extractor.extract_cluster_tokens(patch_features, cluster_labels)
         confidences = np.zeros((len(cluster_tokens),), dtype=np.float32)
         prompt_indices = np.zeros((len(cluster_tokens),), dtype=np.int64)
+        num_foreground_prompts = len(self.foreground_prompts)
+        self.cluster_logits = np.zeros((len(cluster_tokens), num_foreground_prompts), dtype=np.float32)
         for label_idx, cluster_feature in enumerate(cluster_tokens):
             confidences[label_idx], prompt_indices[label_idx] = self._classify_cluster(cluster_feature)
+            self.cluster_logits[label_idx] = self._prompt_logits(cluster_feature)[:num_foreground_prompts]
         return confidences[cluster_labels], prompt_indices[cluster_labels]
 
     def generate_foreground_map(
@@ -168,13 +183,19 @@ class CoarseSegmenter:
             confidence, prompt_index = self._judge_clusters(patch_features, cluster_labels)
 
         pe_clusters = None
+        pe_labels = cluster_labels
         if edge_embed is not None:
             pe_clusters = ClusterView(cluster_labels, self._prompt_per_cluster(cluster_labels, prompt_index))
             with Timer("    ┌ EdgeTAM特徴での確信度の伝播処理時間"):
                 confidence, prompt_index = self._propagate_with_edgetam(confidence, prompt_index, edge_embed)
+        # 1 つの物体の別のクラスタが、僅差の似たプロンプトを選んで別クラスに割れるのを防ぐ
+        prompt_index = merge_near_ties(prompt_index, pe_labels, self.cluster_logits, len(self.foreground_prompts), self.tie_tolerance)
+        # ロジットの差が僅差でなくても、同じ物体の中の同義語のクラスは 1 つにする
+        prompt_index = merge_synonyms_in_objects(prompt_index, self.grid, len(self.foreground_prompts), self.synonym_representative)
+        if edge_embed is not None:
             # PE のクラスタの中でも、伝播で判定が変わったパッチはプロンプトが違うので、(PE のクラスタ, プロンプト) の組を新しいクラスタにする
             num_prompts = len(self.foreground_prompts) + len(self.background_prompts)
-            _, cluster_labels = np.unique(cluster_labels * num_prompts + prompt_index, return_inverse=True)
+            _, cluster_labels = np.unique(pe_labels * num_prompts + prompt_index, return_inverse=True)
             cluster_labels = cluster_labels.reshape(-1)
 
         cluster_index_list = self._prompt_per_cluster(cluster_labels, prompt_index)

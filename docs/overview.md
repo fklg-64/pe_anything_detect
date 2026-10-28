@@ -9,6 +9,7 @@
 | **この資料** | 全体の流れ・2 段階にした理由・設定・処理時間 |
 | [coarse_segmentation.md](coarse_segmentation.md) | ① 粗いセマンティックセグメンテーションの詳細 |
 | [detailed_segmentation.md](detailed_segmentation.md) | ② 詳細セグメンテーションの詳細 |
+| [lattice_detection.md](lattice_detection.md) | ② の格子の検出方法（シリンジの巣の画像で、段階ごとに説明） |
 | [method_history.md](method_history.md) | これまでに試した手法と、現在の手法との比較（メリット・デメリット） |
 
 以降の説明は、同じ 1 枚（コイン 9 枚、3024×3024）を例にする。各資料の末尾に、前景が複数クラスの画像（カップ麺）の例もある。
@@ -81,6 +82,7 @@ sequenceDiagram
     PE-->>C: クラスタの代表ベクトル
     C->>C: プロンプトと照合 → 前景確信度
     C->>C: image_embed の kNN で確信度を伝播
+    C->>C: 似たプロンプトのクラスをまとめる（僅差・同義語）
     C-->>U: foreground_map, foreground_mask, クラスタ
     U->>C: assign_semantic_labels / refine_coarse_segmentation
     C-->>U: 粗いラベル（整形済み）
