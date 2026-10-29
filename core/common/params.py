@@ -5,9 +5,6 @@
 # 可視化の見た目だけに関わる値は visualization.py にある。
 # =============================================================================
 
-import numpy as np
-
-
 # --- CLIP（粗い前景・セマンティックの判定） ---
 # テキストとの類似度(cos)に掛ける係数（softmaxの温度の逆数）
 CLIP_LOGIT_SCALE = 100.0
@@ -35,11 +32,13 @@ EDGETAM_INPUT_ALIGNMENT = 32
 # 長辺を image_size に固定すると、短辺を 32 の倍数に丸める分だけ縦横比がずれる（例: 1600x1068 で 3%）ので、長辺を 1 単位ずつ縮めてずれを抑える
 FIT_ASPECT_TOLERANCE = 0.01
 
+# resize_mode（config）に指定できる値。square: アスペクト比を無視 / fit: アスペクト比を保つ / pad: fit の大きさを image_size 四方まで埋める（image_layout.py）
+RESIZE_MODES = ("square", "fit", "pad")
+
 # --- パッチ単位の幾何（粗い結果はCLIPのパッチ格子上にある） ---
 # 近傍の大きさ。「内側」「細い領域」の判定（この近傍で縮めて残るか）と、粗いマスクの平滑化に使う。
 # 3 = 1パッチ分の近傍。粗いマスクは縁・影で最大1パッチ太るという前提に基づく
 PATCH_NEIGHBORHOOD = 3
-PATCH_STRUCTURE = np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)
 # 背景の負例点を前景から離す距離（パッチ数）。縁・影の太り(1パッチ)を避けるため2
 BACKGROUND_POINT_MARGIN = 2
 # ノイズとして除去する領域の最小面積（パッチ面積に対する倍率）。1パッチ未満は粗いマスクの分解能以下
@@ -100,6 +99,15 @@ LATTICE_WINDOW_TOKENS = 12
 # 格子の位相（物体の中心）を、デコード結果の重心で直すときに使うセルの数の上限（全セルではなく、等間隔に選んだ一部で足りる）
 LATTICE_PHASE_PROBES = 16
 
+# EdgeTAM の特徴（image_embed / high_res_feats1 / high_res_feats0）の、入力画像に対する縮小倍率
+LATTICE_EMBED_STRIDE = 16
+LATTICE_FEATS1_STRIDE = 8
+LATTICE_FEATS0_STRIDE = 4
+# デコーダーの出力（低解像度ロジット）の縮小倍率は high_res_feats0 と同じ
+LATTICE_MASK_STRIDE = LATTICE_FEATS0_STRIDE
+# デコーダーの予測 IoU（マスクと正解の IoU の予測値）が、この値以上のマスクを物体として採る。0.5 は、物体と一致した（マッチした）とみなす IoU の基準
+LATTICE_MIN_PREDICTED_IOU = 0.5
+
 # --- セマンティック（クラス）のまとめ方（semantic_merge.py） ---
 # プロンプトのロジットの差がこれ以内なら「違う」とは言えない（ノイズの範囲）。1 つの物体の領域（連結成分）のパッチを半分ずつにして、それぞれで
 # attention pool したトークンで求めたロジットの差は、中央値 0.47・75 パーセンタイル 0.91・90 パーセンタイル 1.37（MVTec・実画像・合成 660 組）。
@@ -109,3 +117,19 @@ PROMPT_TIE_TOLERANCE = 1.0
 # tube / transparent tubes（0.94）・pill / capsule（0.93）・cable / wire（0.95）・plastic part / rubber part（0.96）を同義語とし、
 # white plastic lid / round white food container（0.92）・noodle / package（0.85）・bottle / cap（0.87）は別のものとする
 PROMPT_SYNONYM_DISTANCE = 0.08
+
+# --- PE-Core / PE-Spatial（ViT） ---
+# ブロック数。PyTorchで詳細な特徴量を取るときに、この全ブロックをパッチする
+PE_NUM_BLOCKS = 12
+
+# --- OpenVINO 実行環境（core/openvino/runtime_utils.py） ---
+# pip 版 openvino との衝突を避けるため sys.path / PYTHONPATH から外すシステム版 OpenVINO の場所
+SYSTEM_OPENVINO_DIR = "/opt/intel/openvino"
+# NumPy の BLAS（OpenBLAS）のスレッド数。BLAS は既定で論理コア数（20）のスレッドを起こし、行列積（`@`）の後もしばらくスピン待ちするので、
+# OpenVINO のスレッド（ピン止め）とコアを取り合い、直後の推論が 2〜4 倍遅くなる（行列積 2ms の後のデコードが 7ms → 29ms）。
+# 本パイプラインの行列積は小さい（1024×256）ので、1 スレッドで 4ms 程度で済み、結果も同じ
+BLAS_NUM_THREADS = 1
+
+# --- 画像の読み込み ---
+# データセット定義yamlのディレクトリを探索するときに画像とみなす拡張子
+IMAGE_EXTENSIONS = {".png", ".jpg", ".bmp"}

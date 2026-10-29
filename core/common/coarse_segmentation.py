@@ -19,7 +19,7 @@ from core.common.params import (
     EDGE_PROPAGATION_NEIGHBORS,
     FAISS_NUM_THREADS,
     KMEANS_SEED,
-    PATCH_STRUCTURE,
+    PATCH_NEIGHBORHOOD,
     PROMPT_SYNONYM_DISTANCE,
     PROMPT_TIE_TOLERANCE,
 )
@@ -275,8 +275,8 @@ class CoarseSegmenter:
         fg = original_fg.copy()
         labels = semantic_labels.copy()
 
-        fg = self._fill_holes(fg, labels, original_fg)
-        self._merge_thin_regions(fg, labels)
+        # fg = self._fill_holes(fg, labels, original_fg)
+        # self._merge_thin_regions(fg, labels)
 
         return fg.astype(foreground_mask.dtype), labels
 
@@ -304,9 +304,9 @@ class CoarseSegmenter:
 
         for _, class_id, region in sorted(regions, key=lambda r: r[0]):
             region &= labels == class_id
-            if not region.any() or binary_erosion(region, structure=PATCH_STRUCTURE, border_value=1).any():
+            if not region.any() or binary_erosion(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool), border_value=1).any():
                 continue
-            ring = binary_dilation(region, structure=PATCH_STRUCTURE) & ~region
+            ring = binary_dilation(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)) & ~region
             neighbors = labels[ring & fg]
             neighbors = neighbors[neighbors != class_id]
             if neighbors.size:

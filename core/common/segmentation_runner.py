@@ -11,7 +11,8 @@ from core.utils import Timer, load_image, normalize_image
 from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
-from core.common.image_layout import RESIZE_MODES, make_layout
+from core.common.image_layout import make_layout
+from core.common.params import RESIZE_MODES
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
 from core.common.visualization import ORIGINAL_STEM, ResultSaver, write_gallery_html

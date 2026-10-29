@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from open_clip.model import CustomTextCLIP
 
+from core.common.params import PE_NUM_BLOCKS
+
 # monkey_patch は import した時点で timm 側へのパッチ（動的な画像サイズ対応）が適用される。モデル生成より前に import すること
 from core.torch.monkey_patch import (
     attention_rope_forward,
@@ -19,9 +21,6 @@ from core.torch.monkey_patch import (
     eva_forward_head,
     timmmodel_forward,
 )
-
-# PE-Core / PE-Spatial（ViT）のブロック数。PyTorchで詳細な特徴量を取るときに、この全ブロックをパッチする
-NUM_BLOCKS = 12
 
 
 class TorchCLIPFeatureExtractor:
@@ -54,7 +53,7 @@ class TorchCLIPFeatureExtractor:
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
         # OpenVINO化の有無で設定変更（pytorchで処理する場合は、詳細な特徴量も取得）
         if not self.to_openvino:
-            for block in trunk.blocks[:NUM_BLOCKS]:
+            for block in trunk.blocks[:PE_NUM_BLOCKS]:
                 block.attn.forward = types.MethodType(attention_rope_forward, block.attn)
                 block.forward = types.MethodType(eva_block_forward, block)
         trunk.forward = types.MethodType(eva_forward, trunk)
@@ -67,7 +66,7 @@ class TorchCLIPFeatureExtractor:
         model.visual.to_openvino = self.to_openvino
         trunk.to_openvino = self.to_openvino
         # 保持する層。OpenVINO化では cluster_layers だけ、PyTorchの詳細な特徴量では全層
-        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, NUM_BLOCKS + 1))
+        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, PE_NUM_BLOCKS + 1))
 
         return model, preprocess
 

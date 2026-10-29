@@ -8,6 +8,8 @@ from PIL import Image
 from pathlib import Path
 from typing import Union
 
+from core.common.params import IMAGE_EXTENSIONS
+
 
 class Timer:
     """ミリ秒単位で処理時間を計測し表示するコンテキストマネージャー"""
@@ -88,8 +90,6 @@ def load_config(config_path: str = "./configs/ov_config.yaml") -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".bmp"}
 
 # データセット定義yamlから画像パスの一覧を作る（ディレクトリは再帰的に探索）
 def load_dataset_paths(dataset_path: str = "./configs/dataset.yaml") -> list[Path]:

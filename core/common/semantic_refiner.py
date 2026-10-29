@@ -31,7 +31,7 @@ from core.common.params import (
     MASK_LOGIT_THRESHOLD,
     MIN_ISOLATED_PATCHES,
     MIN_REGION_PATCH_AREA,
-    PATCH_STRUCTURE,
+    PATCH_NEIGHBORHOOD,
     PRIOR_LOGIT_RANGE,
     PRIOR_NON_CORE_PROBABILITY,
     SCORE_PRIOR_WEIGHT,
@@ -238,7 +238,7 @@ class SemanticRefiner:
                 binary, _, _ = self._refine_region(ctx, region, [component], f"クラス{class_id}(再推定)")
                 if region.sum() < MIN_ISOLATED_PATCHES:
                     # 極小成分は、成分を1パッチ広げた範囲までに制限する
-                    allowed = binary_dilation(region, structure=PATCH_STRUCTURE)
+                    allowed = binary_dilation(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool))
                     binary &= resize_map(allowed, ctx.size, cv2.INTER_NEAREST) > 0
                 ctx.semantic_map[binary & (ctx.semantic_map == 0)] = class_id
                 ctx.debug_images[f"c{class_id}_rescue_{peak[0]}_{peak[1]}"] = binary
@@ -293,7 +293,7 @@ class SemanticRefiner:
         coarse_map: coarse_mask のパッチ近傍平均（patch_mean）。
         """
         core_map = patch_mean(core)
-        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, PATCH_STRUCTURE).astype(np.float32))
+        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)).astype(np.float32))
         prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
         upsampled = cv2.resize(prior_map, self._high_res_size(ctx.input_hw), interpolation=cv2.INTER_LINEAR)
         return np.clip(guided_filter(ctx.guide, upsampled, self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)

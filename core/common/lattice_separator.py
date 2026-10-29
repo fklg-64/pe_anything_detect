@@ -14,16 +14,15 @@ import numpy as np
 from core.utils import Timer
 from core.common import lattice as lattice_utils
 from core.common.backend import EdgeTamBackend
-from core.common.params import LATTICE_PHASE_PROBES, LATTICE_WINDOW_TOKENS
-
-# EdgeTAM の特徴（image_embed / high_res_feats1 / high_res_feats0）の、入力画像に対する縮小倍率
-EMBED_STRIDE = 16
-FEATS1_STRIDE = 8
-FEATS0_STRIDE = 4
-# デコーダーの出力（低解像度ロジット）の縮小倍率は high_res_feats0 と同じ
-MASK_STRIDE = FEATS0_STRIDE
-# デコーダーの予測 IoU（マスクと正解の IoU の予測値）が、この値以上のマスクを物体として採る。0.5 は、物体と一致した（マッチした）とみなす IoU の基準
-MIN_PREDICTED_IOU = 0.5
+from core.common.params import (
+    LATTICE_EMBED_STRIDE,
+    LATTICE_FEATS0_STRIDE,
+    LATTICE_FEATS1_STRIDE,
+    LATTICE_MASK_STRIDE,
+    LATTICE_MIN_PREDICTED_IOU,
+    LATTICE_PHASE_PROBES,
+    LATTICE_WINDOW_TOKENS,
+)
 
 
 class LatticeSeparator:
@@ -79,12 +78,12 @@ class LatticeSeparator:
 
         with Timer("    ┌ 格子のセルごとのデコード"):
             low, scores, origins = self._decode(feats, centers, half)
-        # デコーダーの予測 IoU が、物体として当てはまっているかの確認。セルの 4 分の 1 以上で予測 IoU が MIN_PREDICTED_IOU 未満（下位 4 分位点が未満）なら、
+        # デコーダーの予測 IoU が、物体として当てはまっているかの確認。セルの 4 分の 1 以上で予測 IoU が LATTICE_MIN_PREDICTED_IOU 未満（下位 4 分位点が未満）なら、
         # 格子に見えたのは物体の並びではない（背景の模様など）ので、何も変えない。個々のセルも、予測 IoU が低ければそのセルは変えない
         confidence = scores.max(axis=1)
-        if np.percentile(confidence, 25) < MIN_PREDICTED_IOU:
+        if np.percentile(confidence, 25) < LATTICE_MIN_PREDICTED_IOU:
             return None
-        instance_logit, owner = self._compose(low, scores, origins, input_hw, semantic_map.shape, confidence >= MIN_PREDICTED_IOU)
+        instance_logit, owner = self._compose(low, scores, origins, input_hw, semantic_map.shape, confidence >= LATTICE_MIN_PREDICTED_IOU)
         self._apply(semantic_map, instance_logit, owner, centers, half, input_hw, foreground_map)
         return {"instance_logit": instance_logit, "centers": centers, "lattice": lattice}
 
@@ -102,15 +101,15 @@ class LatticeSeparator:
         feats0, feats1, embed = feats
         grid_h, grid_w = embed.shape[2:]
         win = min(LATTICE_WINDOW_TOKENS, grid_h, grid_w)
-        ratio1, ratio0 = EMBED_STRIDE // FEATS1_STRIDE, EMBED_STRIDE // FEATS0_STRIDE
+        ratio1, ratio0 = LATTICE_EMBED_STRIDE // LATTICE_FEATS1_STRIDE, LATTICE_EMBED_STRIDE // LATTICE_FEATS0_STRIDE
         windows0, windows1, windows_e, coords, origins = [], [], [], [], []
         for cx, cy in centers:
-            tx = int(np.clip(round(cx / EMBED_STRIDE - win / 2), 0, grid_w - win))
-            ty = int(np.clip(round(cy / EMBED_STRIDE - win / 2), 0, grid_h - win))
+            tx = int(np.clip(round(cx / LATTICE_EMBED_STRIDE - win / 2), 0, grid_w - win))
+            ty = int(np.clip(round(cy / LATTICE_EMBED_STRIDE - win / 2), 0, grid_h - win))
             windows_e.append(embed[0, :, ty:ty + win, tx:tx + win])
             windows1.append(feats1[0, :, ty * ratio1:(ty + win) * ratio1, tx * ratio1:(tx + win) * ratio1])
             windows0.append(feats0[0, :, ty * ratio0:(ty + win) * ratio0, tx * ratio0:(tx + win) * ratio0])
-            ox, oy = tx * EMBED_STRIDE, ty * EMBED_STRIDE
+            ox, oy = tx * LATTICE_EMBED_STRIDE, ty * LATTICE_EMBED_STRIDE
             coords.append([[cx - half[0] - ox, cy - half[1] - oy], [cx + half[0] - ox, cy + half[1] - oy]])
             origins.append((ox, oy))
         n = len(centers)
@@ -134,7 +133,7 @@ class LatticeSeparator:
         for k, mask in enumerate(best > 0):
             if mask.any():
                 ys, xs = np.nonzero(mask)
-                out[k] = (origins[k][0] + (xs.mean() + 0.5) * MASK_STRIDE, origins[k][1] + (ys.mean() + 0.5) * MASK_STRIDE)
+                out[k] = (origins[k][0] + (xs.mean() + 0.5) * LATTICE_MASK_STRIDE, origins[k][1] + (ys.mean() + 0.5) * LATTICE_MASK_STRIDE)
         return out
 
     def _compose(
@@ -146,7 +145,7 @@ class LatticeSeparator:
         scale_x, scale_y = width / input_hw[1], height / input_hw[0]
         logit = np.full((height, width), -32.0, np.float32)
         owner = np.full((height, width), -1, np.int32)
-        window = best.shape[-1] * MASK_STRIDE  # 窓の一辺（入力画像の画素）
+        window = best.shape[-1] * LATTICE_MASK_STRIDE  # 窓の一辺（入力画像の画素）
         win_w, win_h = max(1, round(window * scale_x)), max(1, round(window * scale_y))
         for k in np.flatnonzero(use):
             x0, y0 = int(round(origins[k][0] * scale_x)), int(round(origins[k][1] * scale_y))

@@ -18,9 +18,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
-from core.common.params import EDGETAM_INPUT_ALIGNMENT, FIT_ASPECT_TOLERANCE
-
-RESIZE_MODES = ("square", "fit", "pad")
+from core.common.params import EDGETAM_INPUT_ALIGNMENT, FIT_ASPECT_TOLERANCE, RESIZE_MODES
 
 
 @dataclass(frozen=True)

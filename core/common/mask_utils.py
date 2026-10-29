@@ -13,7 +13,6 @@ from core.common.params import (
     GAP_FILL_PIXELS_PER_PATCH,
     MEDIAN_BLUR_KSIZE,
     PATCH_NEIGHBORHOOD,
-    PATCH_STRUCTURE,
 )
 
 
@@ -157,7 +156,7 @@ def connected_components(mask: np.ndarray) -> List[Component]:
         region = comp == i
         edt = distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
         y, x = np.unravel_index(np.argmax(edt), edt.shape)
-        core = binary_erosion(region, structure=PATCH_STRUCTURE, border_value=1)
+        core = binary_erosion(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool), border_value=1)
         result.append(Component((int(x), int(y)), core if core.any() else region, region))
     return result
 
@@ -255,7 +254,7 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
     foreground: 粗い前景マスク（パッチ格子、全クラス）。
     """
     grid_h, grid_w = foreground.shape
-    core = binary_erosion(foreground, structure=PATCH_STRUCTURE, border_value=1)
+    core = binary_erosion(foreground, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool), border_value=1)
     if not core.any():
         return
     # 1 パッチ = GAP_FILL_PIXELS_PER_PATCH 画素に縮小したマスクで、閉処理で埋まる画素（隙間）を求める
