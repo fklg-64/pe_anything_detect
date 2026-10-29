@@ -9,6 +9,14 @@ import openvino as ov
 import openvino_tokenizers
 
 from core.common.params import PE_MEAN, PE_STD
+from core.openvino.compiled_model import OVModel, static_input_side
+
+
+def _drop_unused_outputs(model: ov.Model) -> None:
+    """未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す。"""
+    for result in model.get_results():
+        if result.output(0).get_names() & {"cls2patch_attention"}:
+            model.remove_result(result)
 
 
 class OVCLIPFeatureExtractor:
@@ -20,6 +28,8 @@ class OVCLIPFeatureExtractor:
         self.use_int8 = config["pe_use_int8"]
         self.device = config["device"].upper()
         self.num_threads = config["ov_num_thread"]
+        # 画像モデルの入力の一辺（ov_static_shape が真のときだけ。None なら動的形状。compiled_model.py）
+        self.static_side = static_input_side(config)
 
         # 画像の正規化に使用する変数
         self.mean = np.array(PE_MEAN).reshape(3, 1, 1)
@@ -47,39 +57,38 @@ class OVCLIPFeatureExtractor:
         patch_logits_path = model_dir / f"pe_patch_logits_model{suffix}"
         tokenizer_path = model_dir / "pe_tokenizer.xml"
 
-        visual_model = core.read_model(visual_path)
-        # 未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す
-        for result in visual_model.get_results():
-            if result.output(0).get_names() & {"cls2patch_attention"}:
-                visual_model.remove_result(result)
+        side = self.static_side
+        self.visual_model = OVModel(
+            core, visual_path, self.device, self.num_threads, prepare=_drop_unused_outputs,
+            static_shapes=None if side is None else {"x": [1, 3, side, side]},
+        )
         text_model = core.read_model(text_path)
         patch_logits_model = core.read_model(patch_logits_path)
         tokenizer_model = core.read_model(tokenizer_path)
 
         # メタデータ
-        self.patch_size: int = visual_model.rt_info["patch_size"].astype(int)
+        self.patch_size: int = self.visual_model.rt_info["patch_size"].astype(int)
 
         # 特徴マップのサイズ
         self.feature_size = self.target_size // self.patch_size
 
         # コンパイルモデル
-        self.compiled_visual_model = core.compile_model(visual_model, self.device, compile_config)
         self.compiled_text_model = core.compile_model(text_model, self.device, compile_config)
         self.compiled_patch_logits_model = core.compile_model(patch_logits_model, self.device, compile_config)
         self.compiled_tokenizer = core.compile_model(tokenizer_model, self.device, compile_config)
 
     def _forward_once(self) -> None:
         input_tensor = np.zeros((1, 3, self.target_size, self.target_size), dtype=np.float32)
-        self.compiled_visual_model([input_tensor])
+        self.visual_model([input_tensor])
 
     def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
         """(1,3,S,S) -> (raw_image_features, raw_patch_features, fused_layer_features)"""
-        outs = self.compiled_visual_model([image_tensor])
-        raw_image_features = outs[self.compiled_visual_model.output("raw_image_features")]
+        outs = self.visual_model([image_tensor])
+        raw_image_features = outs[self.visual_model.output_index("raw_image_features")]
         if normalize:
             raw_image_features = raw_image_features / np.linalg.norm(raw_image_features, axis=-1, keepdims=True)
-        raw_patch_features = outs[self.compiled_visual_model.output("raw_patch_features")]
-        fused_patch_features = outs[self.compiled_visual_model.output("fused_layer_features")]
+        raw_patch_features = outs[self.visual_model.output_index("raw_patch_features")]
+        fused_patch_features = outs[self.visual_model.output_index("fused_layer_features")]
         return raw_image_features, raw_patch_features, fused_patch_features
 
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
