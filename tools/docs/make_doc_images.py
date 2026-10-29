@@ -23,7 +23,8 @@ from scipy.ndimage import binary_dilation
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.common.image_layout import make_layout
 from core.common.mask_utils import connected_components, guided_filter, knn_graph, patch_mean, propagate, select_background_points
-from core.common.params import CLIP_LOGIT_SCALE, GUIDED_FILTER_EPS, PATCH_NEIGHBORHOOD, PRIOR_NON_CORE_PROBABILITY
+from core.common.mask_utils import patch_structure
+from core.common.params import CLIP_LOGIT_SCALE, GUIDED_FILTER_EPS, PRIOR_NON_CORE_PROBABILITY
 from core.common.segmentation_runner import SegmentationRunner
 from core.common.visualization import clean_prompt
 from core.openvino.edgetam_runner import OVEdgeTamRunner
@@ -341,7 +342,7 @@ def main() -> None:
     def build_prior(ctx, coarse_mask_, coarse_map_, core_):
         prior = original_build_prior(ctx, coarse_mask_, coarse_map_, core_)
         core_map = patch_mean(core_)
-        unknown = np.maximum(coarse_map_, binary_dilation(coarse_mask_, np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)).astype(np.float32))
+        unknown = np.maximum(coarse_map_, binary_dilation(coarse_mask_, patch_structure()).astype(np.float32))
         patch_prior = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
         upsampled = cv2.resize(patch_prior, refiner._high_res_size(ctx.input_hw), interpolation=cv2.INTER_LINEAR)
         recorded["priors"].append(dict(core_map=core_map, unknown=unknown, patch_prior=patch_prior, upsampled=upsampled, prior=prior, guide=ctx.guide,

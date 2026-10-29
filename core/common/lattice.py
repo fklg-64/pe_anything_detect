@@ -157,7 +157,8 @@ def detect(image: np.ndarray, region: np.ndarray) -> Optional[Lattice]:
     )
 
 
-def _basis(lattice: Lattice) -> np.ndarray:
+def basis(lattice: Lattice) -> np.ndarray:
+    """格子ベクトルを列に持つ 2x2 行列。格子の係数 (i, j) を入力画像の画素 (x, y) に直す。"""
     return np.array([[lattice.v1[0], lattice.v2[0]], [lattice.v1[1], lattice.v2[1]]], dtype=np.float64)
 
 
@@ -170,8 +171,8 @@ def find_phase(lattice: Lattice, values: np.ndarray, mask: np.ndarray, input_siz
     grid_h, grid_w = values.shape
     ys, xs = np.nonzero(mask)
     points = np.stack([(xs + 0.5) * input_size[1] / grid_w, (ys + 0.5) * input_size[0] / grid_h], axis=1)
-    basis = _basis(lattice)
-    coef = np.linalg.solve(basis, points.T).T
+    grid_basis = basis(lattice)
+    coef = np.linalg.solve(grid_basis, points.T).T
     frac = coef - np.floor(coef)
     bins = np.minimum((frac * LATTICE_PHASE_BINS).astype(int), LATTICE_PHASE_BINS - 1)
     total = np.zeros((LATTICE_PHASE_BINS, LATTICE_PHASE_BINS))
@@ -185,16 +186,16 @@ def find_phase(lattice: Lattice, values: np.ndarray, mask: np.ndarray, input_siz
     for axis_weight in (weight.sum(0), weight.sum(1)):  # 列方向（x）→ 行方向（y）
         angle = np.arctan2((axis_weight * np.sin(2 * np.pi * centres)).sum(), (axis_weight * np.cos(2 * np.pi * centres)).sum())
         centre_frac.append((angle / (2 * np.pi)) % 1.0)
-    return basis @ np.array(centre_frac)
+    return grid_basis @ np.array(centre_frac)
 
 
 def cell_centers(lattice: Lattice, phase: np.ndarray, region: np.ndarray, input_size: Tuple[int, int]) -> np.ndarray:
     """phase を通る格子点のうち、画像の内側で region（bool。任意の大きさ）が真のもの。(N, 2)（入力画像の画素 (x, y)）。"""
     height, width = input_size
-    basis = _basis(lattice)
+    grid_basis = basis(lattice)
     extent = int(np.ceil(max(height, width) / max(np.hypot(*lattice.v1), np.hypot(*lattice.v2)))) + 2
     ii, jj = np.meshgrid(np.arange(-extent, extent + 1), np.arange(-extent, extent + 1))
-    points = phase[None] + (basis @ np.stack([ii.ravel(), jj.ravel()])).T
+    points = phase[None] + (grid_basis @ np.stack([ii.ravel(), jj.ravel()])).T
     inside = (points[:, 0] >= 0) & (points[:, 0] < width) & (points[:, 1] >= 0) & (points[:, 1] < height)
     points = points[inside]
     rows = np.minimum((points[:, 1] / height * region.shape[0]).astype(int), region.shape[0] - 1)

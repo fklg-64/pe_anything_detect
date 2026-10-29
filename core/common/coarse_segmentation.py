@@ -11,7 +11,7 @@ from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_ed
 
 from core.utils import Timer
 from core.common.backend import CLIPBackend
-from core.common.mask_utils import knn_graph, propagate, softmax
+from core.common.mask_utils import knn_graph, patch_structure, propagate, softmax
 from core.common.params import (
     CLIP_LOGIT_SCALE,
     EDGE_PROPAGATION_ALPHA,
@@ -19,7 +19,6 @@ from core.common.params import (
     EDGE_PROPAGATION_NEIGHBORS,
     FAISS_NUM_THREADS,
     KMEANS_SEED,
-    PATCH_NEIGHBORHOOD,
     PROMPT_SYNONYM_DISTANCE,
     PROMPT_TIE_TOLERANCE,
 )
@@ -125,9 +124,13 @@ class CoarseSegmenter:
 
         プロンプト番号は 前景プロンプト -> 背景プロンプト の通し番号。
         """
+        return self._classify_logits(self._prompt_logits(cluster_feature))
+
+    def _classify_logits(self, prompt_logits: np.ndarray) -> Tuple[float, int]:
+        """プロンプトごとのロジット（前景 -> 背景の順）から、(前景確信度, 最も近いプロンプト番号) を返す。"""
         num_foreground_prompts = len(self.foreground_prompts)
 
-        logits = self._prompt_logits(cluster_feature)[None, :]
+        logits = prompt_logits[None, :]
         fg_logits = logits[:, :num_foreground_prompts]
         bg_logits = logits[:, num_foreground_prompts:]
 
@@ -157,8 +160,9 @@ class CoarseSegmenter:
         num_foreground_prompts = len(self.foreground_prompts)
         self.cluster_logits = np.zeros((len(cluster_tokens), num_foreground_prompts), dtype=np.float32)
         for label_idx, cluster_feature in enumerate(cluster_tokens):
-            confidences[label_idx], prompt_indices[label_idx] = self._classify_cluster(cluster_feature)
-            self.cluster_logits[label_idx] = self._prompt_logits(cluster_feature)[:num_foreground_prompts]
+            prompt_logits = self._prompt_logits(cluster_feature)
+            confidences[label_idx], prompt_indices[label_idx] = self._classify_logits(prompt_logits)
+            self.cluster_logits[label_idx] = prompt_logits[:num_foreground_prompts]
         return confidences[cluster_labels], prompt_indices[cluster_labels]
 
     def generate_foreground_map(
@@ -304,9 +308,9 @@ class CoarseSegmenter:
 
         for _, class_id, region in sorted(regions, key=lambda r: r[0]):
             region &= labels == class_id
-            if not region.any() or binary_erosion(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool), border_value=1).any():
+            if not region.any() or binary_erosion(region, structure=patch_structure(), border_value=1).any():
                 continue
-            ring = binary_dilation(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)) & ~region
+            ring = binary_dilation(region, structure=patch_structure()) & ~region
             neighbors = labels[ring & fg]
             neighbors = neighbors[neighbors != class_id]
             if neighbors.size:

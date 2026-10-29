@@ -1,15 +1,13 @@
-from core.openvino.runtime_utils import limit_blas_threads, make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
+from core.openvino.runtime_utils import limit_cpu_threads, make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
 
 from pathlib import Path
 from typing import Tuple
 
-import cv2
 import numpy as np
 
 import openvino as ov
 
 from core.common.edgetam_helper import EdgeTamHelper
-from core.common.params import OPENCV_NUM_THREADS
 
 
 class OVEdgeTamRunner(EdgeTamHelper):
@@ -24,11 +22,8 @@ class OVEdgeTamRunner(EdgeTamHelper):
         self.device = config["device"].upper()
         self.num_threads = config["ov_num_thread"]
 
-        # OpenCVの処理に使用するスレッド数
-        cv2.setNumThreads(OPENCV_NUM_THREADS)
-
-        # NumPyのBLASのスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
-        limit_blas_threads()
+        # OpenCV・NumPy(BLAS)のスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
+        limit_cpu_threads()
 
         # OpenVINOのモデルを読み込み
         self.load_ov_model()

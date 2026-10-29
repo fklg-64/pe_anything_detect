@@ -86,14 +86,14 @@ python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・
 - `image_layout.py`: モデル入力のリサイズモード（config の `resize_mode`: `square`（既定・アスペクト比を無視）/ `fit`（アスペクト比を保ち長辺を image_size、短辺はパッチサイズの倍数）/ `pad`（fit の大きさを下・右に Replication で image_size 四方まで埋め、特徴抽出後にパディング部分を捨てる））。`ImageLayout` が入力画像・パッチ格子・元画像の対応を持つ。**以降のパッチ格子は長方形になりうる**ので、格子の大きさは `feature_size` ではなく `layout.valid_grid`（`CoarseSegmenter.grid`）を使う。プロンプト点・マスクは常に元画像の座標・大きさ。C++ 版（cppsrc/）は未対応（既定の `square` のみ）。格子分離・クラスのまとめ（`semantic_merge.py`）も C++ 版は未追従。
 - `lattice.py` / `lattice_separator.py`: 規則的に並んだ同じ物体（巣・トレイ・ブリスター）の格子の検出（画像の勾配の自己相関。`detect`）と、セルごとの箱プロンプトによる物体の分離（`LatticeSeparator.separate`）。クラス単位のデコードは、隙間が 1 パッチ未満の物体の集まりを 1 つの塊にする（EdgeTAM は点に従い、事前マスクはほとんど効かない）ため。デコーダーが画像サイズ可変なので、特徴を箱の周りの窓（`LATTICE_WINDOW_TOKENS`）で切り出して全セルを一括実行する（80 個で約 95ms）。予測 IoU の下位 4 分位点が 0.5 未満なら何も変えない。定数は `params.py` の `LATTICE_*`。
 - `semantic_merge.py`: 1 つの物体が似たプロンプトの別クラスに割れるのを防ぐ。`merge_near_ties`（PE のクラスタのロジットが僅差 `PROMPT_TIE_TOLERANCE` 以内のプロンプトを、より大きいクラスへ統合）、`merge_synonyms_in_objects`（1 つの連結成分の中の、テキスト埋め込みの距離 `PROMPT_SYNONYM_DISTANCE` 以内のクラスをまとめる。組は `synonym_representatives` で前景プロンプトから作る）。`CoarseSegmenter.generate_foreground_map` の伝播の後で呼ぶ（`tie_tolerance` / `synonym_representative` はインスタンスの属性で、実験で切れる）。
-- `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分（`Component` = 最内点 `peak`・`core`・`region` の NamedTuple）・ノイズ除去などの純粋関数。
-- `params.py`: yaml に出さずコードに固定したハイパーパラメータ（値を変えるときはここだけ編集）。
-- `visualization.py` / `result.py`: 結果の保存・可視化 / `SegmentationResult`。
+- `mask_utils.py`: 点サンプリング（`farthest_point_sampling` 等）・連結成分（`Component` = 最内点 `peak`・`core`・`region` の NamedTuple）・ノイズ除去・パッチ近傍の構造要素（`patch_structure()`）・kNN グラフの伝播などの純粋関数。節ごとに並べてある（型と数値 / 点のサンプリング / 連結成分とマスクの整形 / パッチ格子 <-> 作業解像度 / 伝播）。
+- `params.py`: yaml に出さずコードに固定したハイパーパラメータ・定数（値を変えるときはここだけ編集。NumPy などを import しない定数だけのファイル。`RESIZE_MODES`・EdgeTAM / PE の正規化の平均と標準偏差・ロジットの上限 `EDGETAM_LOGIT_CLIP`・OpenVINO 実行環境の定数もここ）。
+- `visualization.py` / `gallery.py` / `result.py`: 結果の画像の保存（`ResultSaver`。matplotlib の図だけメインスレッドで描き、他の PNG は並行して書く）/ 一覧HTML（`gallery.py`。ひな形は `gallery_template.html`）/ `SegmentationResult`。
 
 backend:
 
 - OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
-  - `core/openvino/runtime_utils.py`: 2 つの backend 共通の準備。**import するだけで `/opt/intel/openvino` を `sys.path` から外す**ので、各 backend ファイルは `import openvino` より前にこれを import する（順序を保つこと）。コンパイル設定 `make_compile_config` と INT8 の接尾辞 `model_file_suffix` もここ。**NumPy の BLAS のスレッド数も 1 に制限する（`limit_blas_threads`）。BLAS の既定（20 スレッド）は、行列積の後もスピン待ちして OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする（処理時間が約 1/1.5 に）。`docs/method_history.md`**
+  - `core/openvino/runtime_utils.py`: 2 つの backend 共通の準備。**import するだけで `/opt/intel/openvino` を `sys.path` から外す**ので、各 backend ファイルは `import openvino` より前にこれを import する（順序を保つこと）。コンパイル設定 `make_compile_config` と INT8 の接尾辞 `model_file_suffix` もここ。各 backend の初期化は `limit_cpu_threads()`（OpenCV と BLAS のスレッド数の制限）を呼ぶ。**NumPy の BLAS のスレッド数は 1 に制限する（`limit_blas_threads`）。BLAS の既定（20 スレッド）は、行列積の後もスピン待ちして OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする（処理時間が約 1/1.5 に）。`docs/method_history.md`**
 - PyTorch（実験用）: `core/torch/feature_extractor.py` の `TorchCLIPProbe`。全層の hidden・attention 出力を取り出し、後半ブロックを attention マスク付きで再実行できる。`tools/experiments/decontam/exp_decontam*.py` が使う。
 - PyTorch（SAM2.1）: `core/torch/sam2_runner.py` の `TorchSam2Backend`。EdgeTAM のクラス（`RepVitModel` / `DecodeModel` / `TorchEdgeTamBackend`）を継承し、モデルの取得だけを公式 SAM2.1 に差し替える（デコーダーの入出力と特徴量の形状が同じなので、`SegmentationRunner(extractor, TorchSam2Backend(config), config)` でそのままつながる）。`core/torch/sam2_official/` は公式 SAM2.1 のコピー（パッケージ名 `sam2_official`、`UPSTREAM.md` 参照）。`core/torch/sam2/` は EdgeTAM の fork で公式とは別物（同名のパッケージは同時に置けない）。
 - PyTorch: `core/torch/feature_extractor.py`（`TorchCLIPBackend`。変換済みモデルと同じグラフ `to_openvino=True` で動かし、出力を ndarray 化）, `edgetam_runner.py`（`TorchEdgeTamBackend`）
@@ -108,7 +108,7 @@ backend:
 4. `assign_semantic_labels`: クラスタに対応するプロンプトで粗いセマンティックラベルを付与
 5. `refine_coarse_segmentation`: 穴埋め・細い領域の統合
 6. `SemanticRefiner.refine`: 前景（クラスごと `edgetam_foreground_points_per_class` 点、既定 4）/ 背景（`edgetam_background_point_count` 点、既定 4）のプロンプト点と、初期マスク（粗いマスクの外側 1 パッチを「不明」にし、128×128 に拡大して入力画像の輝度をガイドにしたガイデッドフィルタで縁を整えたもの）で EdgeTAM の decoder を反復し、クラスを統合し、前景内部の幅 1 パッチ未満の隙間（クラス境界の割れ）を埋める（`mask_utils.fill_narrow_gaps`。encoder は 2 で実行済みなら再実行しない）。最後に、物体が格子状に並んでいれば、セルごとに 1 個ずつに分ける（`LatticeSeparator`。作動は稀で、約 +150ms。判定は毎回 約 6ms）
-7. `run()` では `ResultSaver` が `output_dir/<画像名>/` に可視化を保存
+7. `run()` では `ResultSaver` が `output_dir/<画像名>/` に可視化を保存（`Inference Time` には含まない。matplotlib の図だけメインスレッド、他の PNG はスレッドで並行して書く）
 
 `core/utils.py` に共通ヘルパー（`Timer` コンテキストマネージャー、`load_image`, `resize_image`, `normalize_image`, `preprocess_image`, `load_config`）。各処理は `with Timer(...)` で ms 計測する流儀。
 

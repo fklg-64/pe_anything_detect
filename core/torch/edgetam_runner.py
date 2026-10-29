@@ -13,6 +13,7 @@ from PIL import Image
 import numpy as np
 
 from core.common.edgetam_helper import EdgeTamHelper
+from core.common.params import EDGETAM_LOGIT_CLIP
 from sam2.build_sam import build_sam2
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.modeling.backbones.image_encoder import FpnNeck
@@ -401,7 +402,7 @@ class DecodeModel(BaseModel):
         """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います。"""
         # マスクを元画像の解像度にリサイズ
         # masks = self._transforms.postprocess_masks(low_res_masks, orig_hw)
-        low_res_masks = torch.clamp(low_res_masks, -32.0, 32.0)
+        low_res_masks = torch.clamp(low_res_masks, -EDGETAM_LOGIT_CLIP, EDGETAM_LOGIT_CLIP)
 
         # マスク画像を作成
         masks = low_res_masks > self.mask_threshold

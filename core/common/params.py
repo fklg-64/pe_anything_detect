@@ -2,7 +2,7 @@
 # 固定ハイパーパラメータ
 # yamlでは調整せずコードに固定している値を、すべてここにまとめる。
 # 値を変える場合はこのファイルだけを編集すること（他の箇所に数値を直書きしない）。
-# 可視化の見た目だけに関わる値は visualization.py にある。
+# 結果の画像・一覧HTMLの見た目だけに関わる値は visualization.py / gallery.py にある。
 # =============================================================================
 
 # --- CLIP（粗い前景・セマンティックの判定） ---
@@ -23,6 +23,12 @@ OPENCV_NUM_THREADS = 2
 EDGE_PROPAGATION_ALPHA = 0.8
 EDGE_PROPAGATION_NEIGHBORS = 8
 EDGE_PROPAGATION_ITERATIONS = 3
+
+# --- 画像の正規化（RGB。(画素値/255 - 平均) / 標準偏差） ---
+EDGETAM_MEAN = (0.485, 0.456, 0.406)
+EDGETAM_STD = (0.229, 0.224, 0.225)
+PE_MEAN = (0.5, 0.5, 0.5)
+PE_STD = (0.5, 0.5, 0.5)
 
 # --- モデル入力の大きさ ---
 # EdgeTAM エンコーダの neck は最も粗い特徴（1/32）を 2 倍に拡大して 1/16 の特徴に足すので、入力の辺は 32 の倍数でないと大きさが合わず落ちる。
@@ -58,6 +64,8 @@ PRIOR_NON_CORE_PROBABILITY = 0.5
 GUIDED_FILTER_EPS = 1e-2
 # EdgeTAMのロジットがこの値を超えた画素を前景とする
 MASK_LOGIT_THRESHOLD = 0.0
+# EdgeTAMのデコーダ出力（低解像度ロジット）を、絶対値がこの値以下に収める（外れ値で補間・比較が荒れないように）
+EDGETAM_LOGIT_CLIP = 32.0
 # EdgeTAMのデコーダ出力マスクを縮小する倍率（分母。高さ・幅を 1/N にする）
 EDGETAM_MASK_DOWNSCALE = 8
 

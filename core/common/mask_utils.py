@@ -1,4 +1,4 @@
-"""マスク・座標・点サンプリングの純粋なヘルパー関数（状態を持たない）。"""
+"""マスク・座標・点サンプリング・kNN グラフ上の伝播の、純粋なヘルパー関数（状態を持たない）。"""
 
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -16,12 +16,21 @@ from core.common.params import (
 )
 
 
+# =============================================================================
+# 型と数値のヘルパー
+# =============================================================================
+
 class Component(NamedTuple):
     """マスクの連結成分1つ分（タプルとしても (peak, core, region) の順に取り出せる）。"""
 
     peak: Tuple[int, int]   # 最内点 (x, y)。距離変換が最大の位置
     core: np.ndarray        # 成分を1パッチ内側へ縮めたマスク（縮めると消える細い成分では成分そのもの）
     region: np.ndarray      # 成分のマスク
+
+
+def patch_structure() -> np.ndarray:
+    """パッチ近傍（PATCH_NEIGHBORHOOD 四方）の構造要素。scipy.ndimage の binary_erosion / binary_dilation に渡す。"""
+    return np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)
 
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -141,7 +150,7 @@ def select_background_points(
 
 
 # =============================================================================
-# マスクの解析・整形
+# 連結成分とマスクの整形
 # =============================================================================
 
 def connected_components(mask: np.ndarray) -> List[Component]:
@@ -156,7 +165,7 @@ def connected_components(mask: np.ndarray) -> List[Component]:
         region = comp == i
         edt = distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
         y, x = np.unravel_index(np.argmax(edt), edt.shape)
-        core = binary_erosion(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool), border_value=1)
+        core = binary_erosion(region, structure=patch_structure(), border_value=1)
         result.append(Component((int(x), int(y)), core if core.any() else region, region))
     return result
 
@@ -254,7 +263,7 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
     foreground: 粗い前景マスク（パッチ格子、全クラス）。
     """
     grid_h, grid_w = foreground.shape
-    core = binary_erosion(foreground, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool), border_value=1)
+    core = binary_erosion(foreground, structure=patch_structure(), border_value=1)
     if not core.any():
         return
     # 1 パッチ = GAP_FILL_PIXELS_PER_PATCH 画素に縮小したマスクで、閉処理で埋まる画素（隙間）を求める
@@ -288,7 +297,7 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
 
 
 # =============================================================================
-# パッチ格子 <-> 作業解像度の変換
+# パッチ格子 <-> 作業解像度
 # =============================================================================
 
 def patch_mean(patch_map: np.ndarray) -> np.ndarray:
@@ -299,23 +308,9 @@ def patch_mean(patch_map: np.ndarray) -> np.ndarray:
     )
 
 
-def knn_graph(features: np.ndarray, k: int) -> sparse.csr_matrix:
-    """特徴 (N, C)（L2 正規化済み）のコサイン類似度が上位 k 個の近傍で、対称の kNN グラフを作る（行を正規化した疎行列）。"""
-    n = len(features)
-    similarity = features @ features.T
-    np.fill_diagonal(similarity, -np.inf)
-    neighbors = np.argpartition(similarity, -k, axis=1)[:, -k:]
-    directed = sparse.csr_matrix((np.ones(n * k, dtype=np.float32), (np.repeat(np.arange(n), k), neighbors.ravel())), shape=(n, n))
-    graph = directed.maximum(directed.T)
-    return sparse.diags(1.0 / np.asarray(graph.sum(axis=1)).ravel()) @ graph
-
-
-def propagate(values: np.ndarray, graph: sparse.csr_matrix, alpha: float, iterations: int) -> np.ndarray:
-    """values (N,) をグラフ上で value ← (1-α)·values0 + α·(近傍の平均) と iterations 回伝播する。"""
-    propagated = values.astype(np.float32)
-    for _ in range(iterations):
-        propagated = (1.0 - alpha) * values + alpha * (graph @ propagated)
-    return propagated
+def resize_map(patch_map: np.ndarray, size: Tuple[int, int], interpolation: int) -> np.ndarray:
+    """パッチ格子のマップを size=(幅, 高さ) へ拡大する。"""
+    return cv2.resize(patch_map.astype(np.float32), size, interpolation=interpolation)
 
 
 def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
@@ -335,6 +330,24 @@ def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -
     return box(a) * guide + box(b)
 
 
-def resize_map(patch_map: np.ndarray, size: Tuple[int, int], interpolation: int) -> np.ndarray:
-    """パッチ格子のマップを size=(幅, 高さ) へ拡大する。"""
-    return cv2.resize(patch_map.astype(np.float32), size, interpolation=interpolation)
+# =============================================================================
+# 前景確信度の伝播（kNN グラフ）
+# =============================================================================
+
+def knn_graph(features: np.ndarray, k: int) -> sparse.csr_matrix:
+    """特徴 (N, C)（L2 正規化済み）のコサイン類似度が上位 k 個の近傍で、対称の kNN グラフを作る（行を正規化した疎行列）。"""
+    n = len(features)
+    similarity = features @ features.T
+    np.fill_diagonal(similarity, -np.inf)
+    neighbors = np.argpartition(similarity, -k, axis=1)[:, -k:]
+    directed = sparse.csr_matrix((np.ones(n * k, dtype=np.float32), (np.repeat(np.arange(n), k), neighbors.ravel())), shape=(n, n))
+    graph = directed.maximum(directed.T)
+    return sparse.diags(1.0 / np.asarray(graph.sum(axis=1)).ravel()) @ graph
+
+
+def propagate(values: np.ndarray, graph: sparse.csr_matrix, alpha: float, iterations: int) -> np.ndarray:
+    """values (N,) をグラフ上で value ← (1-α)·values0 + α·(近傍の平均) と iterations 回伝播する。"""
+    propagated = values.astype(np.float32)
+    for _ in range(iterations):
+        propagated = (1.0 - alpha) * values + alpha * (graph @ propagated)
+    return propagated

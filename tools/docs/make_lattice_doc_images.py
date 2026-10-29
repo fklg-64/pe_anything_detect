@@ -124,7 +124,7 @@ def phase_template(lattice: L.Lattice, values: np.ndarray, mask: np.ndarray, inp
     grid_h, grid_w = values.shape
     ys, xs = np.nonzero(mask)
     points = np.stack([(xs + 0.5) * input_size[1] / grid_w, (ys + 0.5) * input_size[0] / grid_h], axis=1)
-    basis = L._basis(lattice)
+    basis = L.basis(lattice)
     coef = np.linalg.solve(basis, points.T).T
     frac = coef - np.floor(coef)
     bins = np.minimum((frac * LATTICE_PHASE_BINS).astype(int), LATTICE_PHASE_BINS - 1)
@@ -145,7 +145,7 @@ def phase_template(lattice: L.Lattice, values: np.ndarray, mask: np.ndarray, inp
 def correct_phase(separator, lattice, phase, region, feats, input_hw):
     """`LatticeSeparator.separate` の位相の補正を再現する（一部のセルをデコードして、重心のずれの中央値で位相を直す）。"""
     half = np.array(L.cell_half_size(lattice))
-    basis = L._basis(lattice)
+    basis = L.basis(lattice)
     centers = L.cell_centers(lattice, phase, region, input_hw)
     probes = centers[np.linspace(0, len(centers) - 1, min(len(centers), LATTICE_PHASE_PROBES)).astype(int)]
     low, scores, origins = separator._decode(feats, probes, half)
@@ -627,7 +627,7 @@ def main() -> None:
 
     # ---- セルの中心と箱 ---------------------------------------------------------
     all_points = L.cell_centers(lattice, phase1, np.ones((8, 8), bool), input_hw)
-    basis = L._basis(lattice)
+    basis = L.basis(lattice)
     coef = np.linalg.solve(basis, (centers - phase1).T).T
     nx, ny = len(np.unique(np.round(coef[:, 0]))), len(np.unique(np.round(coef[:, 1])))
     fig_cells(dict(content=content, centers=centers, all_points=all_points, half=L.cell_half_size(lattice), nx=nx, ny=ny,

@@ -1,9 +1,19 @@
-"""CLIPによる粗い推定 -> EdgeTAMによる精緻化 の全体の流れ（画像1枚分）をつなぐ。"""
+"""CLIPによる粗い推定 -> EdgeTAMによる精緻化 の全体の流れ（画像1枚分）をつなぐ。
+
+処理の流れ（SegmentationRunner.segment。各段階の詳細は docs/overview.md）:
+  1. 前処理               リサイズ（ImageLayout）と正規化
+  2. EdgeTAM エンコーダ   use_edgetam_clustering のとき、粗い判定の前に 1 回だけ実行（精緻化でも使う）
+  3. CLIP（PE）の特徴量   パッチ特徴・fused パッチ特徴
+  4. 粗い前景/クラスタ    CoarseSegmenter.generate_foreground_map（KMeans + テキスト照合 + EdgeTAM 特徴での伝播 + クラスのまとめ）
+  5. 粗いセマンティック   assign_semantic_labels -> refine_coarse_segmentation（パッチ単位）
+  6. 精緻化               SemanticRefiner.refine（クラスごとに EdgeTAM デコーダ -> 1 枚のセマンティックマップ）
+結果の保存は run() / ResultSaver（segment には含まれない）。
+"""
 
 import time
 import shutil
 from pathlib import Path
-from typing import Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 
@@ -11,11 +21,12 @@ from core.utils import Timer, load_image, normalize_image
 from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
-from core.common.image_layout import make_layout
+from core.common.image_layout import ImageLayout, make_layout
 from core.common.params import RESIZE_MODES
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
-from core.common.visualization import ORIGINAL_STEM, ResultSaver, write_gallery_html
+from core.common.gallery import ORIGINAL_STEM, write_gallery_html
+from core.common.visualization import ResultSaver
 
 
 class SegmentationRunner:
@@ -56,38 +67,11 @@ class SegmentationRunner:
         # 計測開始
         start = time.time()
 
-        # 画像前処理
-        with Timer("画像前処理時間"):
-            # リサイズ（パディング込み）はCLIPとEdgeTAMで共通（正規化だけがモデルごとに異なる）
-            layout = make_layout((height, width), self.extractor.target_size, int(self.extractor.patch_size), self.resize_mode)
-            resized = layout.apply(image_raw)
-            image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
-            # 以降のパッチ格子は、パディングを除いた（元画像の全体を覆う）領域
-            self.coarse.grid = layout.valid_grid
-
-        # EdgeTAMの特徴量抽出（粗い判定で EdgeTAM の特徴を使うときは、ここで 1 回だけ実行して精緻化にも渡す）
-        edgetam_features = None
-        if self.use_edgetam_clustering:
-            with Timer("EdgeTAM特徴量抽出処理時間"):
-                edgetam_features = layout.crop_edgetam(self.refiner.predict_encoder(resized))
-
-        # 特徴量抽出
-        with Timer("特徴量抽出処理時間"):
-            _, patch_features, fused_patch_features = self.coarse.extract_features(image_tensor)
-            # パディング部分のトークンは捨てる
-            patch_features, fused_patch_features = layout.crop_tokens(patch_features), layout.crop_tokens(fused_patch_features)
-
-        # CLIP + KMeans による初期前景マップの推定
-        with Timer("粗い前景マスク取得処理時間"):
-            if edgetam_features is None:
-                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
-            else:
-                edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
-                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features, edgetam_image_embed)
-            # 4 要素のタプルを返す差し替え実装（tools）でも動くよう、名前付きにそろえる
-            coarse_foreground = CoarseForeground(*generated)
-            foreground_map, foreground_mask = coarse_foreground.foreground_map, coarse_foreground.foreground_mask
-            cluster_labels, cluster_index_list = coarse_foreground.cluster_labels, coarse_foreground.cluster_index_list
+        layout, resized, image_tensor = self._preprocess(image_raw)
+        edgetam_features = self._encode_edgetam(layout, resized)
+        patch_features, fused_patch_features = self._extract_clip_features(layout, image_tensor)
+        coarse_foreground = self._estimate_coarse_foreground(patch_features, fused_patch_features, edgetam_features)
+        cluster_labels, cluster_index_list = coarse_foreground.cluster_labels, coarse_foreground.cluster_index_list
 
         # セマンティックセグメンテーションのラベルを取得
         with Timer("セマンティックセグメンテーション処理時間"):
@@ -96,12 +80,15 @@ class SegmentationRunner:
         # パッチ単位の粗い結果を整形（穴埋め・小さな島の統合・境界パッチのラベル統一）
         with Timer("粗いセグメンテーション整形処理時間"):
             raw_semantic_labels = semantic_labels
-            foreground_mask, semantic_labels = self.coarse.refine_coarse_segmentation(semantic_labels, foreground_mask)
+            foreground_mask, semantic_labels = self.coarse.refine_coarse_segmentation(
+                semantic_labels, coarse_foreground.foreground_mask
+            )
 
         # 粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             refined = self.refiner.refine(
-                resized, foreground_map, foreground_mask, semantic_labels, labels_list, width, height, edgetam_features, layout
+                resized, coarse_foreground.foreground_map, foreground_mask, semantic_labels, labels_list, width, height,
+                edgetam_features, layout,
             )
 
         elapsed_time = time.time() - start
@@ -112,7 +99,7 @@ class SegmentationRunner:
             prompt_indices=refined.prompt_indices,
             point_coords=refined.point_coords,
             point_labels=refined.point_labels,
-            foreground_map=foreground_map,
+            foreground_map=coarse_foreground.foreground_map,
             foreground_mask=foreground_mask,
             cluster_labels=cluster_labels,
             raw_semantic_labels=raw_semantic_labels,
@@ -121,6 +108,48 @@ class SegmentationRunner:
             pe_clusters=coarse_foreground.pe_clusters,
             debug_images=refined.debug_images,
         )
+
+    # -------------------------------------------------------------------------
+    # segment の各段階
+    # -------------------------------------------------------------------------
+
+    def _preprocess(self, image_raw: np.ndarray) -> Tuple[ImageLayout, np.ndarray, np.ndarray]:
+        """リサイズと正規化。(レイアウト, リサイズ済み画像（正規化前）, CLIP の入力テンソル) を返す。"""
+        height, width = image_raw.shape[:2]
+        with Timer("画像前処理時間"):
+            # リサイズ（パディング込み）はCLIPとEdgeTAMで共通（正規化だけがモデルごとに異なる）
+            layout = make_layout((height, width), self.extractor.target_size, int(self.extractor.patch_size), self.resize_mode)
+            resized = layout.apply(image_raw)
+            image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
+            # 以降のパッチ格子は、パディングを除いた（元画像の全体を覆う）領域
+            self.coarse.grid = layout.valid_grid
+        return layout, resized, image_tensor
+
+    def _encode_edgetam(self, layout: ImageLayout, resized: np.ndarray) -> Optional[Tuple]:
+        """EdgeTAMの特徴量抽出。粗い判定で EdgeTAM の特徴を使うときだけ、ここで 1 回実行して精緻化にも渡す（使わなければ None）。"""
+        if not self.use_edgetam_clustering:
+            return None
+        with Timer("EdgeTAM特徴量抽出処理時間"):
+            return layout.crop_edgetam(self.refiner.predict_encoder(resized))
+
+    def _extract_clip_features(self, layout: ImageLayout, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """CLIP（PE）のパッチ特徴と fused パッチ特徴（パディング部分のトークンは捨てる）。"""
+        with Timer("特徴量抽出処理時間"):
+            _, patch_features, fused_patch_features = self.coarse.extract_features(image_tensor)
+            return layout.crop_tokens(patch_features), layout.crop_tokens(fused_patch_features)
+
+    def _estimate_coarse_foreground(
+        self, patch_features: np.ndarray, fused_patch_features: np.ndarray, edgetam_features: Optional[Tuple]
+    ) -> CoarseForeground:
+        """CLIP + KMeans による初期前景マップの推定（EdgeTAM の特徴があれば、前景確信度の伝播も行う）。"""
+        with Timer("粗い前景マスク取得処理時間"):
+            if edgetam_features is None:
+                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
+            else:
+                edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
+                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features, edgetam_image_embed)
+            # 4 要素のタプルを返す差し替え実装（tools）でも動くよう、名前付きにそろえる
+            return CoarseForeground(*generated)
 
     def _save_name(self, image_path: Path) -> str:
         """保存先のフォルダ名。画像名が別の画像と重なるときは 親フォルダ名_ファイル名 にする。"""

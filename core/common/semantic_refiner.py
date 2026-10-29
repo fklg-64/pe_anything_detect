@@ -19,6 +19,7 @@ from core.common.mask_utils import (
     fill_narrow_gaps,
     guided_filter,
     patch_mean,
+    patch_structure,
     prompt_points,
     remove_small_regions,
     resize_map,
@@ -31,7 +32,6 @@ from core.common.params import (
     MASK_LOGIT_THRESHOLD,
     MIN_ISOLATED_PATCHES,
     MIN_REGION_PATCH_AREA,
-    PATCH_NEIGHBORHOOD,
     PRIOR_LOGIT_RANGE,
     PRIOR_NON_CORE_PROBABILITY,
     SCORE_PRIOR_WEIGHT,
@@ -123,13 +123,7 @@ class SemanticRefiner:
         if len(semantic_ids) == 0:
             return RefineOutput(np.zeros((height, width), dtype=np.uint8), prompt_indices, [], [], {})
 
-        # マスク演算は長辺が semantic_max_side 以下の作業解像度で行い、最後に元画像サイズへ戻す
-        scale = min(1.0, self.semantic_max_side / max(width, height))
-        work_w, work_h = max(1, round(width * scale)), max(1, round(height * scale))
-
-        grid = (self.feature_size, self.feature_size) if layout is None else layout.valid_grid
         content = resized if layout is None else layout.content(resized)
-        input_hw = content.shape[:2]
 
         # EdgeTAMの特徴量抽出（全クラス共通）
         if feats is None:
@@ -138,12 +132,43 @@ class SemanticRefiner:
                 if layout is not None:
                     feats = layout.crop_edgetam(feats)
 
+        ctx = self._make_context(content, feats, foreground_map, foreground_binary, width, height, layout)
+
+        # クラスごとに推定し、どのクラスにも入らなかった粗い連結成分は単独で再推定する
+        class_components = self._refine_classes(ctx, semantic_ids, semantic_labels, foreground_binary)
+        self._rescue_uncovered(ctx, class_components)
+        ctx.debug_images["semantic_map_before_cleanup"] = ctx.semantic_map / max(len(semantic_ids), 1)
+
+        # 重ね合わせ後のノイズ除去
+        remove_small_regions(ctx.semantic_map, ctx.min_area)
+        # クラス境界の割れ（前景の内部の細い隙間）を埋める
+        fill_narrow_gaps(ctx.semantic_map, foreground_binary)
+        # 格子状に並んだ小物体（隙間が 1 パッチ未満で、1 つの塊になる）を、セルごとに 1 個ずつに分ける
+        self._separate_lattice(ctx, content, feats)
+
+        return RefineOutput(self._to_image_size(ctx), prompt_indices, ctx.point_coords, ctx.point_labels, ctx.debug_images)
+
+    def _make_context(
+        self,
+        content: np.ndarray,
+        feats: Tuple,
+        foreground_map: np.ndarray,
+        foreground_binary: np.ndarray,
+        width: int,
+        height: int,
+        layout: Optional[ImageLayout],
+    ) -> RefineContext:
+        """全クラス共通の入力（背景の負例点・ガイド・作業解像度など）と、空の結果を持つ RefineContext を作る。"""
+        # マスク演算は長辺が semantic_max_side 以下の作業解像度で行い、最後に元画像サイズへ戻す
+        scale = min(1.0, self.semantic_max_side / max(width, height))
+        work_w, work_h = max(1, round(width * scale)), max(1, round(height * scale))
+        grid = (self.feature_size, self.feature_size) if layout is None else layout.valid_grid
+
         # 背景の負例点は全クラス共通
         background_coords = self.transform_coords(
             select_background_points(foreground_binary, self.background_point_count, foreground_map).tolist(), width, height, grid
         )
-
-        ctx = RefineContext(
+        return RefineContext(
             feats=feats,
             background_coords=background_coords,
             foreground_map=foreground_map,
@@ -154,33 +179,27 @@ class SemanticRefiner:
             min_area=max(1, int(MIN_REGION_PATCH_AREA * work_w * work_h / (grid[0] * grid[1]))),
             guide=self._make_guide(content),
             grid=grid,
-            input_hw=input_hw,
+            input_hw=content.shape[:2],
             semantic_map=np.zeros((work_h, work_w), dtype=np.uint8),
             best_score=np.full((work_h, work_w), -1.0, dtype=np.float32),
         )
 
-        class_components = self._refine_classes(ctx, semantic_ids, semantic_labels, foreground_binary)
-        self._rescue_uncovered(ctx, class_components)
+    def _separate_lattice(self, ctx: RefineContext, content: np.ndarray, feats: Tuple) -> None:
+        """格子状に並んだ物体があれば、semantic_map（in-place）をセルごとの物体に分ける（作動は稀）。"""
+        if not ctx.logits:
+            return
+        lattice = self.lattice_separator.separate(
+            ctx.semantic_map, content, np.maximum.reduce(ctx.logits), feats, ctx.foreground_map
+        )
+        if lattice is not None:
+            ctx.debug_images["lattice_instances"] = (lattice["instance_logit"] > 0).astype(np.float32)
 
-        ctx.debug_images["semantic_map_before_cleanup"] = ctx.semantic_map / max(len(semantic_ids), 1)
-
-        # 重ね合わせ後のノイズ除去
-        remove_small_regions(ctx.semantic_map, ctx.min_area)
-        # クラス境界の割れ（前景の内部の細い隙間）を埋める
-        fill_narrow_gaps(ctx.semantic_map, foreground_binary)
-        # 格子状に並んだ小物体（隙間が 1 パッチ未満で、1 つの塊になる）を、セルごとに 1 個ずつに分ける
-        if ctx.logits:
-            lattice = self.lattice_separator.separate(
-                ctx.semantic_map, content, np.maximum.reduce(ctx.logits), feats, foreground_map
-            )
-            if lattice is not None:
-                ctx.debug_images["lattice_instances"] = (lattice["instance_logit"] > 0).astype(np.float32)
-
-        semantic_map = ctx.semantic_map
-        if (work_w, work_h) != (width, height):
-            semantic_map = cv2.resize(semantic_map, (width, height), interpolation=cv2.INTER_NEAREST)
-
-        return RefineOutput(semantic_map, prompt_indices, ctx.point_coords, ctx.point_labels, ctx.debug_images)
+    @staticmethod
+    def _to_image_size(ctx: RefineContext) -> np.ndarray:
+        """作業解像度のセマンティックマップを、元画像の大きさへ戻す（同じ大きさならそのまま）。"""
+        if ctx.size == (ctx.width, ctx.height):
+            return ctx.semantic_map
+        return cv2.resize(ctx.semantic_map, (ctx.width, ctx.height), interpolation=cv2.INTER_NEAREST)
 
     def _high_res_size(self, input_hw: Tuple[int, int]) -> Tuple[int, int]:
         """EdgeTAMの高解像度特徴量の大きさ (幅, 高さ)。cv2.resize に渡す向き。"""
@@ -238,7 +257,7 @@ class SemanticRefiner:
                 binary, _, _ = self._refine_region(ctx, region, [component], f"クラス{class_id}(再推定)")
                 if region.sum() < MIN_ISOLATED_PATCHES:
                     # 極小成分は、成分を1パッチ広げた範囲までに制限する
-                    allowed = binary_dilation(region, structure=np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool))
+                    allowed = binary_dilation(region, structure=patch_structure())
                     binary &= resize_map(allowed, ctx.size, cv2.INTER_NEAREST) > 0
                 ctx.semantic_map[binary & (ctx.semantic_map == 0)] = class_id
                 ctx.debug_images[f"c{class_id}_rescue_{peak[0]}_{peak[1]}"] = binary
@@ -293,7 +312,7 @@ class SemanticRefiner:
         coarse_map: coarse_mask のパッチ近傍平均（patch_mean）。
         """
         core_map = patch_mean(core)
-        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)).astype(np.float32))
+        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, patch_structure()).astype(np.float32))
         prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
         upsampled = cv2.resize(prior_map, self._high_res_size(ctx.input_hw), interpolation=cv2.INTER_LINEAR)
         return np.clip(guided_filter(ctx.guide, upsampled, self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)

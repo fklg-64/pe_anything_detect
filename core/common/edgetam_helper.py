@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from core.common.params import EDGETAM_LOGIT_CLIP, EDGETAM_MEAN, EDGETAM_STD, MASK_LOGIT_THRESHOLD
+
 
 class EdgeTamHelper:
     """EdgeTAMの入出力の前後処理（NumPy）。backend（OpenVINO / PyTorch）に依存しない。"""
@@ -11,11 +13,11 @@ class EdgeTamHelper:
         self.target_size = config["image_size"]
 
         # マスク閾値
-        self.mask_threshold = 0.0
+        self.mask_threshold = MASK_LOGIT_THRESHOLD
 
         # 画像の正規化に使用する変数
-        self.mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
-        self.std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        self.mean = np.array(EDGETAM_MEAN).reshape(3, 1, 1)
+        self.std = np.array(EDGETAM_STD).reshape(3, 1, 1)
 
     def transform_coords(
         self,
@@ -167,7 +169,7 @@ class EdgeTamHelper:
             masks = masks > self.mask_threshold
             # 不要なバッチ次元を削除して float 型へキャスト
             masks = np.squeeze(masks, axis=0).astype(np.float32)
-        low_res_masks = np.clip(low_res_masks, -32.0, 32.0)
+        low_res_masks = np.clip(low_res_masks, -EDGETAM_LOGIT_CLIP, EDGETAM_LOGIT_CLIP)
         iou_predictions = np.squeeze(iou_predictions, axis=0).astype(np.float32)
         low_res_masks = np.squeeze(low_res_masks, axis=0)
 

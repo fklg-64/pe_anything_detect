@@ -15,6 +15,7 @@ from core.utils import Timer
 from core.common import lattice as lattice_utils
 from core.common.backend import EdgeTamBackend
 from core.common.params import (
+    EDGETAM_LOGIT_CLIP,
     LATTICE_EMBED_STRIDE,
     LATTICE_FEATS0_STRIDE,
     LATTICE_FEATS1_STRIDE,
@@ -57,24 +58,12 @@ class LatticeSeparator:
             return None
 
         input_hw = content.shape[:2]
-        phase = lattice_utils.find_phase(lattice, logit, mask, input_hw)
         half = np.array(lattice_utils.cell_half_size(lattice))
-        basis = np.array([[lattice.v1[0], lattice.v2[0]], [lattice.v1[1], lattice.v2[1]]], dtype=np.float64)
-
-        # 位相は、一部のセルのデコード結果の重心で直す（箱プロンプトのデコード結果は物体の中心に寄る）
+        phase = lattice_utils.find_phase(lattice, logit, mask, input_hw)
         centers = lattice_utils.cell_centers(lattice, phase, region, input_hw)
         if len(centers) == 0:
             return None
-        probes = centers[np.linspace(0, len(centers) - 1, min(len(centers), LATTICE_PHASE_PROBES)).astype(int)]
-        with Timer("    ┌ 格子の位相の補正"):
-            low, scores, origins = self._decode(feats, probes, half)
-        centroids = self._centroids(low, scores, origins)
-        found = ~np.isnan(centroids[:, 0])
-        if found.sum() >= 3:
-            offset = np.linalg.solve(basis, (centroids[found] - probes[found]).T).T
-            offset -= np.round(offset)
-            phase = phase + np.median(offset, axis=0) @ basis.T
-            centers = lattice_utils.cell_centers(lattice, phase, region, input_hw)
+        centers = self._correct_phase(feats, lattice, phase, centers, region, half, input_hw)
 
         with Timer("    ┌ 格子のセルごとのデコード"):
             low, scores, origins = self._decode(feats, centers, half)
@@ -86,6 +75,34 @@ class LatticeSeparator:
         instance_logit, owner = self._compose(low, scores, origins, input_hw, semantic_map.shape, confidence >= LATTICE_MIN_PREDICTED_IOU)
         self._apply(semantic_map, instance_logit, owner, centers, half, input_hw, foreground_map)
         return {"instance_logit": instance_logit, "centers": centers, "lattice": lattice}
+
+    def _correct_phase(
+        self,
+        feats: Tuple[np.ndarray, np.ndarray, np.ndarray],
+        lattice: lattice_utils.Lattice,
+        phase: np.ndarray,
+        centers: np.ndarray,
+        region: np.ndarray,
+        half: np.ndarray,
+        input_hw: Tuple[int, int],
+    ) -> np.ndarray:
+        """格子の位相を、一部のセルのデコード結果の重心で直して、セルの中心 (N, 2) を作り直す。
+
+        箱プロンプトのデコード結果は物体の中心に寄るので、等間隔に選んだ LATTICE_PHASE_PROBES 個以内のセルをデコードし、
+        重心とのずれ（格子の係数で、±0.5 周期に畳んだ中央値）を位相に足す。重心が 3 個未満しか求まらなければ直さない。
+        """
+        probes = centers[np.linspace(0, len(centers) - 1, min(len(centers), LATTICE_PHASE_PROBES)).astype(int)]
+        with Timer("    ┌ 格子の位相の補正"):
+            low, scores, origins = self._decode(feats, probes, half)
+        centroids = self._centroids(low, scores, origins)
+        found = ~np.isnan(centroids[:, 0])
+        if found.sum() < 3:
+            return centers
+        grid_basis = lattice_utils.basis(lattice)
+        offset = np.linalg.solve(grid_basis, (centroids[found] - probes[found]).T).T
+        offset -= np.round(offset)
+        phase = phase + np.median(offset, axis=0) @ grid_basis.T
+        return lattice_utils.cell_centers(lattice, phase, region, input_hw)
 
     # =========================================================================
     # セルごとのデコード
@@ -119,7 +136,7 @@ class LatticeSeparator:
             np.array(coords, np.float32), np.tile(np.array([[2, 3]], np.int32), (n, 1)),  # ラベル 2・3 = 箱の左上・右下
             np.zeros((n, 1, side, side), np.float32), np.zeros((n,), np.float32),
         )
-        return np.clip(low, -32.0, 32.0), scores, np.array(origins, np.float64)
+        return np.clip(low, -EDGETAM_LOGIT_CLIP, EDGETAM_LOGIT_CLIP), scores, np.array(origins, np.float64)
 
     @staticmethod
     def _best(low: np.ndarray, scores: np.ndarray) -> np.ndarray:
@@ -143,7 +160,7 @@ class LatticeSeparator:
         best = self._best(low, scores)
         height, width = size
         scale_x, scale_y = width / input_hw[1], height / input_hw[0]
-        logit = np.full((height, width), -32.0, np.float32)
+        logit = np.full((height, width), -EDGETAM_LOGIT_CLIP, np.float32)
         owner = np.full((height, width), -1, np.int32)
         window = best.shape[-1] * LATTICE_MASK_STRIDE  # 窓の一辺（入力画像の画素）
         win_w, win_h = max(1, round(window * scale_x)), max(1, round(window * scale_y))

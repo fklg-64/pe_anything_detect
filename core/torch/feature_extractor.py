@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from open_clip.model import CustomTextCLIP
 
-from core.common.params import PE_NUM_BLOCKS
+from core.common.params import PE_MEAN, PE_NUM_BLOCKS, PE_STD
 
 # monkey_patch は import した時点で timm 側へのパッチ（動的な画像サイズ対応）が適用される。モデル生成より前に import すること
 from core.torch.monkey_patch import (
@@ -103,8 +103,8 @@ class TorchCLIPBackend(TorchCLIPFeatureExtractor):
 
         # 画像の正規化に使用する変数（OVCLIPFeatureExtractorと同じ）
         self.target_size = self.force_image_size
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.mean = np.array(PE_MEAN).reshape(3, 1, 1)
+        self.std = np.array(PE_STD).reshape(3, 1, 1)
 
     @staticmethod
     def _to_numpy(x: torch.Tensor) -> np.ndarray:
@@ -144,8 +144,8 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
 
         # 画像の正規化に使用する変数（OVCLIPFeatureExtractorと同じ）
         self.target_size = self.force_image_size
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.mean = np.array(PE_MEAN).reshape(3, 1, 1)
+        self.std = np.array(PE_STD).reshape(3, 1, 1)
 
     def _tensor(self, x: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(x)).to(device=self.device, dtype=torch.float32)
