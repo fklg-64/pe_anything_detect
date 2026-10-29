@@ -64,6 +64,8 @@ class LatticeSeparator:
         if len(centers) == 0:
             return None
         centers = self._correct_phase(feats, lattice, phase, centers, region, half, input_hw)
+        if len(centers) == 0:
+            return None
 
         with Timer("    ┌ 格子のセルごとのデコード"):
             low, scores, origins = self._decode(feats, centers, half)

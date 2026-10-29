@@ -25,6 +25,12 @@ from core.common.mask_utils import (
     resize_map,
     select_background_points,
 )
+from core.common.object_points import (
+    background_features,
+    normalize_features,
+    object_prompt_points,
+    objectness_map,
+)
 from core.common.params import (
     EDGETAM_HIGH_RES_FEATURE_DOWNSCALE,
     EDGETAM_MASK_DOWNSCALE,
@@ -53,6 +59,8 @@ class RefineContext:
     guide: np.ndarray                      # 初期マスクの縁を整えるガイド（入力画像の輝度。EdgeTAMの高解像度特徴量と同じ大きさ、float32、0〜1）
     grid: Tuple[int, int]                  # パッチ格子 (高さ, 幅)。画像の全体を覆う（パディングは含まない）
     input_hw: Tuple[int, int]              # モデルに入力した画像の内容の大きさ (高さ, 幅)。プロンプト点の座標変換に使う
+    normalized_feats: Optional[List[np.ndarray]]      # EdgeTAMの特徴量3層を画素ごとにL2正規化したもの。前景の点を物体の上に選ぶのに使う（object_points.py）
+    background_means: Optional[List[np.ndarray]]      # 上の各層の、背景の特徴の平均（全クラス共通）。作れなければ None
 
     # 結果（段階ごとに更新する）
     semantic_map: np.ndarray               # 作業解像度。0=背景、1~=前景クラス
@@ -85,6 +93,8 @@ class SemanticRefiner:
         self.lattice_separator = LatticeSeparator(edgetam, config["foreground_threshold"])
         # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
         self.guide_radius: int = max(1, (edgetam.target_size // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE) // feature_size)
+        # 前景の点を、EdgeTAM の高解像度特徴量の画素から物体の上に選ぶ（object_points.py）。False なら従来どおりパッチの中心（実験で切れる）
+        self.use_object_points = True
 
     # =========================================================================
     # メインの流れ
@@ -164,6 +174,10 @@ class SemanticRefiner:
         work_w, work_h = max(1, round(width * scale)), max(1, round(height * scale))
         grid = (self.feature_size, self.feature_size) if layout is None else layout.valid_grid
 
+        # 前景の点を物体の上に選ぶための、正規化した特徴量と背景の特徴（全クラス共通なので、画像に 1 回だけ求める）
+        normalized_feats = normalize_features(feats) if self.use_object_points else None
+        background_means = None if normalized_feats is None else background_features(normalized_feats, foreground_binary)
+
         # 背景の負例点は全クラス共通
         background_coords = self.transform_coords(
             select_background_points(foreground_binary, self.background_point_count, foreground_map).tolist(), width, height, grid
@@ -180,6 +194,8 @@ class SemanticRefiner:
             guide=self._make_guide(content),
             grid=grid,
             input_hw=content.shape[:2],
+            normalized_feats=normalized_feats,
+            background_means=background_means,
             semantic_map=np.zeros((work_h, work_w), dtype=np.uint8),
             best_score=np.full((work_h, work_w), -1.0, dtype=np.float32),
         )
@@ -275,7 +291,7 @@ class SemanticRefiner:
         coarse_map = patch_mean(coarse_mask)
         prior_map = self._build_prior_map(ctx, coarse_mask, coarse_map, core)
 
-        fg_points = prompt_points(core, [c.peak for c in comps], self.foreground_points_per_class)
+        fg_points = self._foreground_points(ctx, coarse_mask, comps, core)
         logit, coords, labels = self._estimate_class_logit(
             ctx.feats, prior_map, fg_points, ctx.background_coords, ctx.width, ctx.height, tag, ctx.grid, ctx.input_hw
         )
@@ -298,6 +314,19 @@ class SemanticRefiner:
         prior_low = cv2.resize(coarse_foreground_score, confidence.shape[::-1], interpolation=cv2.INTER_LINEAR)
         score = confidence * ((1.0 - SCORE_PRIOR_WEIGHT) + SCORE_PRIOR_WEIGHT * prior_low)
         return binary, resize_map(score, ctx.size, cv2.INTER_LINEAR), core
+
+    def _foreground_points(self, ctx: RefineContext, coarse_mask: np.ndarray, comps: List[Component], core: np.ndarray) -> np.ndarray:
+        """クラスの正例点（パッチ座標）。EdgeTAM の高解像度特徴量で物体らしさを求め、粗いマスクの縁も含めて物体の上の画素から選ぶ。
+
+        背景の特徴が作れないとき（前景が画像の全体など）は、従来どおり core 上のパッチの中心から選ぶ。
+        """
+        peaks = [c.peak for c in comps]
+        score = None
+        if ctx.background_means is not None:
+            score = objectness_map(ctx.normalized_feats, ctx.background_means, core)
+        if score is None:
+            return prompt_points(core, peaks, self.foreground_points_per_class)
+        return object_prompt_points(score, coarse_mask, peaks, self.foreground_points_per_class, ctx.grid)
 
     def _build_prior_map(
         self, ctx: RefineContext, coarse_mask: np.ndarray, coarse_map: np.ndarray, core: np.ndarray
