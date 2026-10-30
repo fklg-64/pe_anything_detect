@@ -100,7 +100,7 @@ sequenceDiagram
 |---|---|---|
 | 学習なしで物体の種類を知りたい | EdgeTAM は「点を置いた物体」を切り出すだけで、種類は分からない | PE（CLIP 系）が画像とテキストを比べて、種類と場所を決める |
 | 輪郭を画素単位で正確にしたい | PE の特徴は 16px = 1 パッチ。32×32 の格子では輪郭が荒く、縁・影で太る | EdgeTAM が画像を見て輪郭を決める |
-| EdgeTAM に点を置く場所が要る | 点を自動で決める手がかりが無い | PE の粗い結果の「内側」に正例点、「遠い背景」に負例点を置く |
+| EdgeTAM に点を置く場所が要る | 点を自動で決める手がかりが無い | PE の粗い結果の「内側」と、EdgeTAM の特徴で物体らしいと分かる画素に正例点、「遠い背景」に負例点を置く |
 | 速く動かしたい | 画像全体を重いモデルで画素単位に判定すると遅い | 粗い段階は 8 クラスタを 8 回判定するだけ。EdgeTAM はエンコーダ 1 回 + クラスごとに軽いデコーダ |
 
 **粗い結果は「正解」ではなく「ヒント」** として渡す。内側は確実、縁は不明として扱うので、粗い段階の太りや欠けを引き継がない（[detailed_segmentation.md](detailed_segmentation.md)）。
@@ -166,6 +166,7 @@ NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runti
 
 ```bash
 python tools/docs/make_doc_images.py [--image PATH] [--prefix coin]   # docs/images/ に JPEG で出力（幅 1200px 以下）
+python tools/docs/make_points_doc_images.py                             # 前景点の選び方の比較図（points_toothbrush.jpg。MVTec の toothbrush で従来 / 現在）
 ```
 
 本体の `segment` と同じ処理を段階ごとに呼び、中間結果を画像にする（最後に `semantic_map` が本体と一致することを確かめる）。
