@@ -141,3 +141,7 @@ BLAS_NUM_THREADS = 1
 # --- 画像の読み込み ---
 # データセット定義yamlのディレクトリを探索するときに画像とみなす拡張子
 IMAGE_EXTENSIONS = {".png", ".jpg", ".bmp"}
+
+# --- 重みの自動ダウンロード ---
+# edgetam_model_path に重みが無いときの取得先（Hugging Face の公式配布）
+EDGETAM_WEIGHTS_URL = "https://huggingface.co/facebook/EdgeTAM/resolve/main/edgetam.pt"

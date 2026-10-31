@@ -13,7 +13,7 @@ from PIL import Image
 import numpy as np
 
 from core.common.edgetam_helper import EdgeTamHelper
-from core.common.params import EDGETAM_LOGIT_CLIP
+from core.common.params import EDGETAM_LOGIT_CLIP, EDGETAM_WEIGHTS_URL
 from sam2.build_sam import build_sam2
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.modeling.backbones.image_encoder import FpnNeck
@@ -21,6 +21,23 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.utils.transforms import SAM2Transforms
 
 from timm.models.repvit import RepVit
+
+
+def ensure_edgetam_weights(checkpoint_path) -> Path:
+    """重みが checkpoint_path に無ければ、そのパスへダウンロードする（途中で失敗しても壊れたファイルを残さない）"""
+    path = Path(checkpoint_path)
+    if path.exists():
+        return path
+    import urllib.request
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    print(f"EdgeTAM の重みが見つからないためダウンロードします: {EDGETAM_WEIGHTS_URL} -> {path}")
+    try:
+        urllib.request.urlretrieve(EDGETAM_WEIGHTS_URL, tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
 
 # ベースとした実装（使わない）
 class EdgeTAMPredictor:
@@ -34,6 +51,7 @@ class EdgeTAMPredictor:
         self.dtype = getattr(torch, config["dtype"])
 
         # モデルとPredictorの構築
+        ensure_edgetam_weights(self.checkpoint_path)
         sam_model = build_sam2(self.config_path, self.checkpoint_path, device=self.device)
         self.predictor = SAM2ImagePredictor(sam_model)
 
@@ -150,6 +168,7 @@ class EdgeTamModel:
     @classmethod
     def get_model(cls, config_path, checkpoint_path, device="cpu") -> Tuple[SAM2Base, SAM2Transforms]:
         if cls._sam_model is None:
+            ensure_edgetam_weights(checkpoint_path)
             cls._sam_model: SAM2Base = build_sam2(config_path, checkpoint_path, device=device)
         if cls._transforms is None:
             # 閾値
