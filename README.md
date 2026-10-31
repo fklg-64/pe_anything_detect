@@ -6,6 +6,14 @@
 
 ## 使い方
 
+### データセットの用意
+
+1. データセットを用意する
+
+2. `configs/dataset.sample.yaml`をコピーして`configs/dataset.yaml`にファイル名を変更する
+
+3. `dataset.yaml`に用意したデータセットのパスを記載する
+
 ### OpenVINOモデル
 
 1. PyTorch -> OpenVINOモデルに変換

@@ -12,3 +12,4 @@ docs/tmp
 # 説明資料の画像（JPEG・幅 1200px 以下に縮めたもの。tools/docs/shrink_images.py）は git に載せる
 !docs/images/
 !docs/images/*.jpg
+config/dataset.yaml
