@@ -14,7 +14,7 @@ k_clusters: 8
 n_iter: 10
 
 # モデルのディレクトリ
-model_dir: "./weights/openvino_models_l6"
+model_dir: "./weights/openvino_models"
 
 # プロンプトが保存されているディレクトリ
 prompts_dir: "./prompts"
@@ -28,6 +28,11 @@ ov_num_thread: 4
 #          代わりに、出力が動的形状と bit 単位では一致しない（数値が微小に変わる）。resize_mode: fit では使えない（入力の大きさが画像ごとに変わる）。
 #          形が違う入力（格子分離のセルごとのデコード、pad のパディングを除いた特徴量）は、動的形状のモデルで推論する（初めて必要になったときにコンパイルする）
 ov_static_shape: true
+
+# 静的形状のモデルのグラフを書き換えて速くするか？（ov_static_shape が true のときだけ。core/openvino/graph_edits.py）
+#   true : デコーダーの Reorder（NCHW <-> NHWC のレイアウト変換）を除く。デコード 1 回が約 16 → 9ms。出力は書き換え前と同じ（bit 一致）
+#   false: 書き換えない（変換したままのグラフ。実験で比べるとき）
+ov_optimize_graph: true
 
 # 使用するデバイス
 device: "cpu"
@@ -50,6 +55,11 @@ use_edgetam_clustering: true
 # EdgeTAMでマスクを反復精緻化する回数（前回のロジットを入力に再推定）
 edgetam_refine_iterations: 2
 
+# モデルの推論と重ねて NumPy / OpenCV の整形を実行する Python のスレッド数（0 なら重ねず、順に実行する）
+#   領域（クラス・取りこぼしの成分）ごとのマスクの整形を次のデコードと、EdgeTAM の特徴の kNN グラフを PE の推論と重ねる。cable のように領域が多い画像で効く
+#   （cable/000 で約 -30ms）。結果は従来と同じ順に反映するので、出力は変わらない。OpenVINO のスレッド数（ov_num_thread）は変わらない。2 で十分（3 以上は変わらない）
+worker_threads: 2
+
 # セマンティックマップのマスク演算（重なり解決・ノイズ除去）を行う作業解像度の長辺上限（出力は元画像サイズ）
 semantic_max_side: 1024
 
@@ -66,7 +76,7 @@ save_gallery_html: true
 foreground_threshold: 0.5
 
 # 結果を出力するディレクトリ
-output_dir: "./outputs/experiment_results_20261029"
+output_dir: "./outputs/experiment_results_20261031_2"
 
 # カラーパレット
 color_palette: [

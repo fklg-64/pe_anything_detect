@@ -1,5 +1,6 @@
 """マスク・座標・点サンプリング・kNN グラフ上の伝播の、純粋なヘルパー関数（状態を持たない）。"""
 
+from concurrent.futures import Executor
 from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
@@ -183,31 +184,45 @@ def bounding_slices(mask: np.ndarray, margin: int = 1) -> Optional[Tuple[slice, 
     )
 
 
+# 小さな連結成分が多いときは、成分ごとに消すより、全画素を表で引く方が速い
+CLEAN_MASK_MAX_PER_COMPONENT = 48
+
+
 def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
     """
-    mask: 2次元の二値マスク（0/1 または 0/255）
+    mask: 2次元の二値マスク（bool、または 0/1・0/255 の整数）
     min_area: 除去する連結成分の最小面積（ピクセル数）
 
-    return: 0/1 の二値マスク
+    return: 0/1 の二値マスク（uint8。値は 0/1 だけなので、`.view(bool)` で bool として読める）
 
     処理は前景の外接矩形（余白1画素）の中だけで行う（外は0なので、連結成分もメディアンフィルタ（3x3）も画像全体で行うのと同じ結果になる）。
     """
-    binary = (np.asarray(mask) > 0).view(np.uint8)  # bool の 0/1 をコピーせず uint8 として読む
-    cleaned = np.zeros_like(binary)
-    box = bounding_slices(binary)
+    mask = np.asarray(mask)
+    foreground = mask if mask.dtype == bool else mask > 0  # bool のまま扱う（整数との比較は、bool を int64 に広げるので遅い）
+    box = bounding_slices(foreground)
+    cleaned = np.zeros(foreground.shape, dtype=np.uint8)
     if box is None:
         return cleaned
-    crop = binary[box]
+    crop = foreground.view(np.uint8)[box]  # bool の 0/1 をコピーせず uint8 として読む
 
     # 小さな独立成分を除去
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         crop, connectivity=8
     )
 
-    # 面積が足りる連結成分だけを残す（背景ラベル0は常に除外）
-    keep = stats[:, cv2.CC_STAT_AREA] >= min_area
-    keep[0] = False
-    kept = keep.astype(np.uint8)[labels]  # 成分数分の表を先に uint8 にしてから全画素へ引く（全画素の型変換を省く）
+    # 面積が足りない連結成分（背景ラベル0は除く）だけを消す。クロップ内の前景は、どれかの成分に属する
+    small = np.flatnonzero(stats[1:, cv2.CC_STAT_AREA] < min_area) + 1
+    if len(small) == 0:
+        kept = crop
+    elif len(small) <= CLEAN_MASK_MAX_PER_COMPONENT:
+        kept = crop.copy()
+        for i in small:  # 成分の外接矩形の中だけで消す
+            x, y, w, h = stats[i, :4]
+            kept[y:y + h, x:x + w][labels[y:y + h, x:x + w] == i] = 0
+    else:
+        keep = stats[:, cv2.CC_STAT_AREA] >= min_area
+        keep[0] = False
+        kept = keep.astype(np.uint8)[labels]  # 成分数分の表を先に uint8 にしてから全画素へ引く（全画素の型変換を省く）
 
     # 輪郭の細かなノイズを平滑化
     cleaned[box] = cv2.medianBlur(kept, MEDIAN_BLUR_KSIZE)
@@ -215,25 +230,33 @@ def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
     return cleaned
 
 
-def remove_small_regions(semantic_map: np.ndarray, min_area: int) -> None:
+def _small_pieces(semantic_map: np.ndarray, class_id: int, min_area: int) -> Tuple[Tuple[slice, slice], np.ndarray]:
+    """クラス class_id の小さな連結成分（clean_mask が除く画素）を、外接矩形と、その中のマスクで返す。semantic_map は読むだけ。"""
+    region = semantic_map == class_id
+    box = bounding_slices(region)  # 外接矩形の中だけで処理する（clean_mask の結果は外接矩形の外で常に 0）
+    crop = region[box]
+    return box, crop & ~clean_mask(crop, min_area).view(bool)
+
+
+def remove_small_regions(semantic_map: np.ndarray, min_area: int, pool: Optional[Executor] = None) -> None:
     """セマンティックマップ上の小領域ノイズを除去する（in-place）。
 
     1. クラスごとに小さな連結成分を背景へ戻す。
     2. 背景に残った小さな穴を、周囲で最も多いクラスで埋める。
+
+    クラスは互いに素な画素なので、1 のクラスごとの整形は独立（pool があれば並行して求め、反映は順に行う。結果は同じ）。
     """
     height, width = semantic_map.shape
-    present_class_ids = np.flatnonzero(np.bincount(semantic_map.ravel()))
-    for class_id in present_class_ids:
-        if class_id == 0:
-            continue
-        region = semantic_map == class_id
-        box = bounding_slices(region)  # 外接矩形の中だけで処理する（clean_mask の結果は外接矩形の外で常に 0）
-        crop = region[box]
-        keep = clean_mask(crop, min_area).astype(bool)
-        semantic_map[box][crop & ~keep] = 0
+    present_class_ids = [int(c) for c in np.flatnonzero(np.bincount(semantic_map.ravel())) if c != 0]
+    if pool is None:
+        pieces = (_small_pieces(semantic_map, class_id, min_area) for class_id in present_class_ids)
+    else:
+        pieces = (future.result() for future in [pool.submit(_small_pieces, semantic_map, c, min_area) for c in present_class_ids])
+    for box, small in pieces:
+        semantic_map[box][small] = 0
 
     n, comp, stats, _ = cv2.connectedComponentsWithStats(
-        (semantic_map == 0).astype(np.uint8), connectivity=8
+        (semantic_map == 0).view(np.uint8), connectivity=8
     )
     ring_kernel = np.ones((3, 3), dtype=np.uint8)
     for i in range(1, n):
@@ -311,6 +334,11 @@ def patch_mean(patch_map: np.ndarray) -> np.ndarray:
 def resize_map(patch_map: np.ndarray, size: Tuple[int, int], interpolation: int) -> np.ndarray:
     """パッチ格子のマップを size=(幅, 高さ) へ拡大する。"""
     return cv2.resize(patch_map.astype(np.float32), size, interpolation=interpolation)
+
+
+def resize_mask(patch_mask: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    """パッチ格子の bool マスクを size=(幅, 高さ) へ最近傍で拡大する（`resize_map(..., INTER_NEAREST) > 0` と同じ結果。uint8 のまま拡大するので速い）。"""
+    return cv2.resize(patch_mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).view(bool)
 
 
 def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:

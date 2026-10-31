@@ -12,6 +12,7 @@
 
 import time
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -50,8 +51,13 @@ class SegmentationRunner:
         if self.resize_mode not in RESIZE_MODES:
             raise ValueError(f"resize_mode は {RESIZE_MODES} のいずれかにしてください: {self.resize_mode!r}")
 
+        # モデルの推論（OpenVINO・PyTorch は GIL を離す）と、NumPy / OpenCV の整形を重ねて実行する Python のスレッド（0 なら重ねず、従来どおり順に実行する）。
+        # 結果は従来と同じ順に反映するので出力は変わらない。モデルの推論のスレッド数（ov_num_thread）は変わらない
+        worker_threads = int(config.get("worker_threads", 0))
+        self.pool = ThreadPoolExecutor(max_workers=worker_threads, thread_name_prefix="segment") if worker_threads > 0 else None
+
         self.coarse = CoarseSegmenter(extractor, config)
-        self.refiner = SemanticRefiner(edgetam, extractor.feature_size, config)
+        self.refiner = SemanticRefiner(edgetam, extractor.feature_size, config, pool=self.pool)
         self.saver = ResultSaver(config, extractor.feature_size)
         self.save_gallery_html = config.get("save_gallery_html", False)
         self._gallery_times: dict[Path, float] = {}  # 一覧HTML用の 保存先 -> 処理時間(ms)
@@ -62,6 +68,11 @@ class SegmentationRunner:
 
     def segment(self, image_raw: np.ndarray) -> SegmentationResult:
         """1枚の画像（RGB）をセグメンテーションする。ファイルへの保存はしない（保存は run / ResultSaver）。"""
+        # 段階ごとの処理時間の表示は、終わってからまとめて出す（端末への出力を、計測する処理の内側で待たない）
+        with Timer.deferred():
+            return self._segment(image_raw)
+
+    def _segment(self, image_raw: np.ndarray) -> SegmentationResult:
         height, width = image_raw.shape[:2]
 
         # 計測開始
@@ -69,8 +80,10 @@ class SegmentationRunner:
 
         layout, resized, image_tensor = self._preprocess(image_raw)
         edgetam_features = self._encode_edgetam(layout, resized)
+        # EdgeTAM の特徴の kNN グラフ（PE の結果に依らない）は、PE の推論と重ねて求める
+        edge_graph = self._start_edge_graph(edgetam_features)
         patch_features, fused_patch_features = self._extract_clip_features(layout, image_tensor)
-        coarse_foreground = self._estimate_coarse_foreground(patch_features, fused_patch_features, edgetam_features)
+        coarse_foreground = self._estimate_coarse_foreground(patch_features, fused_patch_features, edgetam_features, edge_graph)
         cluster_labels, cluster_index_list = coarse_foreground.cluster_labels, coarse_foreground.cluster_index_list
 
         # セマンティックセグメンテーションのラベルを取得
@@ -92,7 +105,7 @@ class SegmentationRunner:
             )
 
         elapsed_time = time.time() - start
-        print(f"Inference Time: {elapsed_time * 1000:.2f} ms")
+        Timer.log(f"Inference Time: {elapsed_time * 1000:.2f} ms")
 
         return SegmentationResult(
             semantic_map=refined.semantic_map,
@@ -132,6 +145,12 @@ class SegmentationRunner:
         with Timer("EdgeTAM特徴量抽出処理時間"):
             return layout.crop_edgetam(self.refiner.predict_encoder(resized))
 
+    def _start_edge_graph(self, edgetam_features: Optional[Tuple]):
+        """EdgeTAM の image_embed の kNN グラフを、pool があれば別スレッドで求め始める（なければ、粗い判定の中で求める。None を返す）。"""
+        if edgetam_features is None or self.pool is None:
+            return None
+        return self.pool.submit(self.coarse.edge_graph_of, edgetam_features[2])
+
     def _extract_clip_features(self, layout: ImageLayout, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """CLIP（PE）のパッチ特徴と fused パッチ特徴（パディング部分のトークンは捨てる）。"""
         with Timer("特徴量抽出処理時間"):
@@ -139,7 +158,11 @@ class SegmentationRunner:
             return layout.crop_tokens(patch_features), layout.crop_tokens(fused_patch_features)
 
     def _estimate_coarse_foreground(
-        self, patch_features: np.ndarray, fused_patch_features: np.ndarray, edgetam_features: Optional[Tuple]
+        self,
+        patch_features: np.ndarray,
+        fused_patch_features: np.ndarray,
+        edgetam_features: Optional[Tuple],
+        edge_graph=None,
     ) -> CoarseForeground:
         """CLIP + KMeans による初期前景マップの推定（EdgeTAM の特徴があれば、前景確信度の伝播も行う）。"""
         with Timer("粗い前景マスク取得処理時間"):
@@ -147,7 +170,9 @@ class SegmentationRunner:
                 generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
             else:
                 edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
-                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features, edgetam_image_embed)
+                generated = self.coarse.generate_foreground_map(
+                    patch_features, fused_patch_features, edgetam_image_embed, None if edge_graph is None else edge_graph.result()
+                )
             # 4 要素のタプルを返す差し替え実装（tools）でも動くよう、名前付きにそろえる
             return CoarseForeground(*generated)
 

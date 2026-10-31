@@ -41,7 +41,11 @@ class OVModel:
     動的形状のモデルで推論する。動的形状のモデルは、必要になったときに初めてコンパイルする。
     static_shapes が None なら、動的形状のモデルだけを使う。
 
-    prepare: 読み込んだモデルに、コンパイルの前に施す変更（未使用の出力を外すなど）。
+    prepare: 読み込んだモデルに、コンパイルの前に施す変更（未使用の出力を外すなど）。動的形状・静的形状のどちらにも施す。
+    prepare_static: 静的形状に reshape した後のモデルだけに、コンパイルの前に施す変更（形が決まっているときだけできるグラフの書き換え。graph_edits.py）。
+    static_input_perms / static_output_perms: prepare_static が入出力の軸の並びを変えたときの、外から見える形（変更前）との対応（入出力の番号 -> 軸の並び）。
+        静的形状のモデルを使うときだけ、入力は外の配列を transpose(perm) して連続にしたものを渡し、出力はモデルの出力を transpose(perm) して外の形に戻す（ビュー。コピーしない）。
+        例: 外からは NCHW に見える特徴量を、内部では NHWC で持つ。動的形状のモデルを使うときは、どちらも適用しない（変更前の形のまま）。
     """
 
     def __init__(
@@ -52,9 +56,14 @@ class OVModel:
         num_threads: int,
         prepare: Optional[Callable[[ov.Model], None]] = None,
         static_shapes: Optional[Dict[str, List[int]]] = None,
+        prepare_static: Optional[Callable[[ov.Model], None]] = None,
+        static_input_perms: Optional[Dict[int, Sequence[int]]] = None,
+        static_output_perms: Optional[Dict[int, Sequence[int]]] = None,
     ):
         self._core, self._path, self._device = core, path, device
         self._compile_config, self._prepare = make_compile_config(num_threads), prepare
+        self._prepare_static = prepare_static
+        self._input_perms, self._output_perms = dict(static_input_perms or {}), dict(static_output_perms or {})
         self._dynamic: Optional[ov.CompiledModel] = None
         self._static: Optional[ov.CompiledModel] = None
         self._static_dims: List[Optional[List[int]]] = []
@@ -82,6 +91,8 @@ class OVModel:
             self._prepare(model)
         if static_shapes is not None:
             model.reshape(static_shapes)
+            if self._prepare_static is not None:
+                self._prepare_static(model)
         return self._core.compile_model(model, self._device, self._compile_config), model
 
     @property
@@ -91,8 +102,9 @@ class OVModel:
 
     @property
     def output_shapes(self) -> List[Tuple[int, ...]]:
-        """出力の形。静的形状のモデルのときだけ使える（動的形状の次元があると失敗する）。"""
-        return [tuple(port.get_partial_shape().to_shape()) for port in self._primary.outputs]
+        """出力の形（外から見える形）。静的形状のモデルのときだけ使える（動的形状の次元があると失敗する）。"""
+        shapes = [tuple(port.get_partial_shape().to_shape()) for port in self._primary.outputs]
+        return [tuple(shape[axis] for axis in self._output_perms[i]) if i in self._output_perms else shape for i, shape in enumerate(shapes)]
 
     def output_index(self, name: str) -> int:
         """名前の付いた出力の、出力の順での位置。"""
@@ -112,10 +124,10 @@ class OVModel:
 
     def __call__(self, inputs: Sequence[np.ndarray]) -> List[np.ndarray]:
         if self._static is not None and self._fits_static(inputs):
-            compiled = self._static
-        else:
-            if self._dynamic is None:
-                self._dynamic, _ = self._compile(None)
-            compiled = self._dynamic
-        outs = compiled(list(inputs))
+            arrays = [np.ascontiguousarray(a.transpose(self._input_perms[i])) if i in self._input_perms else a for i, a in enumerate(inputs)]
+            outs = self._static(arrays)
+            return [outs[i].transpose(self._output_perms[i]) if i in self._output_perms else outs[i] for i in range(len(outs))]
+        if self._dynamic is None:
+            self._dynamic, _ = self._compile(None)
+        outs = self._dynamic(list(inputs))
         return [outs[index] for index in range(len(outs))]

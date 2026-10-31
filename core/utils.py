@@ -1,18 +1,22 @@
 """全体で共有する小さなヘルパー（処理時間の計測、画像の読み込み・前処理、設定ファイルの読み込み）。"""
 
+import contextlib
 import cv2
 import time
 import yaml
 import numpy as np
 from PIL import Image
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from core.common.params import IMAGE_EXTENSIONS
 
 
 class Timer:
     """ミリ秒単位で処理時間を計測し表示するコンテキストマネージャー"""
+
+    _deferred: Optional[list] = None  # Timer.deferred() の中で、表示する行を貯めておく先
+
     def __init__(self, name: str, width: int = 20):
         self.name = name
         self.width = width
@@ -24,7 +28,30 @@ class Timer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.elapsed_ms = (time.perf_counter() - self.start) * 1000
-        print(f"{self.name:<{self.width}} : {self.elapsed_ms:6.2f} ms")
+        Timer.log(f"{self.name:<{self.width}} : {self.elapsed_ms:6.2f} ms")
+
+    @classmethod
+    def log(cls, line: str) -> None:
+        """1 行表示する。deferred() の中なら、抜けるときにまとめて表示する。"""
+        if cls._deferred is None:
+            print(line)
+        else:
+            cls._deferred.append(line)
+
+    @classmethod
+    @contextlib.contextmanager
+    def deferred(cls):
+        """この中の Timer と log の表示を貯めて、抜けるときにまとめて表示する（端末への出力を、計測する処理の内側で待たないため。入れ子なら外側にまとめる）。"""
+        if cls._deferred is not None:
+            yield
+            return
+        cls._deferred = []
+        try:
+            yield
+        finally:
+            lines, cls._deferred = cls._deferred, None
+            for line in lines:
+                print(line)
 
 
 # 画像読み込み
@@ -57,23 +84,22 @@ def normalize_image(
     mean: np.ndarray,
     std: np.ndarray,
 ) -> np.ndarray:
-    """リサイズ済み画像を正規化し、NCHW形式に変換する。"""
-    # Normalize to [0, 1]
-    image = resized.astype(np.float32) / 255.0
+    """リサイズ済み画像を正規化し、NCHW形式に変換する。
 
-    # HWC -> CHW
-    image = image.transpose(2, 0, 1)
+    チャンネルごとに、連続した (1, C, H, W) の配列へ直接書く（HWC の並びのまま転置した配列を返すと、モデルへの入力のたびにコピーが入る）。
+    計算は (x / 255 - mean) / std を float32 で順に行うので、値は従来と同じ。
+    """
+    mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+    std = np.asarray(std, dtype=np.float32).reshape(-1)
 
-    mean = np.asarray(mean, dtype=np.float32)
-    std = np.asarray(std, dtype=np.float32)
-
-    if mean.ndim == 1:
-        mean = mean[:, None, None]
-    if std.ndim == 1:
-        std = std[:, None, None]
-
-    # Normalize and add batch dimension
-    return ((image - mean) / std)[None, ...]
+    height, width, channels = resized.shape
+    output = np.empty((1, channels, height, width), dtype=np.float32)
+    for c in range(channels):
+        plane = output[0, c]
+        np.divide(resized[:, :, c], 255.0, out=plane, dtype=np.float32)  # [0, 1] へ
+        plane -= mean[c]
+        plane /= std[c]
+    return output
 
 # 画像前処理
 def preprocess_image(

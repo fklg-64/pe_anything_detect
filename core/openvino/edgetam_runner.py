@@ -9,6 +9,27 @@ import openvino as ov
 
 from core.common.edgetam_helper import EdgeTamHelper
 from core.openvino.compiled_model import OVModel, static_input_side
+from core.openvino.graph_edits import (
+    NCHW_FROM_NHWC,
+    NHWC_FROM_NCHW,
+    decoder_feats0_from_nhwc,
+    encoder_feats0_as_nhwc,
+    remove_decoder_output_reorder,
+)
+
+_UNEXPECTED_GRAPH = "のグラフが想定と違うため、グラフの最適化ができません（config の ov_optimize_graph: false で切れます）"
+
+
+def _optimize_static_decoder(model: "ov.Model") -> None:
+    """静的形状のデコーダーのグラフから Reorder を除く（graph_edits.py）。出力側の matmul と、入力 high_res_feats0 を NHWC で受けること。"""
+    if not (remove_decoder_output_reorder(model) and decoder_feats0_from_nhwc(model)):
+        raise RuntimeError("デコーダー" + _UNEXPECTED_GRAPH)
+
+
+def _optimize_static_encoder(model: "ov.Model") -> None:
+    """静的形状のエンコーダーが high_res_feats0 を NHWC で出すようにする（デコーダーの入力と合わせる。graph_edits.py）。"""
+    if not encoder_feats0_as_nhwc(model):
+        raise RuntimeError("エンコーダー" + _UNEXPECTED_GRAPH)
 
 
 class OVEdgeTamRunner(EdgeTamHelper):
@@ -24,6 +45,8 @@ class OVEdgeTamRunner(EdgeTamHelper):
         self.num_threads = config["ov_num_thread"]
         # エンコーダーの入力の一辺（ov_static_shape が真のときだけ。None なら動的形状。compiled_model.py）
         self.static_side = static_input_side(config)
+        # 静的形状のデコーダーのグラフを書き換えて速くする（出力は同じ。config の ov_optimize_graph。実験で切れる）
+        self.optimize_graph = config.get("ov_optimize_graph", True)
 
         # OpenCV・NumPy(BLAS)のスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
         limit_cpu_threads()
@@ -44,13 +67,17 @@ class OVEdgeTamRunner(EdgeTamHelper):
         decoder_path = model_dir / f"edgetam_decoder{suffix}"
 
         side = self.static_side
+        # グラフの最適化（出力は同じ。静的形状のモデルだけ）。外から見える特徴量は NCHW のまま、high_res_feats0 を内部では NHWC で持つ
+        optimize = self.optimize_graph and side is not None
         self.encoder_model = OVModel(
             core, encoder_path, self.device, self.num_threads,
             static_shapes=None if side is None else {"x": [1, 3, side, side]},
+            **({"prepare_static": _optimize_static_encoder, "static_output_perms": {0: NCHW_FROM_NHWC}} if optimize else {}),
         )
         self.decoder_model = OVModel(
             core, decoder_path, self.device, self.num_threads,
             static_shapes=None if side is None else self._decoder_static_shapes(),
+            **({"prepare_static": _optimize_static_decoder, "static_input_perms": {0: NHWC_FROM_NCHW}} if optimize else {}),
         )
 
     def _decoder_static_shapes(self):

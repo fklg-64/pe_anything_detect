@@ -131,6 +131,8 @@ sequenceDiagram
 | `edgetam_refine_iterations` | 2 | EdgeTAM デコーダの反復回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度（長辺） |
 | `ov_num_thread` | 4 | OpenVINO のスレッド数 |
+| `worker_threads` | 2 | モデルの推論と重ねて NumPy の整形を実行する Python のスレッド数（0 で重ねない。出力は変わらない） |
+| `ov_optimize_graph` | true | 静的形状のモデルのグラフを書き換えて速くする（Reorder の除去。出力は変わらない） |
 
 コードに固定した値（近傍 3・logit 幅 8・スコア重み 0.5 など）は `core/common/params.py`。
 
@@ -144,6 +146,8 @@ flowchart LR
 上の値は、このコイン画像を連続実行したときの 1 枚分（実行ごとに ±15ms 程度ばらつく）。複数画像（実画像 17 枚 + 合成 12 枚）の中央値は約 177ms（[method_history.md](method_history.md) の #7）。
 
 格子状に並んだ小物体（巣・トレイ）を検出したときだけ、② の最後に **約 +150ms**（006 の 80 個: 検出 30・位相補正 23・セルごとのデコード 95ms）。検出したかを毎回判定するコストは約 6ms（MVTec 中央値 234 → 237ms）。
+
+**領域の多い画像（再推定が多い画像）の処理時間。** デコード（EdgeTAM のデコーダー）の回数は「（クラス数 + 取りこぼしの再推定した成分数）× 反復回数」で、領域ごとに NumPy の整形も付く。MVTec の cable/000（1024×1024。クラス 3 + 再推定 7 = 領域 10、デコード 20 回）は、Ryzen 5 5500U（AVX2 のみ・4 スレッド）で 約 783ms かかっていた。デコーダーのグラフの Reorder を除き（1 回 約 16 → 9ms）、NumPy の整形を高速化して、次のデコードと重ねる（`worker_threads`）ことで、**出力は同じまま 約 472ms（−40%）** になった（詳細は [method_history.md](method_history.md) の #14）。再推定の回数を減らす案（反復 1 回・斑点を省く）は、最終マップの一致率が 99.9% を割るので採っていない。
 
 NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runtime_utils.py`）。既定の 20 スレッドは、行列積の後も待機して OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする。
 

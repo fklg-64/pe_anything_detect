@@ -26,7 +26,8 @@ def normalize_features(feats: Sequence[np.ndarray]) -> List[np.ndarray]:
     """EdgeTAM の特徴量（high_res_feats0 / high_res_feats1 / image_embed）を、画素ごとに L2 正規化した (C, H, W) の配列にする。"""
     levels = []
     for feat in feats:
-        array = np.asarray(feat, dtype=np.float32)
+        # 連続した (C, H, W) にそろえる（OpenVINO の特徴量は、NHWC で持つものを NCHW に見せたビューのことがある。以降の和の順序を変えないため）
+        array = np.ascontiguousarray(feat, dtype=np.float32)
         array = array[0] if array.ndim == 4 else array
         levels.append(array / (np.linalg.norm(array, axis=0, keepdims=True) + 1e-8))
     return levels
@@ -36,9 +37,12 @@ def mean_feature(level: np.ndarray, patch_mask: np.ndarray) -> Optional[np.ndarr
     """パッチ格子のマスクの内側にある特徴の平均（L2 正規化）。マスクが空なら None。level は (C, H, W)。"""
     _, height, width = level.shape
     mask = cv2.resize(patch_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST) > 0
-    if not mask.any():
+    index = np.flatnonzero(mask)
+    if not index.size:
         return None
-    mean = level[:, mask].mean(axis=1)
+    # level[:, mask].mean(axis=1) と同じ値（その和は、画素を順に足す）を、チャンネルごとの集めなおしで速く求める。np.take(...).mean() は足す順序が違い、値が少しずれる
+    picked = np.take(level.reshape(level.shape[0], -1), index, axis=1)
+    mean = np.add.accumulate(picked, axis=1)[:, -1] / index.size
     return mean / (np.linalg.norm(mean) + 1e-8)
 
 
