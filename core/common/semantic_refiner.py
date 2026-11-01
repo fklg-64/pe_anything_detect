@@ -13,12 +13,11 @@
 
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 import cv2
 import numpy as np
 
-from core.utils import Timer
 from core.common.edgetam_session import EdgeTamSession, Features
 from core.common.lattice_separator import LatticeSeparator
 from core.common.mask_utils import (
@@ -77,7 +76,7 @@ class SemanticRefiner:
         labels_list: np.ndarray,
         width: int,
         height: int,
-        feats: Optional[Features] = None,
+        feats: Features,
     ) -> RefineOutput:
         """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
 
@@ -87,7 +86,7 @@ class SemanticRefiner:
         どのクラスのマスクにも入らなかった粗い連結成分は、その成分だけで再推定する。
 
         resized: リサイズ済み（正規化前）の画像。EdgeTAMエンコーダの入力と、初期マスクの縁を整えるガイドになる。
-        feats: EdgeTAMエンコーダの出力。粗い判定で既に計算しているときに渡すと、エンコーダを再実行しない（None なら実行する）。
+        feats: EdgeTAMエンコーダの出力（粗い判定の前に SegmentationRunner が 1 回だけ実行したもの）。
 
         Returns: RefineOutput（各フィールドの意味はそちら）。
         """
@@ -98,9 +97,6 @@ class SemanticRefiner:
             return RefineOutput(np.zeros((height, width), dtype=np.uint8), prompt_indices, [], [], {})
 
         # 1. 準備
-        if feats is None:
-            with Timer("    ┌ edgetam特徴量抽出"):
-                feats = self.session.encode(resized)
         inputs = self.estimator.prepare(resized, feats, foreground_map, foreground_binary, width, height)
         work_w, work_h = inputs.size
         state = RefineState(

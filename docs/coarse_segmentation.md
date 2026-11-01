@@ -144,7 +144,6 @@ flowchart LR
 | `k_clusters` / `n_iter` | 8 / 10 | KMeans のクラスタ数・反復回数 |
 | `foreground_threshold` | 0.5 | 前景のしきい値 |
 | `prompts_dir` | `prompts` | 前景・背景プロンプト |
-| `use_edgetam_clustering` | true | ③ の伝播を使うか（false なら PE の判定だけ） |
 | `model_dir` | `weights/openvino_models` | モデルのフォルダ。クラスタリングに使う PE の層は変換時に固定される（既定は第 8・9・10 層）。**この資料の画像は第 6 層のモデル（`weights/openvino_models_l6`）で作った**（作り方は [overview.md](overview.md#画像の作り方)） |
 
 `core/common/params.py` の固定値:

@@ -17,7 +17,7 @@ FAISS_NUM_THREADS = 2
 # OpenVINO backend が起動時に cv2.setNumThreads へ渡すスレッド数
 OPENCV_NUM_THREADS = 2
 
-# --- EdgeTAM の特徴での前景確信度の伝播（粗い判定。use_edgetam_clustering） ---
+# --- EdgeTAM の特徴での前景確信度の伝播（粗い判定） ---
 # EdgeTAM の image_embed のコサイン類似度が上位の k 個のパッチを近傍とし、前景確信度を conf ← (1-α)·conf0 + α·(近傍の平均) で伝播する。
 # α は 0.7〜0.9、k は 4〜8 で結果が同程度（平坦な範囲から選んだ）。反復は 3 回で十分（5 回でも変わらない）
 EDGE_PROPAGATION_ALPHA = 0.8

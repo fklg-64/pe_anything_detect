@@ -159,7 +159,7 @@ class ResultSaver:
         return image.resize(size, resample=Image.Resampling.NEAREST)
 
     def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
-        """KMeansのクラスタ（EdgeTAM併用時は伝播前のPEも）と、粗いセマンティックラベルを着色して保存。"""
+        """KMeansのクラスタ（伝播前のPEと伝播後）と、粗いセマンティックラベルを着色して保存。"""
         grid = result.foreground_map.shape  # パッチ格子
         for image_name, view in self._cluster_views(result):
             self._colorize_labels(view.labels.reshape(grid), size).save(save_dir / image_name)
@@ -168,12 +168,11 @@ class ResultSaver:
         )
 
     def _cluster_views(self, result: SegmentationResult) -> List[Tuple[str, ClusterView]]:
-        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。EdgeTAM 併用時は、伝播前の PE、伝播後の順。"""
-        views = []
-        if result.pe_clusters is not None:
-            views.append((f"layer_fused_pe_k{self.k_clusters}.png", result.pe_clusters))
-        views.append((f"layer_fused_k{self.k_clusters}.png", ClusterView(result.cluster_labels, result.cluster_index_list)))
-        return views
+        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。伝播前の PE、伝播後の順。"""
+        return [
+            (f"layer_fused_pe_k{self.k_clusters}.png", result.pe_clusters),
+            (f"layer_fused_k{self.k_clusters}.png", ClusterView(result.cluster_labels, result.cluster_index_list)),
+        ]
 
     def _save_cluster_prompts(self, save_dir: Path, result: SegmentationResult, all_prompts: List[str]) -> None:
         """クラスタごとの分類結果（対応するプロンプトの文）をテキストで保存。クラスタの画像と同じクラスタ番号。"""

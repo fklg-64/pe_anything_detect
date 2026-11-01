@@ -64,8 +64,5 @@ foreground_threshold: 0.5
 # 結果を出力するディレクトリ
 output_dir: "./outputs/experiment_results"
 
-# 粗い判定の前に EdgeTAM のエンコーダを実行して、特徴の類似度で前景確信度を伝播するか（configs/ov_config.yaml 参照）。SAM2.1 では使わない
-use_edgetam_clustering: false
-
 # モデルの推論と重ねて NumPy / OpenCV の整形を実行する Python のスレッド数（0 なら重ねず、順に実行する）
 worker_threads: 0

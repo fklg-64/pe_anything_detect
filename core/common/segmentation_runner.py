@@ -3,7 +3,7 @@
 処理の流れ（SegmentationRunner.segment。各段階の詳細は docs/overview.md）:
 
   1. 前処理               image_size 四方へのリサイズと正規化
-  2. EdgeTAM エンコーダ   use_edgetam_clustering のとき、粗い判定の前に 1 回だけ実行（精緻化でも使う）
+  2. EdgeTAM エンコーダ   粗い判定の前に 1 回だけ実行（粗い判定の前景確信度の伝播と、精緻化の両方で使う）
   3. CLIP（PE）の特徴量   パッチ特徴・fused パッチ特徴        <- この間に、EdgeTAM の特徴の kNN グラフを別スレッドで求める
   4. 粗い前景/クラスタ    CoarseSegmenter.generate_foreground_map（KMeans + テキスト照合 + EdgeTAM 特徴での伝播 + クラスのまとめ）
   5. 粗いセマンティック   assign_semantic_labels（パッチ単位のラベル）
@@ -18,7 +18,7 @@ import time
 import shutil
 from functools import partial
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import numpy as np
 
@@ -26,7 +26,7 @@ from core.utils import Timer, load_image, resize_image
 from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
-from core.common.edgetam_session import EdgeTamSession
+from core.common.edgetam_session import EdgeTamSession, Features
 from core.common.parallel import Job, Workers
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
@@ -48,8 +48,6 @@ class SegmentationRunner:
         self.output_dir = config["output_dir"]
         # 保存先フォルダ名 -> 画像パス（同名の別画像が上書きされないようにする）
         self._save_names: dict[str, Path] = {}
-        # 粗い判定の前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える（誤検出を減らす。EdgeTAM のエンコードを先に 1 回だけ実行する）
-        self.use_edgetam_clustering = config["use_edgetam_clustering"]
         # 画像は image_size 四方にリサイズする（アスペクト比は保たない）。パッチ格子が入力の全体を覆うよう、パッチサイズの倍数であること
         if extractor.target_size % extractor.patch_size:
             raise ValueError(f"image_size はパッチサイズ {extractor.patch_size} の倍数にしてください: {extractor.target_size}")
@@ -129,17 +127,13 @@ class SegmentationRunner:
             # リサイズは CLIP と EdgeTAM で共通
             return resize_image(image_raw, self.extractor.target_size)
 
-    def _encode_edgetam(self, resized: np.ndarray) -> Optional[Tuple]:
-        """EdgeTAMの特徴量抽出。粗い判定で EdgeTAM の特徴を使うときだけ、ここで 1 回実行して精緻化にも渡す（使わなければ None）。"""
-        if not self.use_edgetam_clustering:
-            return None
+    def _encode_edgetam(self, resized: np.ndarray) -> Features:
+        """EdgeTAMの特徴量抽出。ここで 1 回だけ実行し、粗い判定と精緻化の両方で使う。"""
         with Timer("EdgeTAM特徴量抽出処理時間"):
             return self.session.encode(resized)
 
-    def _start_edge_graph(self, edgetam_features: Optional[Tuple]) -> Optional[Job]:
+    def _start_edge_graph(self, edgetam_features: Features) -> Job:
         """EdgeTAM の image_embed の kNN グラフ作りを、別スレッドで始める（スレッドが無ければ、result() を呼んだときに実行する）。"""
-        if edgetam_features is None:
-            return None
         return self.workers.submit(partial(self.coarse.edge_graph_of, edgetam_features[2]))
 
     def _extract_clip_features(self, resized: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -151,20 +145,15 @@ class SegmentationRunner:
         self,
         patch_features: np.ndarray,
         fused_patch_features: np.ndarray,
-        edgetam_features: Optional[Tuple],
-        edge_graph: Optional[Job] = None,
+        edgetam_features: Features,
+        edge_graph: Job,
     ) -> CoarseForeground:
-        """CLIP + KMeans による初期前景マップの推定（EdgeTAM の特徴があれば、前景確信度の伝播も行う）。"""
+        """CLIP + KMeans による初期前景マップの推定（EdgeTAM の特徴での前景確信度の伝播も行う）。"""
         with Timer("粗い前景マスク取得処理時間"):
-            if edgetam_features is None:
-                generated = self.coarse.generate_foreground_map(patch_features, fused_patch_features)
-            else:
-                edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
-                generated = self.coarse.generate_foreground_map(
-                    patch_features, fused_patch_features, edgetam_image_embed, edge_graph.result()
-                )
-            # 4 要素のタプルを返す差し替え実装（tools）でも動くよう、名前付きにそろえる
-            return CoarseForeground(*generated)
+            edgetam_image_embed = edgetam_features[2]  # (high_res_feats0, high_res_feats1, image_embed) の最後
+            return self.coarse.generate_foreground_map(
+                patch_features, fused_patch_features, edgetam_image_embed, edge_graph.result()
+            )
 
     def _save_name(self, image_path: Path) -> str:
         """保存先のフォルダ名。画像名が別の画像と重なるときは 親フォルダ名_ファイル名 にする。"""

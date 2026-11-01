@@ -155,7 +155,6 @@ flowchart TD
 | `image_size` | 512 | モデル入力の一辺。画像は 512×512 にリサイズする（縦横比は保たない）。16 と 32 の倍数であること |
 | `k_clusters` / `n_iter` | 8 / 10 | KMeans |
 | `foreground_threshold` | 0.5 | 前景の確信度のしきい値 |
-| `use_edgetam_clustering` | true | EdgeTAM の特徴で前景確信度を伝播 |
 | `edgetam_foreground_points_per_class` / `edgetam_background_point_count` | 4 / 4 | クラスごとの正例点・背景の負例点 |
 | `edgetam_refine_iterations` | 2 | EdgeTAM デコーダの反復回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度（長辺） |

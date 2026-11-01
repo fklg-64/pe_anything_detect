@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple
 
 import numpy as np
 
@@ -24,11 +24,10 @@ class SegmentationResult:
     # 粗い推定の中間結果（パッチ格子（高さ x 幅）上）
     foreground_map: np.ndarray         # 前景らしさ
     foreground_mask: np.ndarray        # 粗い前景マスク
-    cluster_labels: np.ndarray         # KMeansのクラスタ番号（平坦）。EdgeTAM 併用時は PE のクラスタ × 伝播後のプロンプトの組
+    cluster_labels: np.ndarray         # KMeansのクラスタ番号（平坦）。PE のクラスタ × 伝播後のプロンプトの組
     semantic_labels: np.ndarray        # 粗いセマンティックラベル
     cluster_index_list: List[int]      # cluster_labels のクラスタごとの対応プロンプト番号
-    # EdgeTAM 併用時（use_edgetam_clustering）だけ、伝播前の PE だけのクラスタ分けと分類結果。併用しなければ None
-    pe_clusters: Optional[ClusterView] = None
+    pe_clusters: ClusterView           # 伝播前の PE だけのクラスタ分けと分類結果
 
     # 精緻化の中間結果（名前 -> 0〜1 の2次元配列。保存時に元画像サイズへ拡大する）
     debug_images: Dict[str, np.ndarray] = field(default_factory=dict)
