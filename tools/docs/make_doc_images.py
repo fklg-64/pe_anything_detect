@@ -29,7 +29,7 @@ from core.common.segmentation_runner import SegmentationRunner
 from core.common.visualization import clean_prompt
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
-from core.utils import load_config, load_dataset_paths, load_image, normalize_image, resize_image
+from core.utils import load_config, load_dataset_paths, load_image, resize_image
 from tools.docs.shrink_images import save_jpeg
 
 DISPLAY = 512  # 表示用の一辺（モデル入力と同じ。1 パッチ = 16 画素）
@@ -185,8 +185,7 @@ def main() -> None:
 
     # ---- 特徴量 -------------------------------------------------------------
     edgetam_features = session.encode(resized)
-    image_tensor = normalize_image(resized, extractor.mean, extractor.std)
-    patch_features, fused_patch_features = coarse.extract_features(image_tensor)
+    patch_features, fused_patch_features = coarse.extract_features(resized)
     edge_embed = edgetam_features[2]
     pe_tokens = fused_patch_features[0, 1:, :]
     edge_flat = edge_embed[0].reshape(edge_embed.shape[1], -1).T

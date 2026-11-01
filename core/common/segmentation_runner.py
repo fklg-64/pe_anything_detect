@@ -22,7 +22,7 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 
-from core.utils import Timer, load_image, normalize_image, resize_image
+from core.utils import Timer, load_image, resize_image
 from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
@@ -81,11 +81,11 @@ class SegmentationRunner:
         # 計測開始
         start = time.time()
 
-        resized, image_tensor = self._preprocess(image_raw)
+        resized = self._preprocess(image_raw)
         edgetam_features = self._encode_edgetam(resized)
         # EdgeTAM の特徴の kNN グラフ（PE の結果に依らない）は、PE の推論と重ねて求める
         edge_graph = self._start_edge_graph(edgetam_features)
-        patch_features, fused_patch_features = self._extract_clip_features(image_tensor)
+        patch_features, fused_patch_features = self._extract_clip_features(resized)
         coarse_foreground = self._estimate_coarse_foreground(patch_features, fused_patch_features, edgetam_features, edge_graph)
         cluster_labels, cluster_index_list = coarse_foreground.cluster_labels, coarse_foreground.cluster_index_list
 
@@ -123,13 +123,11 @@ class SegmentationRunner:
     # segment の各段階
     # -------------------------------------------------------------------------
 
-    def _preprocess(self, image_raw: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """リサイズと正規化。(リサイズ済み画像（正規化前）, CLIP の入力テンソル) を返す。"""
+    def _preprocess(self, image_raw: np.ndarray) -> np.ndarray:
+        """リサイズ済み画像（正規化前）を返す。正規化はモデルごとに、各特徴抽出の中で行う。"""
         with Timer("画像前処理時間"):
-            # リサイズは CLIP と EdgeTAM で共通（正規化だけがモデルごとに異なる）
-            resized = resize_image(image_raw, self.extractor.target_size)
-            image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
-        return resized, image_tensor
+            # リサイズは CLIP と EdgeTAM で共通
+            return resize_image(image_raw, self.extractor.target_size)
 
     def _encode_edgetam(self, resized: np.ndarray) -> Optional[Tuple]:
         """EdgeTAMの特徴量抽出。粗い判定で EdgeTAM の特徴を使うときだけ、ここで 1 回実行して精緻化にも渡す（使わなければ None）。"""
@@ -144,10 +142,10 @@ class SegmentationRunner:
             return None
         return self.workers.submit(partial(self.coarse.edge_graph_of, edgetam_features[2]))
 
-    def _extract_clip_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """CLIP（PE）のパッチ特徴と fused パッチ特徴。"""
+    def _extract_clip_features(self, resized: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """CLIP（PE）のパッチ特徴と fused パッチ特徴（正規化も含む）。"""
         with Timer("特徴量抽出処理時間"):
-            return self.coarse.extract_features(image_tensor)
+            return self.coarse.extract_features(resized)
 
     def _estimate_coarse_foreground(
         self,
@@ -199,6 +197,6 @@ class SegmentationRunner:
 
         # 処理済みの画像の一覧HTMLを output_dir 直下に更新する（途中でも見られる）
         if self.save_gallery_html:
-            shutil.copy2(image_path, save_dir / f"{ORIGINAL_STEM}{image_path.suffix}")
+            shutil.copyfile(image_path, save_dir / f"{ORIGINAL_STEM}{image_path.suffix}")
             self._gallery_times[save_dir] = elapsed_ms
             print(f"一覧HTML: {write_gallery_html(Path(self.output_dir), self._gallery_times)}")

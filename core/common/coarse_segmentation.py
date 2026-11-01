@@ -8,7 +8,7 @@ import numpy as np
 import yaml
 from scipy import sparse
 
-from core.utils import Timer
+from core.utils import Timer, normalize_image
 from core.common.backend import CLIPBackend
 from core.common.mask_utils import knn_graph, propagate, softmax
 from core.common.params import (
@@ -76,8 +76,9 @@ class CoarseSegmenter:
     # CLIP特徴量
     # =========================================================================
 
-    def extract_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """CLIP（PE）のパッチ特徴と、クラスタリングに使う層を連結した（fused）パッチ特徴。"""
+    def extract_features(self, resized: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """リサイズ済み画像（正規化前）を正規化し、CLIP（PE）のパッチ特徴と、クラスタリングに使う層を連結した（fused）パッチ特徴を返す。"""
+        image_tensor = normalize_image(resized, self.extractor.mean, self.extractor.std)
         return self.extractor.extract_image_features(image_tensor)
 
     # =========================================================================
