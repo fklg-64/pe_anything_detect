@@ -13,13 +13,10 @@ import numpy as np
 
 from core.utils import Timer
 from core.common import lattice as lattice_utils
-from core.common.backend import EdgeTamBackend
+from core.common.edgetam_session import EdgeTamSession
 from core.common.params import (
+    EDGETAM_FEATURE_STRIDES,
     EDGETAM_LOGIT_CLIP,
-    LATTICE_EMBED_STRIDE,
-    LATTICE_FEATS0_STRIDE,
-    LATTICE_FEATS1_STRIDE,
-    LATTICE_MASK_STRIDE,
     LATTICE_MIN_PREDICTED_IOU,
     LATTICE_PHASE_PROBES,
     LATTICE_WINDOW_TOKENS,
@@ -29,8 +26,8 @@ from core.common.params import (
 class LatticeSeparator:
     """semantic_map（作業解像度）の格子状の前景を、セルごとの物体に分ける。"""
 
-    def __init__(self, edgetam: EdgeTamBackend, foreground_threshold: float):
-        self.edgetam = edgetam
+    def __init__(self, session: EdgeTamSession, foreground_threshold: float):
+        self.session = session
         self.foreground_threshold = foreground_threshold
 
     # =========================================================================
@@ -47,7 +44,7 @@ class LatticeSeparator:
     ) -> Optional[Dict[str, Any]]:
         """格子が見つかれば semantic_map を in-place で更新して、中間結果（デバッグ用）を返す。見つからなければ何もせず None。
 
-        content: モデルに入力した画像の内容（パディングを除く。RGB, uint8）。logit: 全クラスの最大の低解像度ロジット（入力の 1/4）。
+        content: モデルに入力した画像（RGB, uint8）。logit: 全クラスの最大の低解像度ロジット（入力の 1/4）。
         feats: EdgeTAM エンコーダの出力（high_res_feats0, high_res_feats1, image_embed）。foreground_map: 粗い前景確信度（パッチ格子）。
         """
         region = semantic_map > 0
@@ -118,22 +115,23 @@ class LatticeSeparator:
         返り値: (低解像度ロジット (N, 候補数, h, w), 予測 IoU (N, 候補数), 窓の左上（入力画像の画素 (x, y)）(N, 2))。
         """
         feats0, feats1, embed = feats
+        stride0, stride1, embed_stride = EDGETAM_FEATURE_STRIDES
         grid_h, grid_w = embed.shape[2:]
         win = min(LATTICE_WINDOW_TOKENS, grid_h, grid_w)
-        ratio1, ratio0 = LATTICE_EMBED_STRIDE // LATTICE_FEATS1_STRIDE, LATTICE_EMBED_STRIDE // LATTICE_FEATS0_STRIDE
+        ratio1, ratio0 = embed_stride // stride1, embed_stride // stride0
         windows0, windows1, windows_e, coords, origins = [], [], [], [], []
         for cx, cy in centers:
-            tx = int(np.clip(round(cx / LATTICE_EMBED_STRIDE - win / 2), 0, grid_w - win))
-            ty = int(np.clip(round(cy / LATTICE_EMBED_STRIDE - win / 2), 0, grid_h - win))
+            tx = int(np.clip(round(cx / embed_stride - win / 2), 0, grid_w - win))
+            ty = int(np.clip(round(cy / embed_stride - win / 2), 0, grid_h - win))
             windows_e.append(embed[0, :, ty:ty + win, tx:tx + win])
             windows1.append(feats1[0, :, ty * ratio1:(ty + win) * ratio1, tx * ratio1:(tx + win) * ratio1])
             windows0.append(feats0[0, :, ty * ratio0:(ty + win) * ratio0, tx * ratio0:(tx + win) * ratio0])
-            ox, oy = tx * LATTICE_EMBED_STRIDE, ty * LATTICE_EMBED_STRIDE
+            ox, oy = tx * embed_stride, ty * embed_stride
             coords.append([[cx - half[0] - ox, cy - half[1] - oy], [cx + half[0] - ox, cy + half[1] - oy]])
             origins.append((ox, oy))
         n = len(centers)
         side = win * ratio0
-        low, scores = self.edgetam.decode(
+        low, scores = self.session.decode_batch(
             np.stack(windows0), np.stack(windows1), np.stack(windows_e),
             np.array(coords, np.float32), np.tile(np.array([[2, 3]], np.int32), (n, 1)),  # ラベル 2・3 = 箱の左上・右下
             np.zeros((n, 1, side, side), np.float32), np.zeros((n,), np.float32),
@@ -152,7 +150,7 @@ class LatticeSeparator:
         for k, mask in enumerate(best > 0):
             if mask.any():
                 ys, xs = np.nonzero(mask)
-                out[k] = (origins[k][0] + (xs.mean() + 0.5) * LATTICE_MASK_STRIDE, origins[k][1] + (ys.mean() + 0.5) * LATTICE_MASK_STRIDE)
+                out[k] = (origins[k][0] + (xs.mean() + 0.5) * EDGETAM_FEATURE_STRIDES[0], origins[k][1] + (ys.mean() + 0.5) * EDGETAM_FEATURE_STRIDES[0])
         return out
 
     def _compose(
@@ -164,7 +162,7 @@ class LatticeSeparator:
         scale_x, scale_y = width / input_hw[1], height / input_hw[0]
         logit = np.full((height, width), -EDGETAM_LOGIT_CLIP, np.float32)
         owner = np.full((height, width), -1, np.int32)
-        window = best.shape[-1] * LATTICE_MASK_STRIDE  # 窓の一辺（入力画像の画素）
+        window = best.shape[-1] * EDGETAM_FEATURE_STRIDES[0]  # 窓の一辺（入力画像の画素）
         win_w, win_h = max(1, round(window * scale_x)), max(1, round(window * scale_y))
         for k in np.flatnonzero(use):
             x0, y0 = int(round(origins[k][0] * scale_x)), int(round(origins[k][1] * scale_y))

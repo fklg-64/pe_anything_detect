@@ -3,16 +3,14 @@
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
-import cv2
 import faiss
 import numpy as np
 import yaml
 from scipy import sparse
-from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt
 
 from core.utils import Timer
 from core.common.backend import CLIPBackend
-from core.common.mask_utils import knn_graph, patch_structure, propagate, softmax
+from core.common.mask_utils import knn_graph, propagate, softmax
 from core.common.params import (
     CLIP_LOGIT_SCALE,
     EDGE_PROPAGATION_ALPHA,
@@ -27,23 +25,11 @@ from core.common.semantic_merge import merge_near_ties, merge_synonyms_in_object
 from core.common.result import ClusterView
 
 
-def load_plain_prompts(path: Path) -> List[str]:
-    """base と custom のプロンプトをそのまま連結して返す。"""
+def load_prompts(path: Path) -> List[str]:
+    """プロンプトの yaml から、base（あれば）と custom を連結して返す。"""
     with open(path, mode="r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return data["base"] + data["custom"]
-
-
-def load_color_shape_prompts(path: Path) -> List[str]:
-    """color x shape の全組み合わせから "a photo of a <color> <shape> object." を作り、custom を足して返す。"""
-    with open(path, mode="r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    prompts = []
-    for color in data["color"]:
-        for shape in data["shape"]:
-            article = "an" if color[0].lower() in "aeiou" else "a"
-            prompts += [f"a photo of {article} {color} {shape} object."]
-    return prompts + data["custom"]
+    return data.get("base", []) + data["custom"]
 
 
 class CoarseForeground(NamedTuple):
@@ -66,7 +52,7 @@ class CoarseSegmenter:
         self.niter = config["n_iter"]
         self.foreground_threshold = config["foreground_threshold"]
         self.feature_size: int = extractor.feature_size
-        # 処理する画像のパッチ格子 (高さ, 幅)。アスペクト比を維持するモードでは画像ごとに変わるので、segment の前に runner が設定する
+        # 処理する画像のパッチ格子 (高さ, 幅)
         self.grid: Tuple[int, int] = (self.feature_size, self.feature_size)
 
         # プロンプトとそのテキスト特徴量（前景プロンプト -> 背景プロンプトの順に並べる）
@@ -77,32 +63,28 @@ class CoarseSegmenter:
 
     def _register_text_features(self) -> None:
         prompts_dir = Path(self.prompts_dir)
-        self.foreground_prompts = load_color_shape_prompts(prompts_dir / "foreground.yaml")
-        self.background_prompts = load_plain_prompts(prompts_dir / "background.yaml")
+        self.foreground_prompts = load_prompts(prompts_dir / "foreground.yaml")
+        self.background_prompts = load_prompts(prompts_dir / "background.yaml")
 
         fg_feats = self.extractor.extract_text_features(self.foreground_prompts)
         bg_feats = self.extractor.extract_text_features(self.background_prompts)
         self.fgbg_text_features = np.vstack([fg_feats, bg_feats])
         # 同義語の前景プロンプトの代表（1 つの物体の中で、同義語のクラスをまとめるのに使う）
-        self.synonym_representative = synonym_representatives(fg_feats, PROMPT_SYNONYM_DISTANCE)
-        self.tie_tolerance = PROMPT_TIE_TOLERANCE   # 実験で runner ごとに変えられるよう、インスタンスの属性にしてある（yaml には出さない）
+        self._synonym_representative = synonym_representatives(fg_feats, PROMPT_SYNONYM_DISTANCE)
 
     # =========================================================================
     # CLIP特徴量
     # =========================================================================
 
-    def extract_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # 画像全体の特徴量は使わないので正規化を省く
-        image_features, patch_features, fused_patch_features = (
-            self.extractor.extract_image_features(image_tensor, normalize=False)
-        )
-        return image_features, patch_features, fused_patch_features
+    def extract_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """CLIP（PE）のパッチ特徴と、クラスタリングに使う層を連結した（fused）パッチ特徴。"""
+        return self.extractor.extract_image_features(image_tensor)
 
     # =========================================================================
     # 前景マップ（KMeans -> クラスタごとにテキストと照合）
     # =========================================================================
 
-    def fit_predict_kmeans(self, features: np.ndarray, k: int = 12, niter: int = 10) -> np.ndarray:
+    def fit_predict_kmeans(self, features: np.ndarray, k: int, niter: int) -> np.ndarray:
         """features (N, D) を k 個にKMeansでクラスタ分けし、N 個のクラスタ番号（平坦）を返す。"""
         _, feature_dim = features.shape
         features = np.ascontiguousarray(features, dtype=np.float32)  # faiss は C 連続の float32 を要求する
@@ -150,21 +132,21 @@ class CoarseSegmenter:
 
     def _judge_clusters(
         self, patch_features: np.ndarray, cluster_labels: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """クラスタごとのトークンをテキストと照合し、パッチごとの (前景確信度, プロンプト番号) を返す。
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """クラスタごとのトークンをテキストと照合し、(パッチごとの前景確信度, パッチごとのプロンプト番号, クラスタごとの前景プロンプトのロジット) を返す。
 
-        クラスタごとの前景プロンプトのロジットは self.cluster_logits (クラスタ数, 前景プロンプト数) に残す（僅差のクラスのまとめで使う）。
+        ロジットは (クラスタ数, 前景プロンプト数)。僅差のクラスのまとめ（merge_near_ties）で使う。
         """
         cluster_tokens: List[np.ndarray] = self.extractor.extract_cluster_tokens(patch_features, cluster_labels)
         confidences = np.zeros((len(cluster_tokens),), dtype=np.float32)
         prompt_indices = np.zeros((len(cluster_tokens),), dtype=np.int64)
         num_foreground_prompts = len(self.foreground_prompts)
-        self.cluster_logits = np.zeros((len(cluster_tokens), num_foreground_prompts), dtype=np.float32)
+        cluster_logits = np.zeros((len(cluster_tokens), num_foreground_prompts), dtype=np.float32)
         for label_idx, cluster_feature in enumerate(cluster_tokens):
             prompt_logits = self._prompt_logits(cluster_feature)
             confidences[label_idx], prompt_indices[label_idx] = self._classify_logits(prompt_logits)
-            self.cluster_logits[label_idx] = prompt_logits[:num_foreground_prompts]
-        return confidences[cluster_labels], prompt_indices[cluster_labels]
+            cluster_logits[label_idx] = prompt_logits[:num_foreground_prompts]
+        return confidences[cluster_labels], prompt_indices[cluster_labels], cluster_logits
 
     def generate_foreground_map(
         self,
@@ -177,39 +159,48 @@ class CoarseSegmenter:
 
         edge_embed（EdgeTAMエンコーダの image_embed (1, C, h, w)）を渡すと、PE の判定で得た前景確信度を、EdgeTAM の特徴の
         類似度が高いパッチどうしで伝播して揃える（_propagate_with_edgetam）。
-        edge_graph: edge_embed の kNN グラフ（edge_graph_of の結果）。先に求めてあれば渡す（None なら、ここで求める）。
+        edge_graph: edge_embed の kNN グラフ（edge_graph_of の結果）。PE の実行と重ねて先に求めてあれば渡す（None なら、ここで求める）。
 
         Returns: CoarseForeground（各フィールドの意味はそちら）。
         """
         patch_tokens = fused_patch_features[0, 1:, :]
 
+        # 1. PE の特徴を KMeans でクラスタ分けし、クラスタごとにテキストと照合して、パッチごとの前景確信度とプロンプトを得る
         with Timer("    ┌ Kmeansクラスタ処理時間"):
-            cluster_labels = self.fit_predict_kmeans(patch_tokens, k=self.k_clusters, niter=self.niter)
-
+            pe_labels = self.fit_predict_kmeans(patch_tokens, k=self.k_clusters, niter=self.niter)
         with Timer("    ┌ クラスタごとのCLSトークン抽出処理時間"):
-            confidence, prompt_index = self._judge_clusters(patch_features, cluster_labels)
+            confidence, prompt_index, cluster_logits = self._judge_clusters(patch_features, pe_labels)
 
+        # 2. EdgeTAM の特徴が似たパッチどうしで、前景確信度を伝播して揃える
         pe_clusters = None
-        pe_labels = cluster_labels
         if edge_embed is not None:
-            pe_clusters = ClusterView(cluster_labels, self._prompt_per_cluster(cluster_labels, prompt_index))
+            pe_clusters = ClusterView(pe_labels, self._prompt_per_cluster(pe_labels, prompt_index))
             with Timer("    ┌ EdgeTAM特徴での確信度の伝播処理時間"):
                 confidence, prompt_index = self._propagate_with_edgetam(confidence, prompt_index, edge_embed, edge_graph)
-        # 1 つの物体の別のクラスタが、僅差の似たプロンプトを選んで別クラスに割れるのを防ぐ
-        prompt_index = merge_near_ties(prompt_index, pe_labels, self.cluster_logits, len(self.foreground_prompts), self.tie_tolerance)
-        # ロジットの差が僅差でなくても、同じ物体の中の同義語のクラスは 1 つにする
-        prompt_index = merge_synonyms_in_objects(prompt_index, self.grid, len(self.foreground_prompts), self.synonym_representative)
+
+        # 3. 1 つの物体が、似たプロンプトの別クラスに割れるのを防ぐ
+        prompt_index = self._merge_similar_classes(prompt_index, pe_labels, cluster_logits)
+
+        # 4. クラスタ番号を付け直す。伝播で判定が変わったパッチは、同じ PE のクラスタの中でもプロンプトが違うので、(PE のクラスタ, プロンプト) の組を新しいクラスタにする
+        cluster_labels = pe_labels
         if edge_embed is not None:
-            # PE のクラスタの中でも、伝播で判定が変わったパッチはプロンプトが違うので、(PE のクラスタ, プロンプト) の組を新しいクラスタにする
             num_prompts = len(self.foreground_prompts) + len(self.background_prompts)
             _, cluster_labels = np.unique(pe_labels * num_prompts + prompt_index, return_inverse=True)
             cluster_labels = cluster_labels.reshape(-1)
-
         cluster_index_list = self._prompt_per_cluster(cluster_labels, prompt_index)
 
         foreground_map = confidence.reshape(self.grid).astype(np.float32)
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
         return CoarseForeground(foreground_map, foreground_mask, cluster_labels, cluster_index_list, pe_clusters)
+
+    def _merge_similar_classes(self, prompt_index: np.ndarray, pe_labels: np.ndarray, cluster_logits: np.ndarray) -> np.ndarray:
+        """1 つの物体の別のクラスタが、似たプロンプトを選んで別クラスに割れるのを防ぐ（semantic_merge.py）。
+
+        ロジットが僅差のプロンプトは、より大きいクラスへ統合する。僅差でなくても、同じ物体（連結成分）の中の同義語のクラスは 1 つにする。
+        """
+        num_foreground_prompts = len(self.foreground_prompts)
+        prompt_index = merge_near_ties(prompt_index, pe_labels, cluster_logits, num_foreground_prompts, PROMPT_TIE_TOLERANCE)
+        return merge_synonyms_in_objects(prompt_index, self.grid, num_foreground_prompts, self._synonym_representative)
 
     @staticmethod
     def _prompt_per_cluster(cluster_labels: np.ndarray, prompt_index: np.ndarray) -> List[int]:
@@ -270,57 +261,3 @@ class CoarseSegmenter:
         semantic_indices = np.asarray(cluster_index_list)[cluster_labels]
         labels_list, semantic_labels = np.unique(semantic_indices, return_inverse=True)
         return labels_list, semantic_labels.reshape(self.grid)
-
-    def refine_coarse_segmentation(
-        self, semantic_labels: np.ndarray, foreground_mask: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """パッチ単位の粗い結果を整える。返り値は (前景マスク, セマンティックラベル)。
-
-        1. 前景に囲まれた背景（反射・透明部などの穴）は前景とし、最寄りの前景ラベルを与える。
-           最終的な形はEdgeTAMが決めるため、穴埋めは粗いマスクを物体単位でつなぐ目的に限る。
-        2. 縁・影由来の細いクラス領域を取り除く。
-
-        物体の縁や影のパッチは背景と物体のトークンが混ざり、別クラスタ（別プロンプト）になりやすい。
-        幅が2パッチ以下（3x3で縮めると消える）のクラス領域が他クラスの前景に接していれば、
-        最も長く接するクラスへ統合する。小さい領域から順に処理する。
-        """
-        original_fg = foreground_mask != 0
-        fg = original_fg.copy()
-        labels = semantic_labels.copy()
-
-        # fg = self._fill_holes(fg, labels, original_fg)
-        # self._merge_thin_regions(fg, labels)
-
-        return fg.astype(foreground_mask.dtype), labels
-
-    @staticmethod
-    def _fill_holes(fg: np.ndarray, labels: np.ndarray, original_fg: np.ndarray) -> np.ndarray:
-        """画像端に接しない背景の連結成分（穴）を前景にし、labels（in-place）には最寄りの前景ラベルを与える。"""
-        n, comp = cv2.connectedComponents((~fg).astype(np.uint8), connectivity=4)
-        border_ids = np.unique(np.concatenate([comp[0], comp[-1], comp[:, 0], comp[:, -1]]))
-        holes = (comp > 0) & ~np.isin(comp, border_ids)
-        if holes.any() and original_fg.any():
-            _, (iy, ix) = distance_transform_edt(~original_fg, return_indices=True)
-            labels[holes] = labels[iy, ix][holes]
-            fg = fg | holes
-        return fg
-
-    @staticmethod
-    def _merge_thin_regions(fg: np.ndarray, labels: np.ndarray) -> None:
-        """細いクラス領域を、最も長く接する他クラスへ統合する（labels を in-place で更新）。"""
-        regions = []
-        for class_id in np.unique(labels[fg]):
-            n, comp, stats, _ = cv2.connectedComponentsWithStats(
-                (fg & (labels == class_id)).astype(np.uint8), connectivity=4
-            )
-            regions += [(stats[i, cv2.CC_STAT_AREA], class_id, comp == i) for i in range(1, n)]
-
-        for _, class_id, region in sorted(regions, key=lambda r: r[0]):
-            region &= labels == class_id
-            if not region.any() or binary_erosion(region, structure=patch_structure(), border_value=1).any():
-                continue
-            ring = binary_dilation(region, structure=patch_structure()) & ~region
-            neighbors = labels[ring & fg]
-            neighbors = neighbors[neighbors != class_id]
-            if neighbors.size:
-                labels[region] = np.bincount(neighbors).argmax()

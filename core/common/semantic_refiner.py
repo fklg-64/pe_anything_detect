@@ -1,77 +1,48 @@
-"""粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。"""
+"""粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
 
-import threading
-from concurrent.futures import Executor, Future
+流れ（refine）:
+  1. 準備                  全領域に共通の入力（背景の負例点・ガイド・作業解像度）を作る          RegionEstimator.prepare
+  2. クラスごとの推定      クラスごとに EdgeTAM で推定し、重なりはスコアの高いクラスを優先する    _refine_classes
+  3. 取りこぼしの再推定    どのクラスにも覆われなかった粗い成分だけを、単独で推定し直す          _rescue_uncovered
+  4. 後処理                小領域の除去 -> 前景内部の細い隙間を埋める -> 格子状の物体を 1 個ずつに分ける
+  5. 元画像の大きさへ戻す
+
+領域の推定（RegionEstimator.estimate）は何も書き換えないので、worker_threads があれば、次の領域のデコードと重ねて実行する。
+推定の結果を semantic_map に反映するのは常にこのクラスで、クラス番号の順（取りこぼしは検出した順）に行うので、出力はスレッドの有無で変わらない。
+"""
+
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import cv2
 import numpy as np
-from scipy.ndimage import binary_dilation
 
-from core.utils import Timer, normalize_image
-from core.common.backend import EdgeTamBackend
-from core.common.edgetam_helper import EdgeTamHelper
-from core.common.image_layout import ImageLayout
+from core.utils import Timer
+from core.common.edgetam_session import EdgeTamSession, Features
 from core.common.lattice_separator import LatticeSeparator
 from core.common.mask_utils import (
     Component,
-    clean_mask,
     connected_components,
+    dilate,
     fill_narrow_gaps,
-    guided_filter,
-    patch_mean,
-    patch_structure,
-    prompt_points,
     remove_small_regions,
-    resize_map,
     resize_mask,
-    select_background_points,
 )
-from core.common.object_points import (
-    background_features,
-    normalize_features,
-    object_prompt_points,
-    objectness_map,
-)
-from core.common.params import (
-    EDGETAM_HIGH_RES_FEATURE_DOWNSCALE,
-    EDGETAM_MASK_DOWNSCALE,
-    GUIDED_FILTER_EPS,
-    MASK_LOGIT_THRESHOLD,
-    MIN_ISOLATED_PATCHES,
-    MIN_REGION_PATCH_AREA,
-    PRIOR_LOGIT_RANGE,
-    PRIOR_NON_CORE_PROBABILITY,
-    SCORE_PRIOR_WEIGHT,
-)
+from core.common.parallel import JobGroup, Workers
+from core.common.params import MIN_ISOLATED_PATCHES
+from core.common.region_estimator import RefineInput, RegionEstimator, RegionResult
 
 
 @dataclass
-class RefineContext:
-    """1枚の画像を精緻化する間、各段階で共有する入力と、更新していく結果。"""
+class RefineState:
+    """精緻化の途中経過。領域の推定結果を反映して更新していく（反映は SemanticRefiner だけが行う）。"""
 
-    # 入力（全クラス共通）
-    feats: Tuple                           # EdgeTAMエンコーダの出力
-    background_coords: List[List[float]]   # 背景の負例点（画像座標）
-    foreground_map: np.ndarray             # 粗い前景らしさ（パッチ格子）
-    width: int                             # 元画像サイズ
-    height: int
-    size: Tuple[int, int]                  # 作業解像度 (幅, 高さ)
-    min_area: int                          # ノイズとして除去する最小面積（作業解像度の画素数）
-    guide: np.ndarray                      # 初期マスクの縁を整えるガイド（入力画像の輝度。EdgeTAMの高解像度特徴量と同じ大きさ、float32、0〜1）
-    grid: Tuple[int, int]                  # パッチ格子 (高さ, 幅)。画像の全体を覆う（パディングは含まない）
-    input_hw: Tuple[int, int]              # モデルに入力した画像の内容の大きさ (高さ, 幅)。プロンプト点の座標変換に使う
-    normalized_feats: Optional[List[np.ndarray]]      # EdgeTAMの特徴量3層を画素ごとにL2正規化したもの。前景の点を物体の上に選ぶのに使う（object_points.py）
-    background_means: Optional[List[np.ndarray]]      # 上の各層の、背景の特徴の平均（全クラス共通）。作れなければ None
-
-    # 結果（段階ごとに更新する）
     semantic_map: np.ndarray               # 作業解像度。0=背景、1~=前景クラス
     best_score: np.ndarray                 # 各画素で勝ったクラスのスコア
-    point_coords: List[List[float]] = field(default_factory=list)
+    point_coords: List[List[float]] = field(default_factory=list)   # EdgeTAMに与えた点（元画像の画素座標。全領域分）
     point_labels: List[int] = field(default_factory=list)
-    logits: List[np.ndarray] = field(default_factory=list)  # EdgeTAM の低解像度ロジット（入力の 1/4）。クラス・再推定ごと
+    logits: List[np.ndarray] = field(default_factory=list)          # EdgeTAM の低解像度ロジット（入力の 1/4）。領域ごと
     debug_images: Dict[str, np.ndarray] = field(default_factory=dict)  # 中間画像（名前 -> 0〜1 の配列）。保存は呼び出し側
 
 
@@ -85,56 +56,13 @@ class RefineOutput(NamedTuple):
     debug_images: Dict[str, np.ndarray]  # 精緻化の中間画像（名前 -> 0〜1 の配列。作業解像度かパッチ格子の大きさ）
 
 
-class RegionResult(NamedTuple):
-    """1 つの領域（クラス、または取りこぼしの成分）の推定結果。ctx は変えない（反映は SemanticRefiner._commit_region）。"""
-
-    binary: np.ndarray                 # EdgeTAM の 2 値マスク（作業解像度）
-    score: Optional[np.ndarray]        # 重なり解決用スコア（need_score が偽なら None）
-    core: np.ndarray
-    coords: List[List[float]]          # EdgeTAM に与えた点（画像座標）
-    labels: List[int]
-    logit: Optional[np.ndarray]        # 低解像度ロジット（デコーダーの結果が無ければ None）
-
-
-class _Deferred:
-    """pool が無いとき、result() を呼んだときに実行する（従来どおりの実行順にするため）。Future と同じ使い方ができる。"""
-
-    def __init__(self, function: Callable[[], RegionResult]):
-        self._function = function
-
-    def result(self) -> RegionResult:
-        return self._function()
-
-    def cancel(self) -> bool:
-        return True
-
-
 class SemanticRefiner:
-    def __init__(
-        self,
-        edgetam: Union[EdgeTamBackend, EdgeTamHelper],
-        feature_size: int,
-        config: dict,
-        pool: Optional[Executor] = None,
-    ):
-        self.edgetam = edgetam
-        self.feature_size = feature_size
-        self.foreground_points_per_class = config["edgetam_foreground_points_per_class"]
-        self.background_point_count = config["edgetam_background_point_count"]
-        self.refine_iterations = config["edgetam_refine_iterations"]
-        # 取りこぼしの再推定（_rescue_uncovered）の反復回数。None ならクラスと同じ（edgetam_refine_iterations）。実験で変える
-        self.rescue_iterations: Optional[int] = config.get("edgetam_rescue_iterations")
-        self.semantic_max_side = config["semantic_max_side"]
+    def __init__(self, session: EdgeTamSession, feature_size: int, config: dict, workers: Workers):
+        self.session = session
+        self.estimator = RegionEstimator(session, feature_size, config)
         # 格子状に並んだ小物体を 1 個ずつに分ける（lattice_separator.py）
-        self.lattice_separator = LatticeSeparator(edgetam, config["foreground_threshold"])
-        # 初期マスクの縁を整えるガイデッドフィルタの半径 = 粗いマスクの信頼限界（1パッチ）が、高解像度特徴量の何画素か
-        self.guide_radius: int = max(1, (edgetam.target_size // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE) // feature_size)
-        # 前景の点を、EdgeTAM の高解像度特徴量の画素から物体の上に選ぶ（object_points.py）。False なら従来どおりパッチの中心（実験で切れる）
-        self.use_object_points = True
-        # 領域ごとの推定を、デコーダー以外の NumPy の整形と重ねて実行するスレッドプール（None なら従来どおり 1 つずつ）。
-        # デコーダーの実行は同時に 1 つだけ（_decode_lock）。結果は従来と同じ順に反映するので、出力は変わらない
-        self.pool = pool
-        self._decode_lock = threading.Lock()
+        self.lattice_separator = LatticeSeparator(session, config["foreground_threshold"])
+        self.workers = workers
 
     # =========================================================================
     # メインの流れ
@@ -149,8 +77,7 @@ class SemanticRefiner:
         labels_list: np.ndarray,
         width: int,
         height: int,
-        feats: Optional[Tuple] = None,
-        layout: Optional[ImageLayout] = None,
+        feats: Optional[Features] = None,
     ) -> RefineOutput:
         """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
 
@@ -160,10 +87,7 @@ class SemanticRefiner:
         どのクラスのマスクにも入らなかった粗い連結成分は、その成分だけで再推定する。
 
         resized: リサイズ済み（正規化前）の画像。EdgeTAMエンコーダの入力と、初期マスクの縁を整えるガイドになる。
-        feats: EdgeTAMエンコーダの出力（layout がパディングを持つときは、有効な領域に切り出し済み）。
-               粗い判定で既に計算しているときに渡すと、エンコーダを再実行しない（None なら実行する）。
-        layout: モデル入力のレイアウト。None なら image_size 四方（従来どおり）。パッチ格子・ロジット・プロンプト点はすべて、
-                パディングを除いた画像の内容（元画像の全体に対応する）を基準にする。
+        feats: EdgeTAMエンコーダの出力。粗い判定で既に計算しているときに渡すと、エンコーダを再実行しない（None なら実行する）。
 
         Returns: RefineOutput（各フィールドの意味はそちら）。
         """
@@ -173,116 +97,55 @@ class SemanticRefiner:
         if len(semantic_ids) == 0:
             return RefineOutput(np.zeros((height, width), dtype=np.uint8), prompt_indices, [], [], {})
 
-        content = resized if layout is None else layout.content(resized)
-
-        # EdgeTAMの特徴量抽出（全クラス共通）
+        # 1. 準備
         if feats is None:
             with Timer("    ┌ edgetam特徴量抽出"):
-                feats = self.predict_encoder(resized)
-                if layout is not None:
-                    feats = layout.crop_edgetam(feats)
-
-        ctx = self._make_context(content, feats, foreground_map, foreground_binary, width, height, layout)
-
-        # クラスごとに推定し、どのクラスにも入らなかった粗い連結成分は単独で再推定する
-        class_components = self._refine_classes(ctx, semantic_ids, semantic_labels, foreground_binary)
-        self._rescue_uncovered(ctx, class_components)
-        ctx.debug_images["semantic_map_before_cleanup"] = ctx.semantic_map / max(len(semantic_ids), 1)
-
-        # 重ね合わせ後のノイズ除去
-        remove_small_regions(ctx.semantic_map, ctx.min_area, self.pool)
-        # クラス境界の割れ（前景の内部の細い隙間）を埋める
-        fill_narrow_gaps(ctx.semantic_map, foreground_binary)
-        # 格子状に並んだ小物体（隙間が 1 パッチ未満で、1 つの塊になる）を、セルごとに 1 個ずつに分ける
-        self._separate_lattice(ctx, content, feats)
-
-        return RefineOutput(self._to_image_size(ctx), prompt_indices, ctx.point_coords, ctx.point_labels, ctx.debug_images)
-
-    def _make_context(
-        self,
-        content: np.ndarray,
-        feats: Tuple,
-        foreground_map: np.ndarray,
-        foreground_binary: np.ndarray,
-        width: int,
-        height: int,
-        layout: Optional[ImageLayout],
-    ) -> RefineContext:
-        """全クラス共通の入力（背景の負例点・ガイド・作業解像度など）と、空の結果を持つ RefineContext を作る。"""
-        # マスク演算は長辺が semantic_max_side 以下の作業解像度で行い、最後に元画像サイズへ戻す
-        scale = min(1.0, self.semantic_max_side / max(width, height))
-        work_w, work_h = max(1, round(width * scale)), max(1, round(height * scale))
-        grid = (self.feature_size, self.feature_size) if layout is None else layout.valid_grid
-
-        # 前景の点を物体の上に選ぶための、正規化した特徴量と背景の特徴（全クラス共通なので、画像に 1 回だけ求める）
-        normalized_feats = normalize_features(feats) if self.use_object_points else None
-        background_means = None if normalized_feats is None else background_features(normalized_feats, foreground_binary)
-
-        # 背景の負例点は全クラス共通
-        background_coords = self.transform_coords(
-            select_background_points(foreground_binary, self.background_point_count, foreground_map).tolist(), width, height, grid
-        )
-        return RefineContext(
-            feats=feats,
-            background_coords=background_coords,
-            foreground_map=foreground_map,
-            width=width,
-            height=height,
-            size=(work_w, work_h),
-            # 粗いマスクの信頼限界は1パッチ。1パッチ未満の領域はノイズとして扱う
-            min_area=max(1, int(MIN_REGION_PATCH_AREA * work_w * work_h / (grid[0] * grid[1]))),
-            guide=self._make_guide(content),
-            grid=grid,
-            input_hw=content.shape[:2],
-            normalized_feats=normalized_feats,
-            background_means=background_means,
+                feats = self.session.encode(resized)
+        inputs = self.estimator.prepare(resized, feats, foreground_map, foreground_binary, width, height)
+        work_w, work_h = inputs.size
+        state = RefineState(
             semantic_map=np.zeros((work_h, work_w), dtype=np.uint8),
             best_score=np.full((work_h, work_w), -1.0, dtype=np.float32),
         )
 
-    def _separate_lattice(self, ctx: RefineContext, content: np.ndarray, feats: Tuple) -> None:
-        """格子状に並んだ物体があれば、semantic_map（in-place）をセルごとの物体に分ける（作動は稀）。"""
-        if not ctx.logits:
-            return
-        lattice = self.lattice_separator.separate(
-            ctx.semantic_map, content, np.maximum.reduce(ctx.logits), feats, ctx.foreground_map
-        )
-        if lattice is not None:
-            ctx.debug_images["lattice_instances"] = (lattice["instance_logit"] > 0).astype(np.float32)
+        # 2.・3. クラスごとに推定し、どのクラスにも入らなかった粗い連結成分は単独で再推定する
+        class_components = self._refine_classes(inputs, state, semantic_ids, semantic_labels, foreground_binary)
+        self._rescue_uncovered(inputs, state, class_components)
+        state.debug_images["semantic_map_before_cleanup"] = state.semantic_map / max(len(semantic_ids), 1)
 
-    @staticmethod
-    def _to_image_size(ctx: RefineContext) -> np.ndarray:
-        """作業解像度のセマンティックマップを、元画像の大きさへ戻す（同じ大きさならそのまま）。"""
-        if ctx.size == (ctx.width, ctx.height):
-            return ctx.semantic_map
-        return cv2.resize(ctx.semantic_map, (ctx.width, ctx.height), interpolation=cv2.INTER_NEAREST)
+        # 4. 後処理: 重ね合わせ後のノイズ除去 -> クラス境界の割れ（前景の内部の細い隙間）を埋める
+        remove_small_regions(state.semantic_map, inputs.min_area, self.workers)
+        fill_narrow_gaps(state.semantic_map, foreground_binary)
+        #    格子状に並んだ小物体（隙間が 1 パッチ未満で、1 つの塊になる）を、セルごとに 1 個ずつに分ける
+        self._separate_lattice(inputs, state, resized, feats)
 
-    def _high_res_size(self, input_hw: Tuple[int, int]) -> Tuple[int, int]:
-        """EdgeTAMの高解像度特徴量の大きさ (幅, 高さ)。cv2.resize に渡す向き。"""
-        return input_hw[1] // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE, input_hw[0] // EDGETAM_HIGH_RES_FEATURE_DOWNSCALE
+        # 5. 元画像の大きさへ戻す（作業解像度が同じならそのまま）
+        semantic_map = state.semantic_map
+        if inputs.size != (width, height):
+            semantic_map = cv2.resize(semantic_map, (width, height), interpolation=cv2.INTER_NEAREST)
+        return RefineOutput(semantic_map, prompt_indices, state.point_coords, state.point_labels, state.debug_images)
 
-    def _make_guide(self, content: np.ndarray) -> np.ndarray:
-        """初期マスクの縁を整えるガイド。入力画像（パディングを除いた内容）の輝度を、EdgeTAMの高解像度特徴量の大きさに縮小したもの（float32、0〜1）。"""
-        return cv2.resize(content, self._high_res_size(content.shape[:2]), interpolation=cv2.INTER_AREA).astype(np.float32).mean(axis=-1) / 255.0
-
-    def _submit(self, function: Callable[[], RegionResult]) -> Union[Future, _Deferred]:
-        """領域の推定を pool に投入する（pool が無ければ、結果を取り出すときに実行する）。"""
-        return self.pool.submit(function) if self.pool is not None else _Deferred(function)
+    # =========================================================================
+    # 2. クラスごとの推定
+    # =========================================================================
 
     def _refine_classes(
         self,
-        ctx: RefineContext,
+        inputs: RefineInput,
+        state: RefineState,
         semantic_ids: np.ndarray,
         semantic_labels: np.ndarray,
         foreground_binary: np.ndarray,
-    ) -> dict:
+    ) -> Dict[int, List[Component]]:
         """クラスごとにEdgeTAMでマスクを推定し、スコアの高いクラスを優先して semantic_map に書き込む。
+
+        先に全クラスの推定を投入し（worker_threads があれば、デコードと整形が重なって進む）、結果はクラス番号の順に反映する。
 
         Returns: クラス番号 -> 粗い連結成分のリスト（取りこぼしの再推定で使う）
         """
-        class_components = {}
-        pending = []  # (クラス番号, 粗いマスク, 結果)
-        try:
+        class_components: Dict[int, List[Component]] = {}
+        with JobGroup(self.workers) as jobs:
+            queue = []  # (クラス番号, 粗いマスク, 推定の仕事)
             for class_id, semantic_id in enumerate(semantic_ids, start=1):
                 coarse_mask = (semantic_labels == semantic_id) & foreground_binary
                 comps = connected_components(coarse_mask)
@@ -292,259 +155,90 @@ class SemanticRefiner:
                 # 経由して物体のマスクが周囲の背景へ広がる。斑点は後段で個別に（範囲を制限して）扱う
                 main = [c for c in comps if c.region.sum() >= MIN_ISOLATED_PATCHES] or comps
                 coarse_main = np.any([c.region for c in main], axis=0)
-                job = partial(self._compute_region, ctx, coarse_main, main, f"クラス{class_id}")
-                pending.append((class_id, coarse_mask, self._submit(job)))
+                job = partial(self.estimator.estimate, inputs, coarse_main, main, f"クラス{class_id}")
+                queue.append((class_id, coarse_mask, jobs.submit(job)))
 
-            for class_id, coarse_mask, future in pending:
-                result = future.result()
-                self._commit_region(ctx, result)
-                binary, score, core = result.binary, result.score, result.core
+            for class_id, coarse_mask, job in queue:
+                result = job.result()
+                self._record_prompts(state, result)
 
                 # 重なり部分はスコアの高いクラスを優先
-                win = binary & (score > ctx.best_score)
-                ctx.semantic_map[win] = class_id
-                ctx.best_score[win] = score[win]
+                win = result.binary & (result.score > state.best_score)
+                state.semantic_map[win] = class_id
+                state.best_score[win] = result.score[win]
 
-                ctx.debug_images[f"c{class_id}_coarse_mask"] = coarse_mask
-                ctx.debug_images[f"c{class_id}_core"] = core
-                ctx.debug_images[f"c{class_id}_edgetam_mask"] = binary
-                ctx.debug_images[f"c{class_id}_score"] = score
-        finally:
-            for _, _, future in pending:
-                future.cancel()
+                state.debug_images[f"c{class_id}_coarse_mask"] = coarse_mask
+                state.debug_images[f"c{class_id}_core"] = result.core
+                state.debug_images[f"c{class_id}_edgetam_mask"] = result.binary
+                state.debug_images[f"c{class_id}_score"] = result.score
         return class_components
 
-    def _rescue_uncovered(self, ctx: RefineContext, class_components: dict) -> None:
+    # =========================================================================
+    # 3. 取りこぼしの再推定
+    # =========================================================================
+
+    def _rescue_uncovered(self, inputs: RefineInput, state: RefineState, class_components: Dict[int, List[Component]]) -> None:
         """取りこぼし防止: 最内点がどのクラスにも覆われていない粗い連結成分は、単独で再推定する。
 
-        再推定の入力は semantic_map を読まないので、クラスの反映が済んだ時点で覆われていない成分は、先にまとめて推定を始める。
-        結果は従来と同じ順に反映し、反映の時点で（先の再推定に）覆われていた成分の結果は捨てる（従来はその成分を推定しなかった）。
+        再推定の入力は semantic_map を読まないので、クラスの反映が済んだ時点で覆われていない成分は、先にまとめて推定を始める（投機的な推定）。
+        結果は検出した順に反映し、反映の時点で（先の再推定に）覆われていた成分の結果は捨てる。
         """
-        work_w, work_h = ctx.size
-        grid_h, grid_w = ctx.grid
-        pending = []  # (クラス番号, 成分, 最内点の作業解像度の座標, 結果)
-        try:
+        with JobGroup(self.workers) as jobs:
+            queue = []  # (クラス番号, 成分, 最内点の作業解像度の座標, 推定の仕事)
             for class_id, comps in class_components.items():
                 for component in comps:
-                    px = min(int((component.peak[0] + 0.5) * work_w / grid_w), work_w - 1)
-                    py = min(int((component.peak[1] + 0.5) * work_h / grid_h), work_h - 1)
-                    if ctx.semantic_map[py, px] != 0:
+                    peak = self._peak_in_work_size(inputs, component)
+                    if self._is_covered(state, peak):
                         continue
                     job = partial(
-                        self._compute_region, ctx, component.region, [component], f"クラス{class_id}(再推定)",
-                        need_score=False, iterations=self.rescue_iterations,
+                        self.estimator.estimate, inputs, component.region, [component], f"クラス{class_id}(再推定)", need_score=False
                     )
-                    pending.append((class_id, component, (px, py), self._submit(job)))
+                    queue.append((class_id, component, peak, jobs.submit(job)))
 
-            for class_id, component, (px, py), future in pending:
-                if ctx.semantic_map[py, px] != 0:
+            for class_id, component, peak, job in queue:
+                if self._is_covered(state, peak):  # 先の再推定で覆われたので、この成分は推定しなかったことにする
                     continue
-                result = future.result()
-                self._commit_region(ctx, result)
-                peak, region, binary = component.peak, component.region, result.binary
-                if region.sum() < MIN_ISOLATED_PATCHES:
+                result = job.result()
+                self._record_prompts(state, result)
+                binary = result.binary
+                if component.region.sum() < MIN_ISOLATED_PATCHES:
                     # 極小成分は、成分を1パッチ広げた範囲までに制限する
-                    allowed = binary_dilation(region, structure=patch_structure())
-                    binary &= resize_mask(allowed, ctx.size)
-                ctx.semantic_map[binary & (ctx.semantic_map == 0)] = class_id
-                ctx.debug_images[f"c{class_id}_rescue_{peak[0]}_{peak[1]}"] = binary
-        finally:
-            for _, _, _, future in pending:
-                future.cancel()
+                    binary &= resize_mask(dilate(component.region), inputs.size)
+                state.semantic_map[binary & (state.semantic_map == 0)] = class_id
+                state.debug_images[f"c{class_id}_rescue_{component.peak[0]}_{component.peak[1]}"] = binary
 
-    def _refine_region(
-        self, ctx: RefineContext, coarse_mask: np.ndarray, comps: List[Component], tag: str, need_score: bool = True
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
-        """粗いマスクに対するEdgeTAMの2値マスク(作業解像度)・重なり解決用スコア・coreを返す。
-
-        EdgeTAMに与えた点は ctx.point_coords / point_labels に追記する。
-        need_score が偽なら、スコアは求めずに None を返す（重なりを解決しない取りこぼしの再推定では使わない）。
-        """
-        result = self._compute_region(ctx, coarse_mask, comps, tag, need_score)
-        self._commit_region(ctx, result)
-        return result.binary, result.score, result.core
+    def _peak_in_work_size(self, inputs: RefineInput, component: Component) -> Tuple[int, int]:
+        """成分の最内点（パッチ格子）に当たる、作業解像度の画素 (x, y)。"""
+        work_w, work_h = inputs.size
+        grid_h, grid_w = self.estimator.grid
+        return (
+            min(int((component.peak[0] + 0.5) * work_w / grid_w), work_w - 1),
+            min(int((component.peak[1] + 0.5) * work_h / grid_h), work_h - 1),
+        )
 
     @staticmethod
-    def _commit_region(ctx: RefineContext, result: RegionResult) -> None:
-        """領域の推定で EdgeTAM に与えた点とロジットを ctx に追記する。領域を反映する順に呼ぶ。"""
-        ctx.point_coords.extend(result.coords)
-        ctx.point_labels.extend(result.labels)
+    def _is_covered(state: RefineState, peak: Tuple[int, int]) -> bool:
+        """作業解像度の画素 peak=(x, y) が、すでにどれかのクラスに覆われているか。"""
+        return state.semantic_map[peak[1], peak[0]] != 0
+
+    @staticmethod
+    def _record_prompts(state: RefineState, result: RegionResult) -> None:
+        """領域の推定で EdgeTAM に与えた点とロジットを state に追記する。領域を反映する順に呼ぶ。"""
+        state.point_coords.extend(result.coords)
+        state.point_labels.extend(result.labels)
         if result.logit is not None:
-            ctx.logits.append(result.logit)
-
-    def _compute_region(
-        self, ctx: RefineContext, coarse_mask: np.ndarray, comps: List[Component], tag: str, need_score: bool = True,
-        iterations: Optional[int] = None,
-    ) -> RegionResult:
-        """1 つの領域の推定（事前マスク・前景点・EdgeTAM のデコード・マスクの整形）。ctx は読むだけで、変えない（別スレッドから呼べる）。"""
-        core = np.zeros_like(coarse_mask, dtype=bool)
-        for component in comps:
-            core |= component.core
-        coarse_map = patch_mean(coarse_mask)
-        prior_map = self._build_prior_map(ctx, coarse_mask, coarse_map, core)
-
-        fg_points = self._foreground_points(ctx, coarse_mask, comps, core)
-        logit, coords, labels = self._estimate_class_logit(
-            ctx.feats, prior_map, fg_points, ctx.background_coords, ctx.width, ctx.height, tag, ctx.grid, ctx.input_hw, iterations
-        )
-
-        # 粗い前景らしさ（粗いマスクの周辺平均 × 前景確信度）
-        coarse_foreground_score = (coarse_map * ctx.foreground_map).astype(np.float32) if need_score else None
-        if logit is None:
-            coarse_full = resize_mask(coarse_mask, ctx.size)
-            score = resize_map(coarse_foreground_score, ctx.size, cv2.INTER_LINEAR) if need_score else None
-            return RegionResult(coarse_full, score, core, coords, labels, None)
-
-        logit_full = cv2.resize(logit.astype(np.float32), ctx.size, interpolation=cv2.INTER_LINEAR)
-        binary = clean_mask(logit_full > MASK_LOGIT_THRESHOLD, ctx.min_area).view(bool)
-        if not need_score:
-            return RegionResult(binary, None, core, coords, labels, logit)
-
-        # 重なり解決用スコア = EdgeTAMの確信度 × ((1-w) + w × 粗い前景らしさ)
-        confidence = 1.0 / (1.0 + np.exp(-logit.astype(np.float32)))
-        prior_low = cv2.resize(coarse_foreground_score, confidence.shape[::-1], interpolation=cv2.INTER_LINEAR)
-        score = confidence * ((1.0 - SCORE_PRIOR_WEIGHT) + SCORE_PRIOR_WEIGHT * prior_low)
-        return RegionResult(binary, resize_map(score, ctx.size, cv2.INTER_LINEAR), core, coords, labels, logit)
-
-    def _foreground_points(self, ctx: RefineContext, coarse_mask: np.ndarray, comps: List[Component], core: np.ndarray) -> np.ndarray:
-        """クラスの正例点（パッチ座標）。EdgeTAM の高解像度特徴量で物体らしさを求め、粗いマスクの縁も含めて物体の上の画素から選ぶ。
-
-        背景の特徴が作れないとき（前景が画像の全体など）は、従来どおり core 上のパッチの中心から選ぶ。
-        """
-        peaks = [c.peak for c in comps]
-        score = None
-        if ctx.background_means is not None:
-            score = objectness_map(ctx.normalized_feats, ctx.background_means, core)
-        if score is None:
-            return prompt_points(core, peaks, self.foreground_points_per_class)
-        return object_prompt_points(score, coarse_mask, peaks, self.foreground_points_per_class, ctx.grid)
-
-    def _build_prior_map(
-        self, ctx: RefineContext, coarse_mask: np.ndarray, coarse_map: np.ndarray, core: np.ndarray
-    ) -> np.ndarray:
-        """EdgeTAMに初期マスクとして与える、前景確率のマップ（高解像度特徴量と同じ大きさ、0〜1）を作る。
-
-        core内は前景、core外の粗いマスクとその外側1パッチ(信頼限界)は不明(PRIOR_NON_CORE_PROBABILITY)、それより外は背景。
-        外側1パッチを背景にすると、粗いマスクが物体より内側に入ったとき（縁のパッチは物体と背景のトークンが混ざり落ちやすい）縁が削れる。
-        不明の縁は、入力画像の縁に沿って物体側・背景側へ倒す（高解像度特徴量の大きさに拡大してガイデッドフィルタ）。
-        パッチ格子の縛りと、小物体で外周が背景へ膨らむのを避けるため。
-
-        coarse_map: coarse_mask のパッチ近傍平均（patch_mean）。
-        """
-        core_map = patch_mean(core)
-        unknown = np.maximum(coarse_map, binary_dilation(coarse_mask, patch_structure()).astype(np.float32))
-        prior_map = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
-        upsampled = cv2.resize(prior_map, self._high_res_size(ctx.input_hw), interpolation=cv2.INTER_LINEAR)
-        return np.clip(guided_filter(ctx.guide, upsampled, self.guide_radius, GUIDED_FILTER_EPS), 0.0, 1.0)
-
-    def _estimate_class_logit(
-        self,
-        feats: Tuple,
-        prior_map: np.ndarray,
-        foreground_points: np.ndarray,
-        background_coords: List[List[float]],
-        width: int,
-        height: int,
-        tag: str,
-        grid: Optional[Tuple[int, int]] = None,
-        input_hw: Optional[Tuple[int, int]] = None,
-        iterations: Optional[int] = None,
-    ) -> Tuple[Optional[np.ndarray], List[List[float]], List[int]]:
-        """正例点と共通の負例点でEdgeTAMを反復実行し、低解像度ロジット(128x128)を返す。
-
-        prior_map: 初期マスクの前景確率（EdgeTAMの高解像度特徴量と同じ大きさ）。ロジットは (2p-1)*PRIOR_LOGIT_RANGE（0.5=不明）。
-        grid, input_hw: パッチ格子 (高さ, 幅) と、モデルに入力した画像の内容の大きさ (高さ, 幅)。None なら image_size 四方。
-        iterations: 反復回数。None なら edgetam_refine_iterations。
-        """
-        coords = self.transform_coords(foreground_points.tolist(), width, height, grid)
-        labels = [1] * len(coords)
-        coords = coords + background_coords
-        labels = labels + [0] * len(background_coords)
-
-        high_res_size = self._high_res_size(input_hw or (self.edgetam.target_size, self.edgetam.target_size))
-        mask_input = cv2.resize(
-            (2.0 * prior_map - 1.0) * PRIOR_LOGIT_RANGE, high_res_size, interpolation=cv2.INTER_LINEAR,
-        )[None, ...]
-
-        # 前回のロジットを入力にして再推定を繰り返す
-        logit: Optional[np.ndarray] = None
-        for it in range(self.refine_iterations if iterations is None else iterations):
-            with Timer(f"    ┌ edgetam {tag} {it + 1}回目マスク推定"):
-                _, scores, logits = self.predict_decoder(
-                    point_coords=coords,
-                    point_labels=labels,
-                    feats=feats,
-                    height=height,
-                    width=width,
-                    mask_input=mask_input,
-                    input_hw=input_hw,
-                )
-            if len(scores) == 0:
-                break
-            best_idx = int(np.argmax(scores))
-            mask_input = logits[best_idx:best_idx + 1]
-            logit = logits[best_idx]
-        return logit, coords, labels
+            state.logits.append(result.logit)
 
     # =========================================================================
-    # EdgeTAM の実行と座標変換
+    # 4. 後処理
     # =========================================================================
 
-    def predict_encoder(self, resized: np.ndarray) -> Tuple:
-        """EdgeTAM Encoder の実行。resized は resize_image 済み（正規化前）の画像。"""
-        return self.edgetam.encode(
-            normalize_image(resized, self.edgetam.mean, self.edgetam.std)
+    def _separate_lattice(self, inputs: RefineInput, state: RefineState, resized: np.ndarray, feats: Features) -> None:
+        """格子状に並んだ物体があれば、semantic_map（in-place）をセルごとの物体に分ける（作動は稀）。"""
+        if not state.logits:
+            return
+        lattice = self.lattice_separator.separate(
+            state.semantic_map, resized, np.maximum.reduce(state.logits), feats, inputs.foreground_map
         )
-
-    def predict_decoder(
-        self,
-        point_coords: List[List[float]],
-        point_labels: List[int],
-        feats: Tuple,
-        height: int,
-        width: int,
-        mask_input: Optional[np.ndarray] = None,
-        input_hw: Optional[Tuple[int, int]] = None,
-    ) -> Tuple[None, np.ndarray, np.ndarray]:
-        """EdgeTAM Decoder の実行。(masks=None, scores, 低解像度logits) を返す。
-
-        masks は使わないので計算しない（リサイズ・二値化を省く）。
-        """
-        if mask_input is None:
-            mask_logits_tensor = np.array([0], dtype=np.float32)
-        else:
-            mask_logits_tensor = mask_input
-
-        mask_input_tensor, point_coords_norm, point_labels_norm, has_mask = self.edgetam.preprocess(
-            (height, width),
-            point_coords=np.array(point_coords, dtype=np.float32),
-            point_labels=np.array(point_labels, dtype=np.int32),
-            mask_logits=mask_logits_tensor,
-            input_hw=input_hw,
-        )
-
-        high_res_feats0, high_res_feats1, image_embed = feats
-        with self._decode_lock, Timer("    ┌ デコード"):  # デコーダーは同時に 1 つだけ実行する（領域の推定を別スレッドで重ねるとき）
-            low_res_masks, iou_predictions = self.edgetam.decode(
-                high_res_feats0, high_res_feats1, image_embed,
-                point_coords=point_coords_norm,
-                point_labels=point_labels_norm,
-                mask_input=mask_input_tensor,
-                has_mask=has_mask,
-            )
-
-        with Timer("    ┌ リサイズ"):
-            return self.edgetam.postprocess(
-                low_res_masks, iou_predictions, (height // EDGETAM_MASK_DOWNSCALE, width // EDGETAM_MASK_DOWNSCALE),
-                need_masks=False,
-            )
-
-    def transform_coords(
-        self, pts: List[List[int]], width: int, height: int, grid: Optional[Tuple[int, int]] = None
-    ) -> List[List[float]]:
-        """パッチ格子の座標 (x, y) を、各パッチの中心に当たる元画像の座標へ変換する。grid は (高さ, 幅)。None なら正方形の格子。"""
-        grid_h, grid_w = grid or (self.feature_size, self.feature_size)
-        return [
-            [(x + 0.5) * width / grid_w, (y + 0.5) * height / grid_h]
-            for x, y in pts
-        ]
+        if lattice is not None:
+            state.debug_images["lattice_instances"] = (lattice["instance_logit"] > 0).astype(np.float32)

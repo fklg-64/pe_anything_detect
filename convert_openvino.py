@@ -1,15 +1,19 @@
 import os
 import sys
 
+from core.common.params import SYSTEM_OPENVINO_DIR  # 定数だけのファイル（openvino を import しない）
+
+
 def _cleanup_openvino_paths():
-    """/opt/intel/openvino 関連のパスを sys.path および PYTHONPATH から除去"""
-    sys.path = [p for p in sys.path if not p.startswith("/opt/intel/openvino")]
+    """システム版 OpenVINO（SYSTEM_OPENVINO_DIR）関連のパスを sys.path および PYTHONPATH から除去（pip 版 openvino との衝突回避。import openvino より前に呼ぶ）"""
+    sys.path = [p for p in sys.path if not p.startswith(SYSTEM_OPENVINO_DIR)]
     if "PYTHONPATH" in os.environ:
         paths = os.environ["PYTHONPATH"].split(os.pathsep)
         os.environ["PYTHONPATH"] = os.pathsep.join(
-            [p for p in paths if not p.startswith("/opt/intel/openvino")]
+            [p for p in paths if not p.startswith(SYSTEM_OPENVINO_DIR)]
         )
-        
+
+
 _cleanup_openvino_paths()
 
 from pathlib import Path
@@ -25,7 +29,7 @@ from transformers import AutoTokenizer
 from timm.models.eva import Eva
 
 from core.utils import load_config
-from core.torch.edgetam_runner import DecodeModel, EdgeTAMPredictor, RepVitModel
+from core.torch.edgetam_runner import DecodeModel, RepVitModel
 from core.torch.feature_extractor import TorchCLIPFeatureExtractor
 
 class BaseOpenVINOExporter:
@@ -312,7 +316,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch -> OpenVINO 変換")
     parser.add_argument("--cluster-layers", type=int, nargs="+", default=None,
                         help="クラスタリングに使う PE の層（fused_layer_features に連結する層）。既定は設定値の [8, 9, 10]")
-    parser.add_argument("--out-dir", default=None, help="保存先。既定は設定の ov_model_dir（既存のモデルを上書きしない場合に指定する）")
+    parser.add_argument("--out-dir", default=None, help="保存先。既定は設定の model_dir（既存のモデルを上書きしない場合に指定する）")
     parser.add_argument("--pe-only", action="store_true", help="PE（CLIP）だけを変換し、EdgeTAM は変換しない")
     parser.add_argument("--edgetam-only", action="store_true", help="EdgeTAM だけを変換し、PE（CLIP）は変換しない")
     args = parser.parse_args()
@@ -324,7 +328,7 @@ if __name__ == "__main__":
     if args.cluster_layers:
         config["cluster_layers"] = args.cluster_layers
     if args.out_dir:
-        config["ov_model_dir"] = args.out_dir
+        config["model_dir"] = args.out_dir
 
     # Extractor / EdgeTAM モデルの初期化
     edgetam_encoder = RepVitModel(config)
@@ -333,12 +337,12 @@ if __name__ == "__main__":
     # CLIP モデルのエクスポート
     if not args.edgetam_only:
         extractor = TorchCLIPFeatureExtractor(config)
-        exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=config["ov_model_dir"])
+        exporter_pe = CLIPOpenVINOExporter(extractor, save_dir=config["model_dir"])
         exporter_pe.export_all()
 
     if args.pe_only:
         raise SystemExit(0)
 
     # EdgeTAM モデルのエクスポート
-    exporter_edgetam = EdgeTAMOpenVINOExporter(edgetam_encoder, edgetam_decoder, save_dir=config["ov_model_dir"])
+    exporter_edgetam = EdgeTAMOpenVINOExporter(edgetam_encoder, edgetam_decoder, save_dir=config["model_dir"])
     exporter_edgetam.export_all()

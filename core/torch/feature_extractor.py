@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from open_clip.model import CustomTextCLIP
 
-from core.common.params import PE_MEAN, PE_NUM_BLOCKS, PE_STD
+from core.common.params import PE_MEAN, PE_STD
 
 # monkey_patch は import した時点で timm 側へのパッチ（動的な画像サイズ対応）が適用される。モデル生成より前に import すること
 from core.torch.monkey_patch import (
@@ -31,7 +31,7 @@ class TorchCLIPFeatureExtractor:
         self.force_image_size = config["image_size"]
         self.to_openvino = config["to_openvino"]
         # クラスタリングに使う層（第 N ブロックの出力）。OpenVINO モデルの fused_layer_features に連結して出力される
-        self.cluster_layers = list(config.get("cluster_layers", [8, 9, 10]))
+        self.cluster_layers = list(config["cluster_layers"])
 
         self.model, self.preprocess = self._setup_model()
         self.tokenizer = open_clip.get_tokenizer(self.model_id)
@@ -53,7 +53,7 @@ class TorchCLIPFeatureExtractor:
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
         # OpenVINO化の有無で設定変更（pytorchで処理する場合は、詳細な特徴量も取得）
         if not self.to_openvino:
-            for block in trunk.blocks[:PE_NUM_BLOCKS]:
+            for block in trunk.blocks:
                 block.attn.forward = types.MethodType(attention_rope_forward, block.attn)
                 block.forward = types.MethodType(eva_block_forward, block)
         trunk.forward = types.MethodType(eva_forward, trunk)
@@ -66,7 +66,7 @@ class TorchCLIPFeatureExtractor:
         model.visual.to_openvino = self.to_openvino
         trunk.to_openvino = self.to_openvino
         # 保持する層。OpenVINO化では cluster_layers だけ、PyTorchの詳細な特徴量では全層
-        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, PE_NUM_BLOCKS + 1))
+        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, len(trunk.blocks) + 1))
 
         return model, preprocess
 
@@ -110,11 +110,11 @@ class TorchCLIPBackend(TorchCLIPFeatureExtractor):
     def _to_numpy(x: torch.Tensor) -> np.ndarray:
         return x.detach().cpu().numpy()
 
-    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
+    def extract_image_features(self, image_tensor: np.ndarray):
         x = torch.from_numpy(np.ascontiguousarray(image_tensor)).to(device=self.device, dtype=torch.float32)
         with torch.no_grad():
-            raw_image, raw_patch, _, fused = self.model.encode_image(x, normalize=normalize)
-        return self._to_numpy(raw_image), self._to_numpy(raw_patch), self._to_numpy(fused)
+            _, raw_patch, _, fused = self.model.encode_image(x, normalize=False)
+        return self._to_numpy(raw_patch), self._to_numpy(fused)
 
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
         tokens = self.tokenizer(prompts).to(self.device)
@@ -195,12 +195,9 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
         return F.normalize(torch.cat([F.normalize(hs[l], dim=-1) for l in layers], dim=2), dim=-1)
 
     @torch.no_grad()
-    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
+    def extract_image_features(self, image_tensor: np.ndarray):
         out = self.forward_all(image_tensor)
-        cls_token = self.trunk.forward_head(out["final"])[0]
-        if normalize:
-            cls_token = F.normalize(cls_token, dim=-1)
-        return cls_token.cpu().numpy(), out["final"].cpu().numpy(), self.fused_features(out["hs"]).cpu().numpy()
+        return out["final"].cpu().numpy(), self.fused_features(out["hs"]).cpu().numpy()
 
     @torch.no_grad()
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:

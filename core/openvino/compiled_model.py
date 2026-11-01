@@ -7,6 +7,7 @@ bit 単位では一致しない（数値が微小に変わる）。config の `o
 
 from core.openvino.runtime_utils import make_compile_config  # openvino より先に import する（sys.path の整理）
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -18,34 +19,38 @@ from core.common.params import EDGETAM_INPUT_ALIGNMENT
 
 
 def static_input_side(config: dict) -> Optional[int]:
-    """config の `ov_static_shape` が真なら、モデルに入力する画像の一辺（画素）を返す。偽なら None（動的形状）。
-
-    入力の大きさが画像ごとに変わる resize_mode: fit では使えない。square / pad は、一辺が image_size で一定。
-    """
-    if not config.get("ov_static_shape", False):
+    """config の `ov_static_shape` が真なら、モデルに入力する画像の一辺（画素）を返す。偽なら None（動的形状）。"""
+    if not config["ov_static_shape"]:
         return None
-    resize_mode = config.get("resize_mode", "square")
-    if resize_mode == "fit":
-        raise ValueError("ov_static_shape は resize_mode: fit では使えません（入力の大きさが画像ごとに変わるため）")
     side = config["image_size"]
     if side % EDGETAM_INPUT_ALIGNMENT:
         raise ValueError(f"ov_static_shape では image_size を {EDGETAM_INPUT_ALIGNMENT} の倍数にしてください: {side}")
     return side
 
 
+@dataclass
+class StaticPlan:
+    """モデルを、入力の大きさを固定した静的形状でコンパイルするための指定。"""
+
+    shapes: Dict[str, List[int]]  # 入力名 -> 固定する形。-1 の次元は固定しない
+    # 静的形状に reshape した後のモデルだけに、コンパイルの前に施す変更（形が決まっているときだけできるグラフの書き換え。graph_edits.py）
+    prepare: Optional[Callable[[ov.Model], None]] = None
+    # prepare が入出力の軸の並びを変えたときの、外から見える形（変更前）との対応（入出力の番号 -> 軸の並び）。
+    # 静的形状のモデルを使うときだけ、入力は外の配列を transpose(perm) して連続にしたものを渡し、出力はモデルの出力を transpose(perm) して外の形に戻す
+    # （ビュー。コピーしない）。例: 外からは NCHW に見える特徴量を、内部では NHWC で持つ。動的形状のモデルを使うときは、どちらも適用しない。
+    input_perms: Dict[int, Sequence[int]] = field(default_factory=dict)
+    output_perms: Dict[int, Sequence[int]] = field(default_factory=dict)
+
+
 class OVModel:
     """OpenVINO のモデル 1 つ。`model(inputs)` で推論し、出力（numpy 配列）をモデルの出力の順にリストで返す。
 
-    static_shapes（入力名 -> 固定する形。-1 の次元は固定しない）を渡すと、その形に reshape したモデルでコンパイルする。
+    static（StaticPlan）を渡すと、その形に reshape したモデルでコンパイルする。
     入力の形がそれに合うときは静的形状のモデルで、合わないとき（例: 格子分離がセルの数をバッチにして呼ぶデコーダー）は、
     動的形状のモデルで推論する。動的形状のモデルは、必要になったときに初めてコンパイルする。
-    static_shapes が None なら、動的形状のモデルだけを使う。
+    static が None なら、動的形状のモデルだけを使う。
 
     prepare: 読み込んだモデルに、コンパイルの前に施す変更（未使用の出力を外すなど）。動的形状・静的形状のどちらにも施す。
-    prepare_static: 静的形状に reshape した後のモデルだけに、コンパイルの前に施す変更（形が決まっているときだけできるグラフの書き換え。graph_edits.py）。
-    static_input_perms / static_output_perms: prepare_static が入出力の軸の並びを変えたときの、外から見える形（変更前）との対応（入出力の番号 -> 軸の並び）。
-        静的形状のモデルを使うときだけ、入力は外の配列を transpose(perm) して連続にしたものを渡し、出力はモデルの出力を transpose(perm) して外の形に戻す（ビュー。コピーしない）。
-        例: 外からは NCHW に見える特徴量を、内部では NHWC で持つ。動的形状のモデルを使うときは、どちらも適用しない（変更前の形のまま）。
     """
 
     def __init__(
@@ -55,24 +60,23 @@ class OVModel:
         device: str,
         num_threads: int,
         prepare: Optional[Callable[[ov.Model], None]] = None,
-        static_shapes: Optional[Dict[str, List[int]]] = None,
-        prepare_static: Optional[Callable[[ov.Model], None]] = None,
-        static_input_perms: Optional[Dict[int, Sequence[int]]] = None,
-        static_output_perms: Optional[Dict[int, Sequence[int]]] = None,
+        static: Optional[StaticPlan] = None,
     ):
         self._core, self._path, self._device = core, path, device
         self._compile_config, self._prepare = make_compile_config(num_threads), prepare
-        self._prepare_static = prepare_static
-        self._input_perms, self._output_perms = dict(static_input_perms or {}), dict(static_output_perms or {})
+        self._plan = static
+        self._input_perms = dict(static.input_perms) if static else {}
+        self._output_perms = dict(static.output_perms) if static else {}
         self._dynamic: Optional[ov.CompiledModel] = None
         self._static: Optional[ov.CompiledModel] = None
         self._static_dims: List[Optional[List[int]]] = []
 
-        if static_shapes is None:
-            self._dynamic, self._model = self._compile(None)
+        if static is None:
+            self._dynamic, self._model = self._compile(False)
             primary = self._dynamic
         else:
-            self._static, self._model = self._compile(static_shapes)
+            static_shapes = static.shapes
+            self._static, self._model = self._compile(True)
             primary = self._static
             # 入力は複数の名前を持つことがある（例: image_embed と内部名）ので、名前の集合で照合する
             port_names = [port.get_names() for port in primary.inputs]
@@ -85,14 +89,14 @@ class OVModel:
         self._output_names = [port.get_names() for port in primary.outputs]
         self._primary = primary
 
-    def _compile(self, static_shapes: Optional[Dict[str, List[int]]]) -> Tuple[ov.CompiledModel, ov.Model]:
+    def _compile(self, static: bool) -> Tuple[ov.CompiledModel, ov.Model]:
         model = self._core.read_model(self._path)
         if self._prepare is not None:
             self._prepare(model)
-        if static_shapes is not None:
-            model.reshape(static_shapes)
-            if self._prepare_static is not None:
-                self._prepare_static(model)
+        if static:
+            model.reshape(self._plan.shapes)
+            if self._plan.prepare is not None:
+                self._plan.prepare(model)
         return self._core.compile_model(model, self._device, self._compile_config), model
 
     @property
@@ -128,6 +132,6 @@ class OVModel:
             outs = self._static(arrays)
             return [outs[i].transpose(self._output_perms[i]) if i in self._output_perms else outs[i] for i in range(len(outs))]
         if self._dynamic is None:
-            self._dynamic, _ = self._compile(None)
+            self._dynamic, _ = self._compile(False)
         outs = self._dynamic(list(inputs))
         return [outs[index] for index in range(len(outs))]

@@ -11,7 +11,7 @@ from timm.models.eva import Eva, EvaBlock, AttentionRope
 from timm.layers.attention import maybe_add_mask, apply_rot_embed_cat, resolve_self_attn_mask
 from timm.layers.attention_pool import AttentionPoolLatent
 
-from typing import Optional, Tuple, List, Union
+from typing import List, Optional
 
 import timm.models.eva as eva_module
 import timm.layers.pos_embed as pos_embed_module
@@ -183,30 +183,6 @@ def attentionpoollatent_forward(
 #     return torch.cat(label_token_list, dim=0)
 
 
-def remove_cls_direction(features: torch.Tensor, alpha=1.0):
-    """
-    features: [B, P+1, C]
-    先頭トークンがCLS。
-    戻り値: [B, P+1, C]
-    """
-    cls = features[:, 0, :]       # [B, C]
-    patch = features[:, 1:, :]    # [B, P, C]
-
-    # CLSのノルムは任意でよい
-    denom = cls.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
-
-    # 各patchをCLS方向へ射影する係数
-    coeff = (
-        (patch * cls[:, None, :]).sum(dim=-1, keepdim=True)
-        / denom[:, None, :]
-    )
-
-    # CLS方向成分を除去
-    cls_component = coeff * cls[:, None, :]
-    residual = patch - alpha * cls_component
-
-    return torch.cat([cls[:, None, :], residual], dim=1)
-
 
 def custom_attentionpoollatent_forward(
     self: Eva,
@@ -248,19 +224,6 @@ def custom_attentionpoollatent_forward(
     )
     k, v = kv.unbind(0)  # [B, Heads, N, HeadDim]
     k = self.attn_pool.k_norm(k)
-
-    # k = F.linear(
-    #     remove_cls_direction(x),
-    #     self.attn_pool.kv.weight[:C, :],
-    #     self.attn_pool.kv.bias[:C] if self.attn_pool.kv.bias is not None else None,
-    # ).reshape(B, N, self.attn_pool.num_heads, self.attn_pool.head_dim).permute(0, 2, 1, 3)
-    # k = self.attn_pool.k_norm(k)
-
-    # v = F.linear(
-    #     remove_cls_direction(x),
-    #     self.attn_pool.kv.weight[C:, :],
-    #     self.attn_pool.kv.bias[C:] if self.attn_pool.kv.bias is not None else None,
-    # ).reshape(B, N, self.attn_pool.num_heads, self.attn_pool.head_dim).permute(0, 2, 1, 3)
 
     # 3. 動的な K (クラスタ数) に向けた Mask の一括作成
     # 0 ~ max(cluster_labels) までのラベルを動的生成 [K, 1]

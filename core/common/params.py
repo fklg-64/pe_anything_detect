@@ -2,7 +2,7 @@
 # 固定ハイパーパラメータ
 # yamlでは調整せずコードに固定している値を、すべてここにまとめる。
 # 値を変える場合はこのファイルだけを編集すること（他の箇所に数値を直書きしない）。
-# 結果の画像・一覧HTMLの見た目だけに関わる値は visualization.py / gallery.py にある。
+# 結果の画像・一覧HTMLの見た目だけに関わる値は、末尾の「結果の保存・表示」にある。
 # =============================================================================
 
 # --- CLIP（粗い前景・セマンティックの判定） ---
@@ -31,25 +31,15 @@ PE_MEAN = (0.5, 0.5, 0.5)
 PE_STD = (0.5, 0.5, 0.5)
 
 # --- モデル入力の大きさ ---
-# EdgeTAM エンコーダの neck は最も粗い特徴（1/32）を 2 倍に拡大して 1/16 の特徴に足すので、入力の辺は 32 の倍数でないと大きさが合わず落ちる。
-# アスペクト比を維持するリサイズモード（fit / pad）では、画像の内容の辺をパッチサイズとこの値の最小公倍数の倍数にする
+# EdgeTAM エンコーダの neck は最も粗い特徴（1/32）を 2 倍に拡大して 1/16 の特徴に足すので、入力の辺は 32 の倍数でないと大きさが合わず落ちる
 EDGETAM_INPUT_ALIGNMENT = 32
-# fit モードで、元画像のアスペクト比との相対誤差がこの値以下になる寸法のうち、最も大きいものを選ぶ（満たす寸法が無ければ誤差が最小のもの）。
-# 長辺を image_size に固定すると、短辺を 32 の倍数に丸める分だけ縦横比がずれる（例: 1600x1068 で 3%）ので、長辺を 1 単位ずつ縮めてずれを抑える
-FIT_ASPECT_TOLERANCE = 0.01
-
-# resize_mode（config）に指定できる値。square: アスペクト比を無視 / fit: アスペクト比を保つ / pad: fit の大きさを image_size 四方まで埋める（image_layout.py）
-RESIZE_MODES = ("square", "fit", "pad")
 
 # --- パッチ単位の幾何（粗い結果はCLIPのパッチ格子上にある） ---
-# 近傍の大きさ。「内側」「細い領域」の判定（この近傍で縮めて残るか）と、粗いマスクの平滑化に使う。
+# 近傍の大きさ。「内側」（core。この近傍で縮めて残る所）の判定と、初期マスクの「不明」の帯（この近傍で膨らませる）、粗いマスクの平滑化に使う。
 # 3 = 1パッチ分の近傍。粗いマスクは縁・影で最大1パッチ太るという前提に基づく
 PATCH_NEIGHBORHOOD = 3
 # 背景の負例点を前景から離す距離（パッチ数）。縁・影の太り(1パッチ)を避けるため2
 BACKGROUND_POINT_MARGIN = 2
-# ノイズとして除去する領域の最小面積（パッチ面積に対する倍率）。1パッチ未満は粗いマスクの分解能以下
-MIN_REGION_PATCH_AREA = 1.0
-
 # 前景クラスタに混ざる斑点を除くための、孤立成分の最小パッチ数。これ未満の孤立成分はクラスの推定に
 # 混ぜず、個別に範囲を制限して扱う（1〜2パッチの孤立成分は、物体より背景の斑点である場合が多い）
 MIN_ISOLATED_PATCHES = 3
@@ -57,33 +47,29 @@ MIN_ISOLATED_PATCHES = 3
 # --- EdgeTAMに渡す初期マスク（粗いマスクを事前確率として与える） ---
 # 初期マスクのロジット幅。確率 p のとき logit = (2p - 1) * PRIOR_LOGIT_RANGE （p=0.5が「不明」で0）
 PRIOR_LOGIT_RANGE = 8.0
-# core（物体内部）の外側にある粗いマスクに与える確率。0.5=前景とも背景とも言えない
-PRIOR_NON_CORE_PROBABILITY = 0.5
 # 初期マスクの縁を入力画像に沿わせるガイデッドフィルタ（He ら 2010）の正則化。ガイドは入力画像の輝度（0〜1）で、半径は粗いマスクの信頼限界（1パッチ）。
 # 値は 0.001〜0.01 で結果が変わらない（0.1 では下がる）
 GUIDED_FILTER_EPS = 1e-2
-# EdgeTAMのロジットがこの値を超えた画素を前景とする
-MASK_LOGIT_THRESHOLD = 0.0
 # EdgeTAMのデコーダ出力（低解像度ロジット）を、絶対値がこの値以下に収める（外れ値で補間・比較が荒れないように）
 EDGETAM_LOGIT_CLIP = 32.0
-# EdgeTAMのデコーダ出力マスクを縮小する倍率（分母。高さ・幅を 1/N にする）
-EDGETAM_MASK_DOWNSCALE = 8
-
-# EdgeTAMの高解像度特徴量の縮小倍率（入力画像に対する分母。縦横それぞれ 1/N。512 入力で 128×128）。初期マスク・ガイデッドフィルタのガイドの大きさ
-EDGETAM_HIGH_RES_FEATURE_DOWNSCALE = 4
+# EdgeTAM エンコーダの出力 (high_res_feats0, high_res_feats1, image_embed) の、入力画像に対する縮小倍率（縦横それぞれ 1/N。512 入力で 128・64・32）。
+# 初期マスク・ガイデッドフィルタのガイドは high_res_feats0 の大きさ。デコーダーの出力（低解像度ロジット）の縮小倍率も high_res_feats0 と同じ
+EDGETAM_FEATURE_STRIDES = (4, 8, 16)
 
 # --- 重なり解決 ---
 # スコア = EdgeTAMの確信度 × ((1 - w) + w × 粗い前景らしさ) の w。0.5で両者を等しく扱う
 SCORE_PRIOR_WEIGHT = 0.5
 
 # --- 前景内部の細い隙間の穴埋め ---
-# 粗い前景の内部（core）にある背景の隙間は、幅が 1 パッチ未満なら粗い判定の分解能以下なので前景にする（クラス境界の割れ。docs/detailed_segmentation.md §8）。
+# 粗い前景の内部（core）にある背景の隙間は、幅が 1 パッチ未満なら粗い判定の分解能以下なので前景にする（クラス境界の割れ。docs/detailed_segmentation.md「5. 後処理」）。
 # 隙間は 1 パッチ = この画素数に縮小したマスクの閉処理で探す（全解像度の閉処理は約 10ms かかるため。位置は ±1 画素程度の差）
 GAP_FILL_PIXELS_PER_PATCH = 8
 
 # --- ノイズ除去 ---
 # マスクの輪郭を平滑化するメディアンフィルタのカーネルサイズ
 MEDIAN_BLUR_KSIZE = 3
+# 小さな連結成分が多いとき（この数を超えるとき）は、成分ごとに消すより、全画素を表で引く方が速い（clean_mask）
+CLEAN_MASK_MAX_PER_COMPONENT = 48
 
 # --- 規則的に並んだ小物体（格子）の分離（lattice.py / lattice_separator.py） ---
 # 物体どうしの隙間が 1 パッチ未満だと、粗い前景は 1 つの塊になり、EdgeTAM もクラス単位のデコードでは点に従って塊を返す（隙間が埋まる）。
@@ -107,12 +93,6 @@ LATTICE_WINDOW_TOKENS = 12
 # 格子の位相（物体の中心）を、デコード結果の重心で直すときに使うセルの数の上限（全セルではなく、等間隔に選んだ一部で足りる）
 LATTICE_PHASE_PROBES = 16
 
-# EdgeTAM の特徴（image_embed / high_res_feats1 / high_res_feats0）の、入力画像に対する縮小倍率
-LATTICE_EMBED_STRIDE = 16
-LATTICE_FEATS1_STRIDE = 8
-LATTICE_FEATS0_STRIDE = 4
-# デコーダーの出力（低解像度ロジット）の縮小倍率は high_res_feats0 と同じ
-LATTICE_MASK_STRIDE = LATTICE_FEATS0_STRIDE
 # デコーダーの予測 IoU（マスクと正解の IoU の予測値）が、この値以上のマスクを物体として採る。0.5 は、物体と一致した（マッチした）とみなす IoU の基準
 LATTICE_MIN_PREDICTED_IOU = 0.5
 
@@ -125,10 +105,6 @@ PROMPT_TIE_TOLERANCE = 1.0
 # tube / transparent tubes（0.94）・pill / capsule（0.93）・cable / wire（0.95）・plastic part / rubber part（0.96）を同義語とし、
 # white plastic lid / round white food container（0.92）・noodle / package（0.85）・bottle / cap（0.87）は別のものとする
 PROMPT_SYNONYM_DISTANCE = 0.08
-
-# --- PE-Core / PE-Spatial（ViT） ---
-# ブロック数。PyTorchで詳細な特徴量を取るときに、この全ブロックをパッチする
-PE_NUM_BLOCKS = 12
 
 # --- OpenVINO 実行環境（core/openvino/runtime_utils.py） ---
 # pip 版 openvino との衝突を避けるため sys.path / PYTHONPATH から外すシステム版 OpenVINO の場所
@@ -145,3 +121,86 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".bmp"}
 # --- 重みの自動ダウンロード ---
 # edgetam_model_path に重みが無いときの取得先（Hugging Face の公式配布）
 EDGETAM_WEIGHTS_URL = "https://huggingface.co/facebook/EdgeTAM/resolve/main/edgetam.pt"
+
+# =============================================================================
+# 結果の保存・表示（visualization.py / gallery.py。セグメンテーションの結果には影響しない）
+# =============================================================================
+
+# セマンティック可視化の色 (RGB)。0番は背景で常にシアン。足りなければ 1 番以降を繰り返す
+SEMANTIC_COLORS = (
+    (0, 255, 255),
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+    (255, 0, 255), (255, 128, 0), (128, 0, 255), (255, 255, 255),
+    (128, 64, 0), (255, 128, 192), (0, 128, 0), (128, 128, 128),
+)
+# KMeans のクラスタ・粗いセマンティックラベルの着色に使う、PIL のパレット（R, G, B を 1 色ずつ並べたもの。41 色。0 番は黒）
+CLUSTER_COLOR_PALETTE = (
+      0,   0,   0,
+    255,   0,   0,
+      0, 255,   0,
+      0,   0, 255,
+    255, 255,   0,
+      0, 255, 255,
+    255,   0, 255,
+    192, 192, 192,
+    128,   0,   0,
+    128, 128,   0,
+      0, 128,   0,
+    128,   0, 128,
+      0,   0, 128,
+    255, 165,   0,
+    255, 105, 180,
+    255,  69,   0,
+    255,  20, 147,
+     34, 139,  34,
+      0, 255, 127,
+    255, 182, 193,
+    255, 215,   0,
+    139,  69,  19,
+    244, 164,  96,
+     72,  61, 139,
+      0, 191, 255,
+     70, 130, 180,
+    147, 112, 219,
+    153,  50, 204,
+    255, 228, 225,
+    255,   0, 255,
+    255, 228, 181,
+    255,  99,  71,
+      0, 250, 154,
+    221, 160, 221,
+    238, 130, 238,
+    186,  85, 211,
+    255, 240, 245,
+    219, 112, 147,
+    255,  69,   0,
+    240, 128, 128,
+    255, 105, 180,
+)
+# 前景オーバーレイ（粗い前景マスク・EdgeTAM最終マスク）の赤の不透明度
+FOREGROUND_OVERLAY_ALPHA = 0.3
+# 前景オーバーレイに描くプロンプト点の半径(px)と色(BGR)。正例=緑、負例=赤
+POINT_RADIUS = 20
+POINT_COLOR_POSITIVE = (0, 255, 0)
+POINT_COLOR_NEGATIVE = (0, 0, 255)
+# セマンティック結果（重畳 + 凡例）のmatplotlib図
+RESULT_FIGSIZE = (10, 6)
+RESULT_DPI = 150
+LEGEND_FONTSIZE = 9
+# 精緻化の中間画像を入れる、保存先の下のフォルダ名
+DEBUG_DIR_NAME = "debug"
+
+# 一覧HTML（gallery.py）に並べる画像（列見出し, ファイル名）。元画像は保存先ではなく入力画像のパスを参照する
+GALLERY_IMAGES = (
+    ("foreground_map", "foreground_map.png"),
+    ("coarse_semantic_segmentation", "coarse_semantic_segmentation.png"),
+    ("foreground_overlay", "foreground_overlay.png"),
+    ("semantic_result", "semantic_result.png"),
+)
+GALLERY_FILE_NAME = "index.html"
+# 元画像を保存先へコピーするときのファイル名（拡張子は元のまま）。output_dir ごと移動しても参照が切れないようにする
+ORIGINAL_STEM = "original"
+# 一覧HTMLの列の最小幅(px)。列は画面幅に合わせて等分され、画像は列幅に合わせて拡縮する（足りなければ横スクロール）
+GALLERY_MIN_COLUMN_WIDTH = 280
+# 一覧HTMLの1ページあたりの表示枚数の選択肢（先頭が既定）
+GALLERY_PAGE_SIZES = (50, 100, 200)

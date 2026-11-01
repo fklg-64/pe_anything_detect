@@ -16,9 +16,8 @@ from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
-from scipy.ndimage import binary_dilation
 
-from core.common.mask_utils import patch_structure
+from core.common.mask_utils import dilate
 from core.common.params import BACKGROUND_POINT_MARGIN
 
 
@@ -51,7 +50,7 @@ def background_features(levels: Sequence[np.ndarray], foreground: np.ndarray) ->
 
     foreground: 粗い前景マスク（パッチ格子、全クラス）。画像に 1 回求めれば、全クラスで共通に使える。
     """
-    background = ~binary_dilation(foreground, patch_structure(), iterations=BACKGROUND_POINT_MARGIN)
+    background = ~dilate(foreground, iterations=BACKGROUND_POINT_MARGIN)
     if not background.any():
         background = ~foreground
     means = [mean_feature(level, background) for level in levels]

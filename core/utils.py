@@ -2,6 +2,7 @@
 
 import contextlib
 import cv2
+import threading
 import time
 import yaml
 import numpy as np
@@ -16,6 +17,7 @@ class Timer:
     """ミリ秒単位で処理時間を計測し表示するコンテキストマネージャー"""
 
     _deferred: Optional[list] = None  # Timer.deferred() の中で、表示する行を貯めておく先
+    _lock = threading.Lock()          # _deferred を守る（領域の推定は別スレッドからも log する）
 
     def __init__(self, name: str, width: int = 20):
         self.name = name
@@ -33,23 +35,28 @@ class Timer:
     @classmethod
     def log(cls, line: str) -> None:
         """1 行表示する。deferred() の中なら、抜けるときにまとめて表示する。"""
-        if cls._deferred is None:
-            print(line)
-        else:
-            cls._deferred.append(line)
+        with cls._lock:
+            if cls._deferred is None:
+                print(line)
+            else:
+                cls._deferred.append(line)
 
     @classmethod
     @contextlib.contextmanager
     def deferred(cls):
         """この中の Timer と log の表示を貯めて、抜けるときにまとめて表示する（端末への出力を、計測する処理の内側で待たないため。入れ子なら外側にまとめる）。"""
-        if cls._deferred is not None:
+        with cls._lock:
+            nested = cls._deferred is not None
+            if not nested:
+                cls._deferred = []
+        if nested:
             yield
             return
-        cls._deferred = []
         try:
             yield
         finally:
-            lines, cls._deferred = cls._deferred, None
+            with cls._lock:
+                lines, cls._deferred = cls._deferred, None
             for line in lines:
                 print(line)
 
@@ -100,16 +107,6 @@ def normalize_image(
         plane -= mean[c]
         plane /= std[c]
     return output
-
-# 画像前処理
-def preprocess_image(
-    image: np.ndarray,
-    target_size: int,
-    mean: np.ndarray,
-    std: np.ndarray,
-) -> np.ndarray:
-    """画像をリサイズ・正規化し、NCHW形式に変換する。"""
-    return normalize_image(resize_image(image, target_size), mean, std)
 
 # yaml設定データの読み込み
 def load_config(config_path: str = "./configs/ov_config.yaml") -> dict:

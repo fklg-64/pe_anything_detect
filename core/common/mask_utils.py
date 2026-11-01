@@ -1,16 +1,17 @@
 """マスク・座標・点サンプリング・kNN グラフ上の伝播の、純粋なヘルパー関数（状態を持たない）。"""
 
-from concurrent.futures import Executor
+from functools import partial
 from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
 import numpy as np
 from scipy import sparse
-from scipy.ndimage import binary_erosion, distance_transform_edt
-from scipy.ndimage import label as ndi_label
+from scipy.ndimage import distance_transform_edt
 
+from core.common.parallel import Workers
 from core.common.params import (
     BACKGROUND_POINT_MARGIN,
+    CLEAN_MASK_MAX_PER_COMPONENT,
     GAP_FILL_PIXELS_PER_PATCH,
     MEDIAN_BLUR_KSIZE,
     PATCH_NEIGHBORHOOD,
@@ -29,9 +30,33 @@ class Component(NamedTuple):
     region: np.ndarray      # 成分のマスク
 
 
-def patch_structure() -> np.ndarray:
-    """パッチ近傍（PATCH_NEIGHBORHOOD 四方）の構造要素。scipy.ndimage の binary_erosion / binary_dilation に渡す。"""
-    return np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=bool)
+def _as_uint8(mask: np.ndarray) -> np.ndarray:
+    """bool（または 0/非 0 の整数）のマスクを、コピーせずに（bool なら）uint8 の 0/1 として読む。cv2 の関数は bool を受け付けない。"""
+    return np.ascontiguousarray(mask, dtype=bool).view(np.uint8)
+
+
+def patch_kernel() -> np.ndarray:
+    """パッチ近傍（PATCH_NEIGHBORHOOD 四方）の構造要素（uint8）。erode / dilate に渡す。"""
+    return np.ones((PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD), dtype=np.uint8)
+
+
+def erode(mask: np.ndarray) -> np.ndarray:
+    """マスクをパッチ近傍で 1 回縮める（bool）。画像の外は前景として扱うので、画像の端では縮まない。"""
+    return cv2.erode(_as_uint8(mask), patch_kernel()).view(bool)
+
+
+def dilate(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """マスクをパッチ近傍で膨らませる（bool）。画像の外は背景として扱う。"""
+    return cv2.dilate(_as_uint8(mask), patch_kernel(), iterations=iterations).view(bool)
+
+
+def squared_distance_to_background(mask: np.ndarray) -> np.ndarray:
+    """前景の各画素から、最も近い背景（False）の画素までのユークリッド距離の二乗（int32。画像の外は背景ではない）。
+
+    cv2 の距離は float32 で、等しい距離でも最後の桁がずれて同点の位置が変わる（scipy と最内点が変わる）ので、二乗して整数に丸める。
+    """
+    distance = cv2.distanceTransform(_as_uint8(mask), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return np.rint(distance * distance).astype(np.int32)
 
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -130,14 +155,14 @@ def select_background_points(
     確信度が連続値だと、候補は最も低い count パッチそのものになる（点が隅に寄る）。広げても精度は上がらない（docs/method_history.md の「負例点をばらす」）。
     """
     background = ~foreground_binary
-    labeled, _ = ndi_label(background)
+    _, labeled = cv2.connectedComponents(_as_uint8(background), connectivity=4)
     border_ids = np.unique(np.concatenate([labeled[0], labeled[-1], labeled[:, 0], labeled[:, -1]]))
     outer = np.isin(labeled, border_ids[border_ids > 0])
     if not outer.any():
         outer = background
-    dist = distance_transform_edt(outer)
+    squared = squared_distance_to_background(outer)
     for margin in (BACKGROUND_POINT_MARGIN, 1):
-        candidate = outer & (dist >= margin)
+        candidate = outer & (squared >= margin * margin)
         if candidate.any():
             break
     if foreground_map is not None:
@@ -164,9 +189,9 @@ def connected_components(mask: np.ndarray) -> List[Component]:
     result = []
     for i in range(1, n):
         region = comp == i
-        edt = distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
+        edt = squared_distance_to_background(np.pad(region, 1))[1:-1, 1:-1]
         y, x = np.unravel_index(np.argmax(edt), edt.shape)
-        core = binary_erosion(region, structure=patch_structure(), border_value=1)
+        core = erode(region)
         result.append(Component((int(x), int(y)), core if core.any() else region, region))
     return result
 
@@ -184,11 +209,7 @@ def bounding_slices(mask: np.ndarray, margin: int = 1) -> Optional[Tuple[slice, 
     )
 
 
-# 小さな連結成分が多いときは、成分ごとに消すより、全画素を表で引く方が速い
-CLEAN_MASK_MAX_PER_COMPONENT = 48
-
-
-def clean_mask(mask: np.ndarray, min_area: int = 8) -> np.ndarray:
+def clean_mask(mask: np.ndarray, min_area: int) -> np.ndarray:
     """
     mask: 2次元の二値マスク（bool、または 0/1・0/255 の整数）
     min_area: 除去する連結成分の最小面積（ピクセル数）
@@ -238,21 +259,19 @@ def _small_pieces(semantic_map: np.ndarray, class_id: int, min_area: int) -> Tup
     return box, crop & ~clean_mask(crop, min_area).view(bool)
 
 
-def remove_small_regions(semantic_map: np.ndarray, min_area: int, pool: Optional[Executor] = None) -> None:
+def remove_small_regions(semantic_map: np.ndarray, min_area: int, workers: Workers) -> None:
     """セマンティックマップ上の小領域ノイズを除去する（in-place）。
 
     1. クラスごとに小さな連結成分を背景へ戻す。
     2. 背景に残った小さな穴を、周囲で最も多いクラスで埋める。
 
-    クラスは互いに素な画素なので、1 のクラスごとの整形は独立（pool があれば並行して求め、反映は順に行う。結果は同じ）。
+    クラスは互いに素な画素なので、1 のクラスごとの整形は独立（スレッドがあれば並行して求め、反映は順に行う。結果は同じ）。
     """
     height, width = semantic_map.shape
     present_class_ids = [int(c) for c in np.flatnonzero(np.bincount(semantic_map.ravel())) if c != 0]
-    if pool is None:
-        pieces = (_small_pieces(semantic_map, class_id, min_area) for class_id in present_class_ids)
-    else:
-        pieces = (future.result() for future in [pool.submit(_small_pieces, semantic_map, c, min_area) for c in present_class_ids])
-    for box, small in pieces:
+    jobs = [workers.submit(partial(_small_pieces, semantic_map, class_id, min_area)) for class_id in present_class_ids]
+    for job in jobs:
+        box, small = job.result()
         semantic_map[box][small] = 0
 
     n, comp, stats, _ = cv2.connectedComponentsWithStats(
@@ -286,7 +305,7 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
     foreground: 粗い前景マスク（パッチ格子、全クラス）。
     """
     grid_h, grid_w = foreground.shape
-    core = binary_erosion(foreground, structure=patch_structure(), border_value=1)
+    core = erode(foreground)
     if not core.any():
         return
     # 1 パッチ = GAP_FILL_PIXELS_PER_PATCH 画素に縮小したマスクで、閉処理で埋まる画素（隙間）を求める
@@ -324,7 +343,7 @@ def fill_narrow_gaps(semantic_map: np.ndarray, foreground: np.ndarray) -> None:
 # =============================================================================
 
 def patch_mean(patch_map: np.ndarray) -> np.ndarray:
-    """パッチ近傍(PATCH_NEIGHBORHOOD四方)の平均。境界は scipy.ndimage の既定(reflect)と同じ。"""
+    """パッチ近傍(PATCH_NEIGHBORHOOD四方)の平均。境界は端の画素を折り返す(reflect)。"""
     return cv2.blur(
         patch_map.astype(np.float32), (PATCH_NEIGHBORHOOD, PATCH_NEIGHBORHOOD),
         borderType=cv2.BORDER_REFLECT,

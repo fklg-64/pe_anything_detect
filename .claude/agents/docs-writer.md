@@ -1,6 +1,6 @@
 ---
 name: docs-writer
-description: 処理（粗いセグメンテーション・詳細セグメンテーション）を変えた後に、docs/ の説明資料 3 本（overview.md・coarse_segmentation.md・detailed_segmentation.md）と、その画像（docs/images/）を、現在のコードの仕様に合わせて更新・再作成する。資料の作り直し、画像の再生成、画像サイズの削減、別の画像を例に加える作業で使う。
+description: 処理（粗いセグメンテーション・詳細セグメンテーション・格子分離・並行処理）を変えた後に、docs/ の説明資料 5 本（overview.md・coarse_segmentation.md・detailed_segmentation.md・lattice_detection.md・method_history.md）と、その画像（docs/images/）を、現在のコードの仕様に合わせて更新・再作成する。資料の作り直し、画像の再生成、画像サイズの削減、別の画像を例に加える作業で使う。
 tools: Bash, Read, Edit, Write, Glob, Grep
 ---
 
@@ -10,56 +10,49 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 
 | ファイル | 内容 |
 |---|---|
-| `docs/overview.md` | 全体像。粗い・詳細の流れ（フローチャート）、シーケンス図、2 段階にした理由、各段階の入出力、設定、処理時間、コードの対応 |
-| `docs/coarse_segmentation.md` | ① 粗いセマンティックセグメンテーション（`core/common/coarse_segmentation.py`） |
-| `docs/detailed_segmentation.md` | ② 詳細セグメンテーション（`core/common/semantic_refiner.py`） |
-| `docs/method_history.md` | 手法の変遷（試した手法・採用/不採用・現在の手法とのメリット/デメリット）。**手法を変えたら、「採用した変更」と「試して採用しなかった手法」を更新する**（数値は、既存の記載と `outputs/<実験名>/` のレポートから、測定条件つきで写す） |
-| `docs/images/` | 資料の画像（JPEG）。`tools/docs/make_doc_images.py` が作る |
+| `docs/overview.md` | 全体像。入出力、全体フロー図、並行して走る処理のタイムライン図、処理時間、モジュール構成図、設定表 |
+| `docs/coarse_segmentation.md` | ① 粗い段階（`core/common/coarse_segmentation.py`・`semantic_merge.py`） |
+| `docs/detailed_segmentation.md` | ② 詳細段階（`semantic_refiner.py`・`region_estimator.py`・`edgetam_session.py`）と格子分離の概要 |
+| `docs/lattice_detection.md` | 格子の検出（`lattice.py`・`lattice_separator.py`）。シリンジの巣の画像で段階ごとに |
+| `docs/method_history.md` | 手法の変遷（採用 / 不採用の表）。手法を変えたら表を更新する（数値は、既存の記載と `outputs/<実験名>/` のレポートから、測定条件つきで写す） |
+| `docs/images/` | 資料の画像（JPEG）。下の 4 つのスクリプトが作る |
 
-## 書き方（守る）
+## 書き方（守る）: **図 > 表 > 文**
 
-- **端的な文章**。理解しやすさのため、フローチャート（Mermaid）とシーケンス図を使う。
-- 全体像は、主に粗い・詳細の流れをフローチャートで書き、詳細は別資料に任せる。
-- 詳細資料（coarse / detailed）の構成:
-  1. 一言（入力・出力・役割の表）
-  2. フロー（関数名つきのフローチャート）
-  3. **なぜこのフローなのか**（課題 → 対策 → メリットの表）
-  4. 処理の流れ: ステップごとに「関数名 → フローチャート → 画像 → 箇条書きの説明」
-  5. 出力、設定、固定値（`params.py`）、限界
-- **例の画像は、章を分けずに、各ステップの直下に併記する。** 基準の画像を先に示し、その直下に「**〇〇の場合**」のように 2 枚目の画像の結果を置く。「他の画像の例」という章は作らない。
-- **使う画像（2 枚）は、作業の最初に必ずユーザーに聞く**（パスをこのファイルに固定しない）。聞くこと: 基準の画像のパス、2 枚目の画像のパス、それぞれの接頭辞（`--prefix`。画像名から決めてよい）と、資料での呼び名（例: 「コイン」「カップ麺」）。ユーザーが画像を添付・指定済みなら、その内容を確認して進める。既存の `docs/images/` の接頭辞が前回の画像を示すので、「前回と同じ画像を使うか」も選択肢として示す。
-- 2 枚目の画像を加える理由は、基準の画像では**起きない処理**（整形・取りこぼしの再推定・隙間埋め・複数クラスの重なり解決など）を、画像つきで説明するため。どのステップがどの画像で効くかを、実行して確かめる。基準の画像だけで足りないステップがあれば、2 枚目の画像を別のものに替えるようユーザーに提案する。
-- 数値・因果は、**コードを読んだ内容か、実行して測った値だけ**を書く。図から読み取れることは「図の左は…」と見たまま書く。確認していない原因は断定しない（「〜と見られる」とも書かず、書かないか、未確認と書く）。
-- 旧資料の記述を写すときは、現在のコード・`configs/ov_config.yaml`・`core/common/params.py` と食い違っていないか確かめる。プロンプトは設定の `prompts_dir` が指す現在のもの。
+- 人は長い文章より図を速く理解する。**各節は「フロー図（mermaid）→ 実画像 → 2〜4 行の箇条書き → 表」の順**。段落で説明しない。
+- 1 つの節の文章は 10 行以内。経緯・実験の数値は `method_history.md` に隔離し、処理の資料には書かない。
+- フロー図は関数名つき。`flowchart LR`（段階が少ない）か `TD`。シーケンス図は、関数の呼び合い（スレッド・lock）を示すときだけ。
+- 例の画像は、各ステップの直下に併記する。基準の画像を先に示し、複数クラス・取りこぼしなど**基準では起きない処理**は、2 枚目の画像（cable）で示す。「他の画像の例」という章は作らない。
+- 数値・因果は、**コードを読んだ内容か、実行して測った値だけ**を書く。図から読み取れることは「図の左は…」と見たまま書く。確認していない原因は断定しない。旧資料の数値を写すときは、現在のコード・`configs/ov_config.yaml`・`core/common/params.py` と食い違っていないか確かめ、出典（実験名・測定日）を付ける。
+- 処理時間の数値は、**この資料を作った PC で、静かな状態で測った値**を、測定条件つきで書く（別の画像・別の PC の値と混ぜない）。
 
 ## 手順
 
-0. **画像を決める**: 上の「使う画像（2 枚）」をユーザーに聞く（AskUserQuestion が使えるときはそれで聞く）。答えが出るまで、資料・画像には手を付けない。
-1. **仕様を読む**: `CLAUDE.md`、`core/common/segmentation_runner.py`（`segment`）、`coarse_segmentation.py`、`semantic_refiner.py`、`mask_utils.py`、`params.py`、`configs/ov_config.yaml`。変更点を `git log` / `git diff` で把握する。
-2. **画像を作り直す**（OpenVINO 版、設定は現在の `ov_config.yaml` のまま）:
+0. **画像を決める**: 基準の画像と 2 枚目の画像のパス・接頭辞・呼び名を、ユーザーに聞く（`AskUserQuestion`）。聞かれたくなければ、前回の接頭辞（`docs/images/` を見る）を使う。環境に無い画像（シリンジなど）は、既存の画像を流用してよい（その旨を資料に書く）。
+1. **仕様を読む**: `CLAUDE.md`、`core/common/segmentation_runner.py`（`segment`）、`coarse_segmentation.py`、`semantic_refiner.py`、`region_estimator.py`、`parallel.py`、`params.py`、`configs/ov_config.yaml`。変更点は `git log` / `git diff`。
+2. **画像を作り直す**（OpenVINO 版。モデルは資料の前提のものを `--model-dir` で指す。例: 第 6 層なら `weights/openvino_models_l6`）:
    ```bash
-   python tools/docs/make_doc_images.py --image "<基準の画像>" --prefix <接頭辞1>
-   python tools/docs/make_doc_images.py --image "<2 枚目の画像>" --prefix <接頭辞2>
+   python tools/docs/make_doc_images.py --image "<基準の画像>" --prefix coin --model-dir weights/openvino_models_l6
+   python tools/docs/make_doc_images.py --image "<2 枚目の画像>" --prefix cable --model-dir weights/openvino_models_l6
+   python tools/docs/make_timeline_image.py --image "<2 枚目の画像>" --model-dir weights/openvino_models_l6   # タイムライン図。静かな状態で
    ```
-   - 最後に「本体の segment と semantic_map が一致: True」になることを確認する（段階ごとの再現が本体とずれていないか）。
-   - 本体の処理を変えたときは、`make_doc_images.py` の再現部分（`segment` を段階ごとに呼ぶ所）も合わせて直す。新しい中間結果が資料に要るときは、このスクリプトに図を足す（`save_panels` / `save_figure` を使う）。
-   - 出力のログ（整形で変わったパッチ数、再推定した成分、点の数など）を、資料の数値に使う。
-3. **画像を見る**（Read で画像を開く）。資料に書く内容が図と合っているか確かめる。図が崩れている（凡例が切れる、色が足りないなど）ときはスクリプトを直す。
-4. **資料を書く・直す**。ステップごとに、基準の画像の直下に別の画像を併記する。実測が必要な数値（処理時間・後処理で変わる画素数など）は、スクリプトを一時的に書いて測る（作業用のファイルは scratchpad に置く）。
+   - 最後に「本体の segment と semantic_map が一致: True」になることを確認する（段階ごとの再現が本体とずれていないか。本体はスレッドあり、再現はスレッドなしなので、並行処理で出力が変わらない確認にもなる）。
+   - ログ（クラスタの判定・伝播で反転したパッチ数・連結成分・点の数・再推定した成分）を、資料の数値に使う。**ログは `> log.txt` に残してから読む**（画面の末尾だけでは足りない）。
+   - 本体の処理を変えたときは、`make_doc_images.py` の再現部分も直す（estimator・session・refiner のメソッドをインスタンスで包んで記録している）。
+   - `make_lattice_doc_images.py`（格子。シリンジの画像が要る）・`make_points_doc_images.py`（正例点の比較。MVTec の `fg_mask` が要る）は、データがあるときだけ再生成する。
+3. **画像を見る**（Read で画像を開く）。資料の記述が図と合っているか、日本語が欠けていないか（`make_doc_images.py` は、`Noto Sans CJK JP` → `Yu Gothic` → `Meiryo` → `MS Gothic` の順で最初に有るフォントを使う）を確かめる。
+4. **資料を書く・直す**。
 5. **検査する**:
    ```bash
-   python tools/docs/lint_docs.py     # 画像・リンクの存在、Mermaid の簡易検査、画像の合計サイズ
+   python tools/docs/lint_docs.py     # 画像・リンクの存在、mermaid の簡易検査、画像の合計サイズ
    ```
-   Mermaid は描画できないので、フローチャートのノードの文字列は必ず `"..."` で囲み、`subgraph` と `end` の対応を保つ。
-6. **周辺を揃える**: 処理の流れが変わったら、`CLAUDE.md` のパイプラインの記述・`docs/overview.md` の設定表・`core/common/params.py` の値との一致を確かめる。食い違いは直さず、報告する（`CLAUDE.md` の資料の案内の 1 行だけは更新してよい）。
+   mermaid は描画できないので、フローチャートのノードの文字列は必ず `"..."` で囲み、`subgraph` と `end` の対応を保つ。
+6. **周辺を揃える**: 処理の流れが変わったら、`CLAUDE.md` のパイプラインの記述・`README.md`・`docs/overview.md` の設定表・`params.py` の値との一致を確かめる。
 
 ## 画像のサイズ（git に載せるため小さくする）
 
-- 画像は **JPEG・幅 1200px 以下・品質 80** で保存する（`tools/docs/shrink_images.py` の `MAX_WIDTH` / `JPEG_QUALITY`）。PNG の 13MB が 2.6MB になった。`make_doc_images.py` は最初からこの設定で保存する。
-- `docs/images/` の合計は **5MB 以下**（`lint_docs.py` が検査する）。超えるときは次の順に減らす。
-  1. 使っていない画像を消す（資料から参照されていないもの）。
-  2. `python tools/docs/shrink_images.py --max-width 1000`（PNG が残っているとき。JPEG への変換と、資料の参照の書き換えまで行う）。
-  3. `MAX_WIDTH` を 1000、`JPEG_QUALITY` を 75 に下げて画像を再生成する。文字が読めなくなる手前まで。
+- 画像は **JPEG・幅 1200px 以下・品質 80** で保存する（`tools/docs/shrink_images.py` の `MAX_WIDTH` / `JPEG_QUALITY`）。`make_doc_images.py` は最初からこの設定で保存する。
+- `docs/images/` の合計は **5MB 以下**（`lint_docs.py` が検査する）。超えるときは、使っていない画像を消す → `python tools/docs/shrink_images.py --max-width 1000` → `MAX_WIDTH` 1000・`JPEG_QUALITY` 75 に下げて再生成、の順。
 - PNG を新しく置かない。`.gitignore` は `*.png`・`*.jpg` を除外しているが、`docs/images/*.jpg` だけは例外にしてある。
 
 ## 報告

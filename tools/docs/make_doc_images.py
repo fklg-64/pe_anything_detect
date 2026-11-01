@@ -1,8 +1,9 @@
 """説明資料（docs/）用の画像を作る: 1 枚の画像をパイプラインに通し、各段階の中間結果を docs/images/ に保存する。
 
-    python tools/docs/make_doc_images.py [--image PATH] [--out-dir docs/images] [--prefix coin]
+    python tools/docs/make_doc_images.py [--image PATH] [--out-dir docs/images] [--prefix coin] [--model-dir weights/openvino_models_l6]
 
 画像は JPEG（幅 1200px 以下・品質 80）で保存する（git に載せるため。設定は shrink_images.py）。
+--image の既定は configs/dataset.yaml の先頭の画像。--model-dir の既定は configs/ov_config.yaml の model_dir。
 
 本体（SegmentationRunner.segment）と同じ処理を段階ごとに呼び出す（結果は本体と同じ。最後に semantic_map の一致を確かめる）。
 OpenVINO 版（configs/ov_config.yaml）で実行する。
@@ -18,28 +19,27 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import binary_dilation
+from matplotlib import font_manager
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from core.common.image_layout import make_layout
-from core.common.mask_utils import connected_components, guided_filter, knn_graph, patch_mean, propagate, select_background_points
-from core.common.mask_utils import patch_structure
-from core.common.params import CLIP_LOGIT_SCALE, GUIDED_FILTER_EPS, PRIOR_NON_CORE_PROBABILITY
+from core.common.mask_utils import connected_components, dilate, guided_filter, knn_graph, patch_mean, propagate, select_background_points
+from core.common.parallel import Workers
+from core.common.params import CLIP_LOGIT_SCALE, GUIDED_FILTER_EPS
 from core.common.segmentation_runner import SegmentationRunner
 from core.common.visualization import clean_prompt
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
-from core.utils import load_config, load_image, normalize_image
+from core.utils import load_config, load_dataset_paths, load_image, normalize_image, resize_image
 from tools.docs.shrink_images import save_jpeg
 
-DEFAULT_IMAGE = "/home/llm/datasets/02_object_detection/coin/001_crop.png"
 DISPLAY = 512  # 表示用の一辺（モデル入力と同じ。1 パッチ = 16 画素）
-FONT = "Noto Sans CJK JP"
+FONTS = ["Noto Sans CJK JP", "Yu Gothic", "Meiryo", "MS Gothic"]  # 日本語が出る最初のフォントを使う
 CLUSTER_COLORS = np.array([
     [230, 25, 75], [60, 180, 75], [255, 225, 25], [0, 130, 200],
     [245, 130, 48], [145, 30, 180], [70, 240, 240], [240, 50, 230],
 ], dtype=np.uint8)
-plt.rcParams["font.family"] = FONT
+_available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+plt.rcParams["font.family"] = next((font for font in FONTS if font in _available_fonts), "sans-serif")
 
 
 # =============================================================================
@@ -144,10 +144,12 @@ def save_panels(path: Path, panels, ncols=None, size=3.4, wspace=0.04) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument("--image", default=None, help="既定は configs/dataset.yaml の先頭の画像")
     parser.add_argument("--out-dir", default="docs/images")
     parser.add_argument("--prefix", default="coin")
+    parser.add_argument("--model-dir", default=None, help="OpenVINO モデルのフォルダ。既定は設定の model_dir")
     args = parser.parse_args()
+    image_path = args.image or load_dataset_paths()[0]
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -155,35 +157,36 @@ def main() -> None:
         return out / f"{args.prefix}_{name}.jpg"
 
     config = load_config()
+    if args.model_dir:
+        config["model_dir"] = args.model_dir
     extractor = OVCLIPFeatureExtractor(config)
     edgetam = OVEdgeTamRunner(config)
     runner = SegmentationRunner(extractor, edgetam, config)
-    coarse, refiner = runner.coarse, runner.refiner
+    coarse, refiner, estimator, session = runner.coarse, runner.refiner, runner.refiner.estimator, runner.session
+    threaded = runner.workers
+    runner.workers = refiner.workers = Workers(0)  # 段階ごとの記録（デコーダーの呼び出しの順など）のため、スレッドを使わずに実行する。最後に、スレッドありの結果と比べる
     all_prompts = runner.foreground_prompts + runner.background_prompts
     num_fg_prompts = len(runner.foreground_prompts)
 
-    image_raw = load_image(args.image)
+    image_raw = load_image(image_path)
     height, width = image_raw.shape[:2]
 
     # ---- 前処理 -------------------------------------------------------------
-    layout = make_layout((height, width), extractor.target_size, int(extractor.patch_size), runner.resize_mode)
-    resized = layout.apply(image_raw)
-    coarse.grid = layout.valid_grid
+    resized = resize_image(image_raw, extractor.target_size)
     grid = coarse.grid
-    base = to_display(layout.content(resized), cv2.INTER_AREA)
-    scale = DISPLAY / max(width, height)  # 元画像座標 -> 表示座標（square / fit で正方形のとき）
+    base = to_display(resized, cv2.INTER_AREA)
+    scale = DISPLAY / max(width, height)  # 元画像座標 -> 表示座標
     print("入力", (height, width), "->", resized.shape[:2], "格子", grid)
 
     save_panels(path("c00_input"), [
         (f"元画像（{width}×{height}）", cv2.resize(image_raw, (DISPLAY, DISPLAY), interpolation=cv2.INTER_AREA)),
-        (f"モデル入力（{layout.content_w}×{layout.content_h}）+ パッチ格子 {grid[1]}×{grid[0]}", draw_grid(base, grid)),
+        (f"モデル入力（{resized.shape[1]}×{resized.shape[0]}）+ パッチ格子 {grid[1]}×{grid[0]}", draw_grid(base, grid)),
     ])
 
     # ---- 特徴量 -------------------------------------------------------------
-    edgetam_features = layout.crop_edgetam(refiner.predict_encoder(resized))
+    edgetam_features = session.encode(resized)
     image_tensor = normalize_image(resized, extractor.mean, extractor.std)
-    _, patch_features, fused_patch_features = coarse.extract_features(image_tensor)
-    patch_features, fused_patch_features = layout.crop_tokens(patch_features), layout.crop_tokens(fused_patch_features)
+    patch_features, fused_patch_features = coarse.extract_features(image_tensor)
     edge_embed = edgetam_features[2]
     pe_tokens = fused_patch_features[0, 1:, :]
     edge_flat = edge_embed[0].reshape(edge_embed.shape[1], -1).T
@@ -197,7 +200,7 @@ def main() -> None:
 
     # ---- KMeans とクラスタの判定 ---------------------------------------------
     cluster_labels = coarse.fit_predict_kmeans(pe_tokens, k=coarse.k_clusters, niter=coarse.niter)
-    confidence0, prompt0 = coarse._judge_clusters(patch_features, cluster_labels)
+    confidence0, prompt0, _ = coarse._judge_clusters(patch_features, cluster_labels)
     cluster_map = CLUSTER_COLORS[cluster_labels.reshape(grid)]
     save_panels(path("c02_kmeans"), [
         ("入力", base),
@@ -277,13 +280,11 @@ def main() -> None:
 
     # ---- 粗いラベルの付与と整形 ---------------------------------------------
     labels_list, semantic_labels = coarse.assign_semantic_labels(generated.cluster_labels, generated.cluster_index_list)
-    fg_after, labels_after = coarse.refine_coarse_segmentation(semantic_labels, foreground_mask)
 
     # セマンティックラベル: 連番 -> プロンプト。背景のクラス（影のプロンプトなど）も含めて全パッチに付く
     label_colors = (plt.get_cmap("tab20")(np.arange(len(labels_list)) % 20)[:, :3] * 255).astype(np.uint8)
     label_view = to_display(label_colors[semantic_labels])
-    changed = (fg_after != foreground_mask) | ((labels_after != semantic_labels) & (fg_after != 0))
-    print("整形で変わったパッチ数:", int(changed.sum()), " ラベル:", [clean_prompt(all_prompts[i]) for i in labels_list])
+    print("ラベル:", [clean_prompt(all_prompts[i]) for i in labels_list])
     fig, ax = plt.subplots(figsize=(4.6, 4.4))
     ax.imshow(label_view)
     ax.set_title(f"粗いセマンティックラベル（{len(labels_list)} 種）", fontsize=11)
@@ -296,22 +297,13 @@ def main() -> None:
     plt.close(fig)
     print("保存:", path("c07_semantic_labels"))
 
-    # 整形の前後（前景のパッチだけをラベルの色で塗る。黄枠 = 整形で変わったパッチ）
-    def fg_label_view(mask, labels):
-        return to_display(np.where(mask[..., None] != 0, label_colors[labels], np.array([40, 40, 40], dtype=np.uint8)).astype(np.uint8))
-
-    changed_view = outline(fg_label_view(fg_after, labels_after), to_display(changed.astype(np.uint8)), (255, 255, 0), 2) if changed.any() else fg_label_view(fg_after, labels_after)
-    save_panels(path("c08_refine_coarse"), [
-        ("整形前", fg_label_view(foreground_mask, semantic_labels)),
-        (f"整形後（黄枠: 変わった {int(changed.sum())} パッチ）", changed_view),
-    ], size=4.2)
-
     # =========================================================================
     # 詳細セグメンテーション
     # =========================================================================
+    fg_after, labels_after = foreground_mask, semantic_labels
     foreground_binary = fg_after != 0
     semantic_ids = np.unique(labels_after[foreground_binary])
-    background_pts = select_background_points(foreground_binary, refiner.background_point_count, foreground_map)
+    background_pts = select_background_points(foreground_binary, estimator.background_point_count, foreground_map)
     background_view = draw_grid(overlay(base, foreground_binary, alpha=0.4), grid)
     for x, y in background_pts:
         patch_box(background_view, int(x), int(y), grid, (255, 0, 0), 3)
@@ -325,7 +317,6 @@ def main() -> None:
     class_id = 1
     coarse_mask = (labels_after == semantic_ids[class_id - 1]) & foreground_binary
     comps = connected_components(coarse_mask)
-    from core.common.params import MIN_ISOLATED_PATCHES
     print("連結成分:", [(c.peak, int(c.region.sum())) for c in comps])
     comp_view = overlay(base, coarse_mask, alpha=0.35)
     core_union = np.any([c.core for c in comps], axis=0)
@@ -334,49 +325,40 @@ def main() -> None:
         cv2.circle(comp_view, (int((c.peak[0] + 0.5) * DISPLAY / grid[1]), int((c.peak[1] + 0.5) * DISPLAY / grid[0])), 6, (255, 255, 0), -1)
         cv2.circle(comp_view, (int((c.peak[0] + 0.5) * DISPLAY / grid[1]), int((c.peak[1] + 0.5) * DISPLAY / grid[0])), 6, (0, 0, 0), 1)
 
-    # 実行: 途中の入出力を記録しながら本体の refine を呼ぶ
+    # 実行: 途中の入出力を記録しながら本体の refine を呼ぶ（estimator・session・refiner のメソッドを、インスタンスで包む）
     recorded = {"priors": [], "decoder": []}
-    original_build_prior = refiner._build_prior_map
-    original_decoder = refiner.predict_decoder
+    original_build_prior, original_decode, original_rescue = estimator.build_prior_map, session.decode_prompts, refiner._rescue_uncovered
 
-    def build_prior(ctx, coarse_mask_, coarse_map_, core_):
-        prior = original_build_prior(ctx, coarse_mask_, coarse_map_, core_)
+    def build_prior(inputs, coarse_mask_, coarse_map_, core_):
+        prior = original_build_prior(inputs, coarse_mask_, coarse_map_, core_)
         core_map = patch_mean(core_)
-        unknown = np.maximum(coarse_map_, binary_dilation(coarse_mask_, patch_structure()).astype(np.float32))
-        patch_prior = np.maximum(core_map, PRIOR_NON_CORE_PROBABILITY * unknown)
-        upsampled = cv2.resize(patch_prior, refiner._high_res_size(ctx.input_hw), interpolation=cv2.INTER_LINEAR)
-        recorded["priors"].append(dict(core_map=core_map, unknown=unknown, patch_prior=patch_prior, upsampled=upsampled, prior=prior, guide=ctx.guide,
-                                       filtered_raw=guided_filter(ctx.guide, upsampled, refiner.guide_radius, GUIDED_FILTER_EPS)))
+        unknown = np.maximum(coarse_map_, dilate(coarse_mask_).astype(np.float32))
+        patch_prior = np.maximum(core_map, 0.5 * unknown)
+        upsampled = cv2.resize(patch_prior, estimator.high_res_size, interpolation=cv2.INTER_LINEAR)
+        recorded["priors"].append(dict(core_map=core_map, unknown=unknown, patch_prior=patch_prior, upsampled=upsampled, prior=prior, guide=inputs.guide,
+                                       filtered_raw=guided_filter(inputs.guide, upsampled, estimator.guide_radius, GUIDED_FILTER_EPS)))
         return prior
 
-    def decoder(*a, **kw):
-        result = original_decoder(*a, **kw)
-        _, scores, logits = result
-        recorded["decoder"].append(dict(mask_input=np.array(kw["mask_input"]), scores=np.array(scores), logit=logits[int(np.argmax(scores))].copy(),
-                                        points=len(kw["point_coords"])))
-        return result
+    def decode(coords, labels, feats, height_, width_, mask_input):
+        scores, logits = original_decode(coords, labels, feats, height_, width_, mask_input)
+        recorded["decoder"].append(dict(mask_input=np.array(mask_input), scores=np.array(scores), logit=logits[int(np.argmax(scores))].copy(), points=len(coords)))
+        return scores, logits
 
     pre_rescue = {}
-    original_rescue = refiner._rescue_uncovered
 
-    def rescue(ctx, class_components):
-        pre_rescue["map"] = ctx.semantic_map.copy()
-        uncovered = []
-        work_w, work_h = ctx.size
-        for class_id_, comps_ in class_components.items():
-            for component in comps_:
-                px = min(int((component.peak[0] + 0.5) * work_w / ctx.grid[1]), work_w - 1)
-                py = min(int((component.peak[1] + 0.5) * work_h / ctx.grid[0]), work_h - 1)
-                if ctx.semantic_map[py, px] == 0:
-                    uncovered.append((class_id_, component))
-        pre_rescue["uncovered"] = uncovered
-        return original_rescue(ctx, class_components)
+    def rescue(inputs, state, class_components):
+        pre_rescue["map"] = state.semantic_map.copy()
+        pre_rescue["uncovered"] = [
+            (class_id_, component)
+            for class_id_, comps_ in class_components.items()
+            for component in comps_
+            if not refiner._is_covered(state, refiner._peak_in_work_size(inputs, component))
+        ]
+        return original_rescue(inputs, state, class_components)
 
-    refiner._rescue_uncovered = rescue
-    refiner._build_prior_map, refiner.predict_decoder = build_prior, decoder
-    refined = refiner.refine(resized, foreground_map, fg_after, labels_after, labels_list, width, height, edgetam_features, layout)
-    refiner._build_prior_map, refiner.predict_decoder = original_build_prior, original_decoder
-    refiner._rescue_uncovered = original_rescue
+    estimator.build_prior_map, session.decode_prompts, refiner._rescue_uncovered = build_prior, decode, rescue
+    refined = refiner.refine(resized, foreground_map, fg_after, labels_after, labels_list, width, height, edgetam_features)
+    del estimator.build_prior_map, session.decode_prompts, refiner._rescue_uncovered  # インスタンスの差し替えを外す（クラスのメソッドに戻る）
 
     n_fg = sum(refined.point_labels)
     print("プロンプト点: 正例", n_fg, "負例", len(refined.point_labels) - n_fg, "デコーダー呼び出し", len(recorded["decoder"]))
@@ -410,7 +392,7 @@ def main() -> None:
         sub = a[cy0 * h // grid[0]:cy1 * h // grid[0], cx0 * w // grid[1]:cx1 * w // grid[1]]
         rgb = (plt.get_cmap("viridis")(np.clip(sub, 0, 1))[..., :3] * 255).astype(np.uint8)
         return cv2.resize(rgb, (DISPLAY, DISPLAY), interpolation=cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR)
-    img_sub = cv2.resize(layout.content(resized)[cy0 * 16:cy1 * 16, cx0 * 16:cx1 * 16], (DISPLAY, DISPLAY), interpolation=cv2.INTER_CUBIC)
+    img_sub = cv2.resize(resized[cy0 * 16:cy1 * 16, cx0 * 16:cx1 * 16], (DISPLAY, DISPLAY), interpolation=cv2.INTER_CUBIC)
     save_panels(path("r04_prior_zoom"), [
         ("入力画像（1 つのコインの周り）", img_sub),
         ("パッチ格子の事前確率（③）", zoom(p["patch_prior"])),
@@ -483,7 +465,8 @@ def main() -> None:
         ("最終結果", outline(overlay(base, final_small > 0, alpha=0.4), final_small > 0, (255, 255, 0), 2)),
     ], size=3.0)
 
-    # ---- 本体の segment と同じ結果か確認 -------------------------------------
+    # ---- 本体の segment（スレッドあり）と同じ結果か確認 -----------------------
+    runner.workers = refiner.workers = threaded
     reference = runner.segment(image_raw)
     same = bool((reference.semantic_map == final).all())
     print("本体の segment と semantic_map が一致:", same, " 差のある画素:", int((reference.semantic_map != final).sum()))

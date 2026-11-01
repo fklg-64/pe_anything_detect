@@ -2,7 +2,7 @@
 
 EdgeTAM（edgetam_runner.py）と同じ入出力（np.ndarray）で、SegmentationRunner / SemanticRefiner にそのままつながる。
 EdgeTAM と SAM2.1 はデコーダー（prompt encoder + mask decoder）の入出力と特徴量の形状が同じなので、
-forward / preprocess / postprocess は EdgeTAM のクラスをそのまま使い、モデルの取得（公式 SAM2.1、パッケージ名 sam2_official）だけを差し替える。
+forward は EdgeTAM のクラスをそのまま使い、モデルの取得（公式 SAM2.1、パッケージ名 sam2_official）だけを差し替える。
 EdgeTAM 側（core/torch/sam2、edgetam_runner.py）は変更していない。
 
 設定（configs/torch_config_sam2.yaml）: sam2_model_path / sam2_model_config / image_size / device
@@ -74,12 +74,11 @@ class Sam2EncoderModel(RepVitModel):
 
 
 class Sam2DecoderModel(DecodeModel):
-    """SAM2.1 のデコーダー（prompt encoder + mask decoder）。forward / preprocess / postprocess は DecodeModel と同じ。"""
+    """SAM2.1 のデコーダー（prompt encoder + mask decoder）。forward は DecodeModel と同じ。"""
 
     def __init__(self, config: dict):
         nn.Module.__init__(self)  # DecodeModel.__init__ は EdgeTAM の設定キーを読むので呼ばない
         _load_sam2(self, config)
-        self.mask_threshold: float = self._transforms.mask_threshold
         self.no_mask_embed = self.edgetam_model.sam_prompt_encoder.no_mask_embed
 
 

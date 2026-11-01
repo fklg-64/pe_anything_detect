@@ -1,7 +1,7 @@
 from core.openvino.runtime_utils import limit_cpu_threads, make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
 
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 
@@ -9,13 +9,17 @@ import openvino as ov
 import openvino_tokenizers
 
 from core.common.params import PE_MEAN, PE_STD
-from core.openvino.compiled_model import OVModel, static_input_side
+from core.openvino.compiled_model import OVModel, StaticPlan, static_input_side
+
+
+# 使わない出力。変換済みモデルは、画像全体の特徴量（raw_image_features）と CLS からパッチへの attention も出すが、粗い判定では使わない
+UNUSED_OUTPUTS = {"raw_image_features", "cls2patch_attention"}
 
 
 def _drop_unused_outputs(model: ov.Model) -> None:
-    """未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す。"""
+    """未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す（その出力だけに使う計算もコンパイルで消える。PE が約 2ms 速くなる）。"""
     for result in model.get_results():
-        if result.output(0).get_names() & {"cls2patch_attention"}:
+        if result.output(0).get_names() & UNUSED_OUTPUTS:
             model.remove_result(result)
 
 
@@ -60,7 +64,7 @@ class OVCLIPFeatureExtractor:
         side = self.static_side
         self.visual_model = OVModel(
             core, visual_path, self.device, self.num_threads, prepare=_drop_unused_outputs,
-            static_shapes=None if side is None else {"x": [1, 3, side, side]},
+            static=None if side is None else StaticPlan({"x": [1, 3, side, side]}),
         )
         text_model = core.read_model(text_path)
         patch_logits_model = core.read_model(patch_logits_path)
@@ -81,15 +85,12 @@ class OVCLIPFeatureExtractor:
         input_tensor = np.zeros((1, 3, self.target_size, self.target_size), dtype=np.float32)
         self.visual_model([input_tensor])
 
-    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
-        """(1,3,S,S) -> (raw_image_features, raw_patch_features, fused_layer_features)"""
+    def extract_image_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """(1,3,S,S) -> (raw_patch_features, fused_layer_features)"""
         outs = self.visual_model([image_tensor])
-        raw_image_features = outs[self.visual_model.output_index("raw_image_features")]
-        if normalize:
-            raw_image_features = raw_image_features / np.linalg.norm(raw_image_features, axis=-1, keepdims=True)
         raw_patch_features = outs[self.visual_model.output_index("raw_patch_features")]
         fused_patch_features = outs[self.visual_model.output_index("fused_layer_features")]
-        return raw_image_features, raw_patch_features, fused_patch_features
+        return raw_patch_features, fused_patch_features
 
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
         """プロンプトの文字列 -> (N, D) のテキスト特徴量"""

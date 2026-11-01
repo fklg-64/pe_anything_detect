@@ -5,23 +5,17 @@ from os.path import relpath
 from pathlib import Path
 from typing import Dict
 
+from core.common.params import (
+    GALLERY_FILE_NAME,
+    GALLERY_IMAGES,
+    GALLERY_MIN_COLUMN_WIDTH,
+    GALLERY_PAGE_SIZES,
+    ORIGINAL_STEM,
+)
+
 # HTML/JS のひな形（__DATA__ などの印を write_gallery_html が埋める）
 GALLERY_TEMPLATE = (Path(__file__).parent / "gallery_template.html").read_text(encoding="utf-8")
 
-# 一覧HTMLに並べる画像（列見出し, ファイル名）。元画像は保存先ではなく入力画像のパスを参照する
-GALLERY_IMAGES = [
-    ("foreground_map", "foreground_map.png"),
-    ("coarse_semantic_segmentation", "coarse_semantic_segmentation.png"),
-    ("foreground_overlay", "foreground_overlay.png"),
-    ("semantic_result", "semantic_result.png"),
-]
-GALLERY_FILE_NAME = "index.html"
-# 元画像を保存先へコピーするときのファイル名（拡張子は元のまま）。output_dir ごと移動しても参照が切れないようにする
-ORIGINAL_STEM = "original"
-# 一覧HTMLの列の最小幅(px)。列は画面幅に合わせて等分され、画像は列幅に合わせて拡縮する（足りなければ横スクロール）
-GALLERY_MIN_COLUMN_WIDTH = 280
-# 一覧HTMLの1ページあたりの表示枚数の選択肢（先頭が既定）
-GALLERY_PAGE_SIZES = [50, 100, 200]
 
 
 def write_gallery_html(output_dir: Path, elapsed_ms: Dict[Path, float]) -> Path:
@@ -54,7 +48,7 @@ def write_gallery_html(output_dir: Path, elapsed_ms: Dict[Path, float]) -> Path:
     data = json.dumps(rows, ensure_ascii=False).replace("<", "\\u003c")
     html = (GALLERY_TEMPLATE
             .replace("__DATA__", data)
-            .replace("__PAGE_SIZES__", json.dumps(GALLERY_PAGE_SIZES))
+            .replace("__PAGE_SIZES__", json.dumps(list(GALLERY_PAGE_SIZES)))
             .replace("__COLUMNS__", str(len(GALLERY_IMAGES) + 1))
             .replace("__MIN_COLUMN_WIDTH__", str(GALLERY_MIN_COLUMN_WIDTH)))
     out_path = output_dir / GALLERY_FILE_NAME

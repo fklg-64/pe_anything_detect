@@ -8,7 +8,7 @@ import numpy as np
 import openvino as ov
 
 from core.common.edgetam_helper import EdgeTamHelper
-from core.openvino.compiled_model import OVModel, static_input_side
+from core.openvino.compiled_model import OVModel, StaticPlan, static_input_side
 from core.openvino.graph_edits import (
     NCHW_FROM_NHWC,
     NHWC_FROM_NCHW,
@@ -17,7 +17,7 @@ from core.openvino.graph_edits import (
     remove_decoder_output_reorder,
 )
 
-_UNEXPECTED_GRAPH = "のグラフが想定と違うため、グラフの最適化ができません（config の ov_optimize_graph: false で切れます）"
+_UNEXPECTED_GRAPH = "のグラフが想定と違うため、グラフを書き換えられません（変換し直したモデルなど。config の ov_static_shape: false なら書き換えずに動きます）"
 
 
 def _optimize_static_decoder(model: "ov.Model") -> None:
@@ -45,8 +45,6 @@ class OVEdgeTamRunner(EdgeTamHelper):
         self.num_threads = config["ov_num_thread"]
         # エンコーダーの入力の一辺（ov_static_shape が真のときだけ。None なら動的形状。compiled_model.py）
         self.static_side = static_input_side(config)
-        # 静的形状のデコーダーのグラフを書き換えて速くする（出力は同じ。config の ov_optimize_graph。実験で切れる）
-        self.optimize_graph = config.get("ov_optimize_graph", True)
 
         # OpenCV・NumPy(BLAS)のスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
         limit_cpu_threads()
@@ -67,23 +65,20 @@ class OVEdgeTamRunner(EdgeTamHelper):
         decoder_path = model_dir / f"edgetam_decoder{suffix}"
 
         side = self.static_side
-        # グラフの最適化（出力は同じ。静的形状のモデルだけ）。外から見える特徴量は NCHW のまま、high_res_feats0 を内部では NHWC で持つ
-        optimize = self.optimize_graph and side is not None
-        self.encoder_model = OVModel(
-            core, encoder_path, self.device, self.num_threads,
-            static_shapes=None if side is None else {"x": [1, 3, side, side]},
-            **({"prepare_static": _optimize_static_encoder, "static_output_perms": {0: NCHW_FROM_NHWC}} if optimize else {}),
-        )
-        self.decoder_model = OVModel(
-            core, decoder_path, self.device, self.num_threads,
-            static_shapes=None if side is None else self._decoder_static_shapes(),
-            **({"prepare_static": _optimize_static_decoder, "static_input_perms": {0: NHWC_FROM_NCHW}} if optimize else {}),
-        )
+        # 静的形状のモデルは、グラフを書き換えて速くする（出力は同じ）。外から見える特徴量は NCHW のまま、high_res_feats0 を内部では NHWC で持つ。
+        # 動的形状のモデルは書き換えない（compiled_model.py）
+        encoder_plan = decoder_plan = None
+        if side is not None:
+            encoder_plan = StaticPlan({"x": [1, 3, side, side]}, _optimize_static_encoder, output_perms={0: NCHW_FROM_NHWC})
+        self.encoder_model = OVModel(core, encoder_path, self.device, self.num_threads, static=encoder_plan)
+        if side is not None:
+            decoder_plan = StaticPlan(self._decoder_static_shapes(), _optimize_static_decoder, input_perms={0: NHWC_FROM_NCHW})
+        self.decoder_model = OVModel(core, decoder_path, self.device, self.num_threads, static=decoder_plan)
 
     def _decoder_static_shapes(self):
         """静的形状のデコーダーに固定する形。特徴量と初期マスクは、静的形状のエンコーダーの出力の形（点の数は固定しない）。
 
-        形がこれと違う入力（格子分離のセルごとのデコード、パディングを除いて切り出した特徴量）は、動的形状のデコーダーで推論する。
+        形がこれと違う入力（格子分離のセルごとのデコード）は、動的形状のデコーダーで推論する。
         """
         feats0, feats1, embed = self.encoder_model.output_shapes
         return {

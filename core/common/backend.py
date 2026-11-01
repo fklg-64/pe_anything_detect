@@ -15,10 +15,8 @@ class CLIPBackend(Protocol):
     mean: np.ndarray  # (3, 1, 1)
     std: np.ndarray   # (3, 1, 1)
 
-    def extract_image_features(
-        self, image_tensor: np.ndarray, normalize: bool = True
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(1,3,S,S) float32 -> (raw_image_features, raw_patch_features, fused_layer_features)"""
+    def extract_image_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """(1,3,S,S) float32 -> (raw_patch_features, fused_layer_features)。画像全体の特徴量は使わないので返さない"""
         ...
 
     def extract_text_features(self, prompts: List[str]) -> np.ndarray:

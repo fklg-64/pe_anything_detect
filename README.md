@@ -1,8 +1,19 @@
 # はじめに
 
-- [perception_models](https://github.com/facebookresearch/perception_models.git)を活用して、様々な検出タスクを"高速"に行うことを目標にしたリポジトリ
+- [perception_models](https://github.com/facebookresearch/perception_models.git)を活用して、様々な検出タスクを**高速**に行うことを目標にしたリポジトリ
 
 - OpenVINOやfaissなども活用して、CPUで高速に動作する基盤モデルを目指す
+
+- テキストプロンプトだけで（学習なしで）、画像から「何がどこにあるか」を求める。**PE-Spatial（CLIP 系）で当たりを付け、EdgeTAM で輪郭を切り出す**
+
+![overview](docs/images/coin_overview.jpg)
+
+| ドキュメント | 説明 |
+| --- | --- |
+| [docs/overview.md](docs/overview.md) | 全体の流れ・処理時間 |
+| [docs/coarse_segmentation.md](docs/coarse_segmentation.md) | 粗い段階 |
+| [docs/detailed_segmentation.md](docs/detailed_segmentation.md) | 詳細な段階 |
+| [docs/method_history.md](docs/method_history.md) | これまでに試した手法 |
 
 ## 使い方
 
@@ -21,6 +32,8 @@
     ```bash
     python convert_openvino.py
     ```
+
+    クラスタリングに使う PE の層を変えたモデルは、`python convert_openvino.py --cluster-layers 6 --out-dir ./weights/openvino_models_l6 --pe-only` で別フォルダに作れる（EdgeTAM のモデルは `openvino_models` からコピーし、`configs/ov_config.yaml` の `model_dir` で切り替える）。
 
 2. モデル実行
 
@@ -45,12 +58,3 @@
 
 ## 補足
 - PyTorchでの動作は、基本的に確認程度とするため、実行しても処理が最新とは限らない
-
-### インスタンス分離に関して
-
-同じクラスの領域を、今回のスコアマップや EdgeTAM のロジットから分けることになります。有力なのは次の 2 つです。
-
-- 領域を分けてから EdgeTAM に渡す方法です。クラスごとのマスクで距離変換して極大点を取り、各点を正例にして EdgeTAM を個別に走らせ、overlap_prior_floor と同じ要領で重なりを解決します。
-- 前景クラスマスクにそのまま watershed をかける方法です。軽くて速い反面、形が不規則だと過分割になります。
-
-どちらも、くっついた同種の物体の境界は距離変換だけでは決まりにくいのが難点です。

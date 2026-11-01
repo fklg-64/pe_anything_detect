@@ -1,7 +1,7 @@
 """変換済み OpenVINO モデルに、コンパイルの前に施すグラフの書き換え（モデルのファイルは変えない）。
 
 どの関数も、静的形状に reshape した後のモデルを in-place で書き換える。出力は書き換え前と同じ値（浮動小数の丸めまで一致する）。
-想定したグラフと違っていれば何も変えず False を返す（変換し直したモデルでも、遅くなるだけで動く）。
+想定したグラフと違っていれば何も変えず False を返す（edgetam_runner.py が例外にする。書き換えずに動かすには ov_static_shape: false）。
 """
 
 import core.openvino.runtime_utils  # noqa: F401  openvino より先に import する（sys.path の整理。runtime_utils.py 参照）
@@ -69,7 +69,7 @@ def remove_decoder_output_reorder(model: ov.Model) -> bool:
     return True
 
 
-# 4 次元の特徴量の軸の並びの変換（NCHW <-> NHWC）。OVModel の static_input_perms / static_output_perms に渡す
+# 4 次元の特徴量の軸の並びの変換（NCHW <-> NHWC）。StaticPlan の input_perms / output_perms に渡す
 NHWC_FROM_NCHW = (0, 2, 3, 1)
 NCHW_FROM_NHWC = (0, 3, 1, 2)
 
@@ -78,7 +78,7 @@ def encoder_feats0_as_nhwc(model: ov.Model) -> bool:
     """エンコーダーの出力 0（high_res_feats0 [1, C, H, W]）を NHWC で出す（出力の直前に Transpose を足す）。
 
     畳み込みの出力は CPU プラグインの内部では NHWC なので、NCHW で出すと Reorder が入る（約 2〜3ms）。NHWC のまま出せば無い。
-    出力の形が [1, H, W, C] に変わるので、呼び出し側は OVModel の static_output_perms で NCHW のビューに戻す。
+    出力の形が [1, H, W, C] に変わるので、呼び出し側は StaticPlan の output_perms で NCHW のビューに戻す。
     """
     result = model.get_results()[0]
     source = result.input_value(0)

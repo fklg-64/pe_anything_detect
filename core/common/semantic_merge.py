@@ -26,11 +26,10 @@ def merge_near_ties(
 
     prompt_index: パッチごとのプロンプト番号（前景プロンプト < num_foreground_prompts <= 背景プロンプト）。変更せず、新しい配列を返す。
     cluster_labels: パッチごとの PE のクラスタ番号。cluster_logits: (クラスタ数, 前景プロンプト数) のロジット（正規化したトークンとテキストの類似度 × CLIP_LOGIT_SCALE）。
-    tolerance が負なら何もしない（実験で、まとめない基準と比べるため）。
     """
     result = prompt_index.copy()
     foreground = result < num_foreground_prompts
-    if tolerance < 0 or not foreground.any():
+    if not foreground.any():
         return result
     weights = np.bincount(result[foreground], minlength=num_foreground_prompts).astype(np.float64)
     pairs: Dict[Tuple[int, int], int] = {}

@@ -9,7 +9,6 @@ from typing import NamedTuple, Optional, Tuple
 import cv2
 import numpy as np
 from scipy import fft as sfft
-from scipy import ndimage as ndi
 
 from core.common.params import (
     LATTICE_DETECT_SIZE,
@@ -73,7 +72,8 @@ def _lattice_vectors(
     bottom, right = rows.max() + LATTICE_PEAK_RADIUS + 1, cols.max() + LATTICE_PEAK_RADIUS + 1
     crop = (slice(top, bottom), slice(left, right))
     local_max = np.zeros_like(candidate)
-    local_max[crop] = corr[crop] == ndi.maximum_filter(corr[crop], size=size)
+    # size 四方の最大値フィルタ（cv2.dilate は、画像の外を無視する。端で折り返した値は窓の中の値なので、結果は同じ）
+    local_max[crop] = corr[crop] == cv2.dilate(np.ascontiguousarray(corr[crop]), np.ones((size, size), np.uint8))
     peaks = local_max & candidate
     coords = np.argwhere(peaks) - np.array([cy, cx])
     values = corr[peaks]

@@ -9,27 +9,21 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from core.common.params import (
+    CLUSTER_COLOR_PALETTE,
+    DEBUG_DIR_NAME,
+    FOREGROUND_OVERLAY_ALPHA,
+    LEGEND_FONTSIZE,
+    POINT_COLOR_NEGATIVE,
+    POINT_COLOR_POSITIVE,
+    POINT_RADIUS,
+    RESULT_DPI,
+    RESULT_FIGSIZE,
+    SEMANTIC_COLORS,
+)
 from core.common.result import ClusterView, SegmentationResult
 
-# セマンティック可視化の色 (RGB)。0番は背景で常にシアン
-SEMANTIC_COLORS = np.array([
-    [0, 255, 255],
-    [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-    [255, 0, 255], [255, 128, 0], [128, 0, 255], [255, 255, 255],
-    [128, 64, 0], [255, 128, 192], [0, 128, 0], [128, 128, 128],
-], dtype=np.uint8)
-# 前景オーバーレイ（粗い前景マスク・EdgeTAM最終マスク）の赤の不透明度
-FOREGROUND_OVERLAY_ALPHA = 0.3
-# 前景オーバーレイに描くプロンプト点の半径(px)と色(BGR)。正例=緑、負例=赤
-POINT_RADIUS = 20
-POINT_COLOR_POSITIVE = (0, 255, 0)
-POINT_COLOR_NEGATIVE = (0, 0, 255)
-# セマンティック結果（重畳 + 凡例）のmatplotlib図
-RESULT_FIGSIZE = (10, 6)
-RESULT_DPI = 150
-LEGEND_FONTSIZE = 9
-# 精緻化の中間画像を入れる、保存先の下のフォルダ名
-DEBUG_DIR_NAME = "debug"
+SEMANTIC_COLOR_ARRAY = np.array(SEMANTIC_COLORS, dtype=np.uint8)
 
 
 def clean_prompt(prompt: str) -> str:
@@ -44,17 +38,15 @@ def semantic_class_names(all_prompts: List[str], prompt_indices: List[int]) -> L
 
 def semantic_colors(num_classes: int) -> np.ndarray:
     """クラス数分の色 (RGB, uint8)。足りなければ繰り返し、0番は常にシアン。"""
-    fg = SEMANTIC_COLORS[1:]
-    return np.vstack([SEMANTIC_COLORS[:1], fg[np.arange(num_classes - 1) % len(fg)]])[:num_classes]
+    fg = SEMANTIC_COLOR_ARRAY[1:]
+    return np.vstack([SEMANTIC_COLOR_ARRAY[:1], fg[np.arange(num_classes - 1) % len(fg)]])[:num_classes]
 
 
 class ResultSaver:
     """処理結果の画像・マスク・オーバーレイの書き出し。"""
 
-    def __init__(self, config: dict, feature_size: int):
-        self.feature_size = feature_size
+    def __init__(self, config: dict):
         self.k_clusters = config["k_clusters"]
-        self.color_palette = config["color_palette"]
         self.overlay_alpha = config["overlay_alpha"]
         self.show_result = config["show_result"]
 
@@ -163,19 +155,16 @@ class ResultSaver:
     def _colorize_labels(self, labels_2d: np.ndarray, size: Tuple[int, int]) -> Image.Image:
         """ラベルマップをパレットで着色し、元画像サイズへ拡大する。"""
         image = Image.fromarray(labels_2d.astype(np.uint8))
-        image.putpalette(self.color_palette)
+        image.putpalette(list(CLUSTER_COLOR_PALETTE))
         return image.resize(size, resample=Image.Resampling.NEAREST)
 
     def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
-        """KMeansのクラスタ（EdgeTAM併用時は伝播前のPEも）、整形前後の粗いセマンティックラベルを着色して保存。"""
-        grid = result.foreground_map.shape  # パッチ格子（アスペクト比を維持するモードでは正方形とは限らない）
+        """KMeansのクラスタ（EdgeTAM併用時は伝播前のPEも）と、粗いセマンティックラベルを着色して保存。"""
+        grid = result.foreground_map.shape  # パッチ格子
         for image_name, view in self._cluster_views(result):
             self._colorize_labels(view.labels.reshape(grid), size).save(save_dir / image_name)
         self._colorize_labels(result.semantic_labels.reshape(grid), size).save(
             save_dir / "coarse_semantic_segmentation.png"
-        )
-        self._colorize_labels(result.raw_semantic_labels.reshape(grid), size).save(
-            save_dir / "coarse_semantic_segmentation_raw.png"
         )
 
     def _cluster_views(self, result: SegmentationResult) -> List[Tuple[str, ClusterView]]:
