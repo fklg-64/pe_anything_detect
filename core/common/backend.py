@@ -27,6 +27,10 @@ class CLIPBackend(Protocol):
         """パッチ特徴 (1,N+1,C) とクラスタ番号 (N,) int64 -> クラスタごとのトークン"""
         ...
 
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """パッチ特徴 (1,N+1,C) と領域番号 (N,) int64 -> 領域ごとのトークン"""
+        ...
+
 
 class EdgeTamBackend(Protocol):
     """前後処理（transform_coords / preprocess / postprocess）は EdgeTamHelper が提供する。"""
