@@ -149,7 +149,15 @@ class CLIPOpenVINOExporter(BaseOpenVINOExporter):
         self._save_and_compress(ov_text, "pe_text_model")
 
     def export_custom_model(self):
-        """パッチ特徴量抽出モデル (Patch Logits Model) の OpenVINO 変換"""
+        """パッチ特徴量抽出モデル (Patch Logits Model) の OpenVINO 変換（本体の粗い判定のクラスタごとのトークン。CLS を含める pool）"""
+        self._export_cluster_tokens_model("pe_patch_logits_model", pool="cls_attn")
+
+    def export_region_model(self):
+        """矩形などの小さな領域の代表トークンのモデル (Region Tokens Model) の OpenVINO 変換（領域のパッチの value の平均。tools/visualizer が使う）"""
+        self._export_cluster_tokens_model("pe_region_tokens_model", pool="mean")
+
+    def _export_cluster_tokens_model(self, model_name: str, pool: str):
+        """(パッチ特徴 (1, 1+N, C), ラベル (N,)) -> ラベルごとの代表トークン (最大ラベル + 1, D) のモデルを変換して保存する。pool は monkey_patch.REGION_POOL_MODES"""
         class CustomWrapper(nn.Module):
             def __init__(self, model: Eva):
                 super().__init__()
@@ -157,7 +165,7 @@ class CLIPOpenVINOExporter(BaseOpenVINOExporter):
 
             def forward(self, patch_features: torch.Tensor, cluster_labels: torch.Tensor):
                 return self.model.custom_forward(
-                    patch_features, cluster_labels, normalize=True
+                    patch_features, cluster_labels, normalize=True, pool=pool
                 )
 
         w, h = self.extractor.force_image_size, self.extractor.force_image_size
@@ -173,7 +181,7 @@ class CLIPOpenVINOExporter(BaseOpenVINOExporter):
             custom_wrapper,
             example_input=(dummy_patch_features, dummy_cluster_labels)
         )
-        self._save_and_compress(ov_custom, "pe_patch_logits_model")
+        self._save_and_compress(ov_custom, model_name)
 
     def export_tokenizer_model(self):
         """トークナイザーの OpenVINO 変換"""
@@ -193,6 +201,7 @@ class CLIPOpenVINOExporter(BaseOpenVINOExporter):
             ("Exporting Visual Model", self.export_visual_model),
             ("Exporting Text Model", self.export_text_model),
             ("Exporting Patch Logits Model", self.export_custom_model),
+            ("Exporting Region Tokens Model", self.export_region_model),
             ("Exporting Tokenizer", self.export_tokenizer_model),
         ]
         self._run_export_pipeline(tasks)
@@ -319,6 +328,8 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", default=None, help="保存先。既定は設定の model_dir（既存のモデルを上書きしない場合に指定する）")
     parser.add_argument("--pe-only", action="store_true", help="PE（CLIP）だけを変換し、EdgeTAM は変換しない")
     parser.add_argument("--edgetam-only", action="store_true", help="EdgeTAM だけを変換し、PE（CLIP）は変換しない")
+    parser.add_argument("--region-only", action="store_true",
+                        help="矩形などの小さな領域の代表トークンのモデル（pe_region_tokens_model。tools/visualizer が使う）だけを変換する。既存のモデルは触らない")
     args = parser.parse_args()
 
     # 設定データ
@@ -329,6 +340,11 @@ if __name__ == "__main__":
         config["cluster_layers"] = args.cluster_layers
     if args.out_dir:
         config["model_dir"] = args.out_dir
+
+    if args.region_only:
+        exporter_region = CLIPOpenVINOExporter(TorchCLIPFeatureExtractor(config), save_dir=config["model_dir"])
+        exporter_region._run_export_pipeline([("Exporting Region Tokens Model", exporter_region.export_region_model)])
+        raise SystemExit(0)
 
     # Extractor / EdgeTAM モデルの初期化
     edgetam_encoder = RepVitModel(config)

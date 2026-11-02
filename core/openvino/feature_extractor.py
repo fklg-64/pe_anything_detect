@@ -59,6 +59,7 @@ class OVCLIPFeatureExtractor:
         visual_path = model_dir / f"pe_visual_model{suffix}"
         text_path = model_dir / f"pe_text_model{suffix}"
         patch_logits_path = model_dir / f"pe_patch_logits_model{suffix}"
+        region_tokens_path = model_dir / f"pe_region_tokens_model{suffix}"
         tokenizer_path = model_dir / "pe_tokenizer.xml"
 
         side = self.static_side
@@ -68,6 +69,7 @@ class OVCLIPFeatureExtractor:
         )
         text_model = core.read_model(text_path)
         patch_logits_model = core.read_model(patch_logits_path)
+        region_tokens_model = core.read_model(region_tokens_path)
         tokenizer_model = core.read_model(tokenizer_path)
 
         # メタデータ
@@ -79,6 +81,7 @@ class OVCLIPFeatureExtractor:
         # コンパイルモデル
         self.compiled_text_model = core.compile_model(text_model, self.device, compile_config)
         self.compiled_patch_logits_model = core.compile_model(patch_logits_model, self.device, compile_config)
+        self.compiled_region_tokens_model = core.compile_model(region_tokens_model, self.device, compile_config)
         self.compiled_tokenizer = core.compile_model(tokenizer_model, self.device, compile_config)
 
     def _forward_once(self) -> None:
@@ -105,3 +108,13 @@ class OVCLIPFeatureExtractor:
         """パッチ特徴 (1,N+1,C) とクラスタ番号 (N,) -> クラスタごとの代表トークン"""
         outs = self.compiled_patch_logits_model([patch_features, fused_cluster_labels])
         return outs[self.compiled_patch_logits_model.output(0)]
+
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """パッチ特徴 (1,N+1,C) と領域番号 (N,)（0 以上の整数。矩形の外も 1 つの番号にできる） -> 番号 0.. ごとの代表トークン (最大番号+1, D)
+
+        extract_cluster_tokens との違い: CLS トークンを見ず、領域のパッチの value の平均を取る。extract_cluster_tokens は CLS が注意の大半を受けるので、
+        数パッチの小さな領域では、どこを囲んでも画像全体の CLS とほぼ同じトークンになる（monkey_patch.custom_attentionpoollatent_forward）。
+        モデルは `python convert_openvino.py --region-only` で作る（本体の粗い判定は使わない）。
+        """
+        outs = self.compiled_region_tokens_model([patch_features, region_labels])
+        return outs[self.compiled_region_tokens_model.output(0)]

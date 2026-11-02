@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## コマンド
 
 ```bash
-python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openvino_models)。実行時は先に必須。`--edgetam-only` で EdgeTAM だけ（約 30 秒）。デコーダーは画像サイズ可変（変換後に別サイズで PyTorch と照合して確認）
+python convert_openvino.py   # PyTorch (weights/*.pt) -> OpenVINO (weights/openvino_models)。実行時は先に必須。`--edgetam-only` で EdgeTAM だけ（約 30 秒）。`--region-only` で矩形用の代表トークンのモデル（`pe_region_tokens_model`。`tools/visualizer` が使う。既存のモデルは触らない）だけ。デコーダーは画像サイズ可変（変換後に別サイズで PyTorch と照合して確認）
 python develop.py            # OpenVINO 版の実行（本命・最新）
 python test_pytorch.py       # PyTorch 版の実行（core/common を共有するので OpenVINO 版と同じ処理。手法の実験用）
 python test_pytorch_sam2.py  # PyTorch 版を SAM2.1（公式 Hiera-T）で精緻化して実行（configs/torch_config_sam2.yaml。EdgeTAM との差し替えの検証用）
@@ -59,6 +59,7 @@ python tools/experiments/semantic_merge/regress_classes.py  # 実画像・COCO12
 python tools/experiments/semantic_merge/montage_classes.py --paths P... --out OUT.jpg --variants current,core  # クラス分けの比較画像
 python tools/experiments/semantic_merge/timing.py  # 統合の有無の処理時間（OpenVINO）
 python tools/experiments/semantic_merge/report_semantic_merge.py  # 上の結果を outputs/semantic_merge/index.html に可視化
+python tools/visualizer/app.py [--open] [--port 8765]  # 画像の上の回転できる矩形ごとに、PE の特徴が前景・背景のどのプロンプトに近いかを見る Web GUI（物体のインスタンス検出の検討用。詳細は tools/visualizer/README.md。初回は `python convert_openvino.py --region-only`）
 python tools/yoloe/app.py  # YOLOE（テキストプロンプトのゼロショット検出）を試すWeb GUI。CLIは tools/yoloe/yoloe.py。詳細は tools/yoloe/README.md
 python tools/dataset/make_synthetic_dataset.py --parts DIR --backgrounds DIR --out DIR  # 部品の切り抜きを背景に合成し、マスク・個数の正解付きデータを作る
 python tools/evaluation/eval_synthetic.py --data DIR  # 合成データでIoU・有無・個数を条件別に評価
@@ -104,6 +105,7 @@ python tools/experiments/speed/compare.py BASE CAND [--verbose]  # 上の 2 つ�
 backend:
 
 - OpenVINO: `core/openvino/feature_extractor.py`（`OVCLIPFeatureExtractor`）, `edgetam_runner.py`（`OVEdgeTamRunner`）
+  - **領域の代表トークンは 2 通り**（`custom_attentionpoollatent_forward(pool=)`）。`extract_cluster_tokens`（`pool="cls_attn"`。本体の粗い判定のクラスタごとのトークン）は CLS を必ず注意の対象に含め、CLS が注意の大半を受ける（領域のパッチ数 1〜4 で 99.6%・25〜99 で 90%・100 以上でも約 70%）。数十パッチ未満の小さな領域（矩形 1 つなど）は、どこでも画像全体の CLS とほぼ同じトークンになり、前景が背景になる。小さな領域は `extract_region_tokens`（`pool="mean"`。領域のパッチの value の平均。モデルは `pe_region_tokens_model`。他のモデルと同じく起動時に読み込む。無いと起動時に FileNotFoundError）を使う。本体の粗い判定は変えていない（12 枚で最終前景マスクが完全一致）。測定は `tools/visualizer/README.md`。**粗い判定の `extract_cluster_tokens` を `extract_region_tokens` に替えてはいけない**: 背景クラスタが前景と判定される割合が 2% → 27%（パッチ数で重み）に増え、粗い前景率が capsule 25→73%・transistor 27→87%・cable 44→68% になる（12 枚で前景→背景は 3 パッチだけ。一方向にずれる）。背景に素材・場面のプロンプト 10 個を足すと 27% → 12% に減るが直りきらず、画像ごとの最良のしきい値が −1.8〜+3.8 とばらつくので 1 つのオフセットでも直らない（2026-11-03、クラスタ単位 96 個で測定）
   - `core/openvino/runtime_utils.py`: 2 つの backend 共通の準備。**import するだけで `/opt/intel/openvino` を `sys.path` から外す**ので、各 backend ファイルは `import openvino` より前にこれを import する（順序を保つこと）。コンパイル設定 `make_compile_config` と INT8 の接尾辞 `model_file_suffix` もここ。各 backend の初期化は `limit_cpu_threads()`（OpenCV と BLAS のスレッド数の制限）を呼ぶ。**NumPy の BLAS のスレッド数は 1 に制限する（`limit_blas_threads`）。BLAS の既定（20 スレッド）は、行列積の後もスピン待ちして OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする（処理時間が約 1/1.5 に）。`docs/method_history.md`**
   - `core/openvino/compiled_model.py`: `OVModel`（モデル 1 つの読み込みと実行。出力はモデルの出力の順のリスト）。config の `ov_static_shape: true` で、PE・EdgeTAM エンコーダー・デコーダーを `image_size` 四方に固定（読み込み時に reshape。**`convert_openvino.py` で変換し直す必要は無い**。`StaticPlan` で指定）してコンパイルする。約 23ms（約 12%）速くなるが、出力が動的形状と bit 単位では一致しない（MVTec・COCO・合成の 53 枚で、最終マップは 52 枚が完全一致・残り 1 枚も不一致画素 0.01%、クラスの変化なし）。形が合わない入力（格子分離のセルごとのデコード）は、動的形状のモデルで推論する（初めて必要になったときにコンパイルする）。
 - PyTorch（実験用）: `core/torch/feature_extractor.py` の `TorchCLIPProbe`。全層の hidden・attention 出力を取り出し、後半ブロックを attention マスク付きで再実行できる。`tools/experiments/decontam/exp_decontam*.py` が使う。

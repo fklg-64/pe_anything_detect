@@ -122,10 +122,17 @@ class TorchCLIPBackend(TorchCLIPFeatureExtractor):
             return self._to_numpy(self.model.encode_text(tokens, normalize=normalize))
 
     def extract_cluster_tokens(self, patch_features: np.ndarray, fused_cluster_labels: np.ndarray) -> np.ndarray:
+        return self._pooled_tokens(patch_features, fused_cluster_labels, pool="cls_attn")
+
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """OVCLIPFeatureExtractor.extract_region_tokens と同じ（CLS を見ず、領域のパッチの value の平均）。"""
+        return self._pooled_tokens(patch_features, region_labels, pool="mean")
+
+    def _pooled_tokens(self, patch_features: np.ndarray, labels: np.ndarray, pool: str) -> np.ndarray:
         patch = torch.from_numpy(np.ascontiguousarray(patch_features)).to(device=self.device, dtype=torch.float32)
-        labels = torch.from_numpy(np.ascontiguousarray(fused_cluster_labels)).to(device=self.device, dtype=torch.int64)
+        labels = torch.from_numpy(np.ascontiguousarray(labels)).to(device=self.device, dtype=torch.int64)
         with torch.no_grad():
-            return self._to_numpy(self.model.visual.trunk.custom_forward(patch, labels, normalize=True))
+            return self._to_numpy(self.model.visual.trunk.custom_forward(patch, labels, normalize=True, pool=pool))
 
 
 class TorchCLIPProbe(TorchCLIPFeatureExtractor):
