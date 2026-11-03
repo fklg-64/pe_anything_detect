@@ -8,6 +8,7 @@ EdgeTAM の高解像度特徴量（入力の 1/4）の画素から選ぶ。
                （EdgeTAM の特徴量 3 層で求めて、最も細かい層の大きさで平均する）
   候補       = 粗いマスク全体（縁のパッチも含む）のうち、物体らしさが正の画素
   選び方     = 各連結成分の最内点（そのパッチの中で物体らしさが最大の画素）を必ず含め、残りは「選択済みの点からの距離 × 物体らしさ」が最大の画素を順に足す
+               候補が 1 つも無い領域（粗い判定の誤りで、背景のパッチ）には、点を置かない
 
 距離だけで選ぶと（物体らしさで重みづけしないと）縁の背景寄りの画素に点が寄り、合成データで下がる。パラメータは増やさない。
 """
@@ -60,7 +61,8 @@ def background_features(levels: Sequence[np.ndarray], foreground: np.ndarray) ->
 def objectness_map(levels: Sequence[np.ndarray], background: Sequence[np.ndarray], core: np.ndarray) -> Optional[np.ndarray]:
     """物体らしさのマップ（最も細かい層の大きさ）。正なら、背景の特徴より core の特徴に近い。core が空なら None。
 
-    levels: normalize_features の結果。background: background_features の結果。core: クラスの core（パッチ格子）。
+    levels: normalize_features の結果。background: background_features の結果。core: 物体の特徴を代表するパッチ（パッチ格子）。
+    領域自身の core だと、領域が背景のパッチのとき基準も背景になり、ほぼ全画素が正になる。極小の成分は、クラスの本体の core を渡す。
     """
     height, width = levels[0].shape[1:]
     maps = []
@@ -79,9 +81,14 @@ def object_prompt_points(
     """正例点（パッチ座標 (x, y)。小数で、整数がパッチの中心）を返す。各連結成分の最内点を必ず含め、残りは k 点まで補う。
 
     score: objectness_map の結果。region: 粗いマスク（パッチ格子。縁のパッチを含む全体）。peaks: 各連結成分の最内点（パッチ座標）。grid: パッチ格子 (高さ, 幅)。
+    領域に物体らしい画素（物体らしさが正）が 1 つも無いときは、点を置かず空の配列を返す（粗い判定の誤り: 背景のパッチ）。
     """
     height, width = score.shape
     grid_h, grid_w = grid
+
+    candidate = (cv2.resize(region.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST) > 0) & (score > 0)
+    if not candidate.any():
+        return np.empty((0, 2), dtype=np.float64)
 
     # 最内点は、そのパッチの中で物体らしさが最大の画素へ動かす
     selected = []
@@ -91,8 +98,7 @@ def object_prompt_points(
         j, i = np.unravel_index(np.argmax(score[v0:v1, u0:u1]), (v1 - v0, u1 - u0))
         selected.append((u0 + i, v0 + j))
 
-    candidate = (cv2.resize(region.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST) > 0) & (score > 0)
-    if candidate.any() and len(selected) < k:
+    if len(selected) < k:
         pixels = np.argwhere(candidate)[:, ::-1].astype(np.float64)  # (u, v)
         weight = score[candidate]
         d2 = np.min(((pixels[:, None, :] - np.asarray(selected, dtype=np.float64)[None]) ** 2).sum(-1), axis=1)

@@ -147,9 +147,7 @@ class SemanticRefiner:
                 comps = connected_components(coarse_mask)
                 class_components[class_id] = comps
 
-                # 孤立した極小成分（背景クラスタの斑点）はクラスの推定に混ぜない。混ぜると、斑点に置いた点を
-                # 経由して物体のマスクが周囲の背景へ広がる。斑点は後段で個別に（範囲を制限して）扱う
-                main = [c for c in comps if c.region.sum() >= MIN_ISOLATED_PATCHES] or comps
+                main = self._main_components(comps)
                 coarse_main = np.any([c.region for c in main], axis=0)
                 job = partial(self.estimator.estimate, inputs, coarse_main, main, f"クラス{class_id}")
                 queue.append((class_id, coarse_mask, jobs.submit(job)))
@@ -182,12 +180,15 @@ class SemanticRefiner:
         with JobGroup(self.workers) as jobs:
             queue = []  # (クラス番号, 成分, 最内点の作業解像度の座標, 推定の仕事)
             for class_id, comps in class_components.items():
+                # 前景点は、成分自身ではなくクラスの本体の特徴を基準に選ぶ（成分が背景のパッチなら、物体らしい画素が無く、点も推定も無い）
+                prototype = np.any([c.core for c in self._main_components(comps)], axis=0)
                 for component in comps:
                     peak = self._peak_in_work_size(inputs, component)
                     if self._is_covered(state, peak):
                         continue
                     job = partial(
-                        self.estimator.estimate, inputs, component.region, [component], f"クラス{class_id}(再推定)", need_score=False
+                        self.estimator.estimate, inputs, component.region, [component], f"クラス{class_id}(再推定)",
+                        need_score=False, prototype=prototype,
                     )
                     queue.append((class_id, component, peak, jobs.submit(job)))
 
@@ -202,6 +203,14 @@ class SemanticRefiner:
                     binary &= resize_mask(dilate(component.region), inputs.size)
                 state.semantic_map[binary & (state.semantic_map == 0)] = class_id
                 state.debug_images[f"c{class_id}_rescue_{component.peak[0]}_{component.peak[1]}"] = binary
+
+    @staticmethod
+    def _main_components(comps: List[Component]) -> List[Component]:
+        """クラスの本体の成分。孤立した極小成分（背景クラスタの斑点）は、クラスの推定に混ぜない。
+
+        混ぜると、斑点に置いた点を経由して物体のマスクが周囲の背景へ広がる。斑点は後段で個別に（範囲を制限して）扱う。
+        """
+        return [c for c in comps if c.region.sum() >= MIN_ISOLATED_PATCHES] or comps
 
     def _peak_in_work_size(self, inputs: RefineInput, component: Component) -> Tuple[int, int]:
         """成分の最内点（パッチ格子）に当たる、作業解像度の画素 (x, y)。"""

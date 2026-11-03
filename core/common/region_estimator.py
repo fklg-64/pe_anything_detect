@@ -135,20 +135,31 @@ class RegionEstimator:
     # =========================================================================
 
     def estimate(
-        self, inputs: RefineInput, coarse_mask: np.ndarray, comps: List[Component], tag: str, need_score: bool = True
+        self,
+        inputs: RefineInput,
+        coarse_mask: np.ndarray,
+        comps: List[Component],
+        tag: str,
+        need_score: bool = True,
+        prototype: Optional[np.ndarray] = None,
     ) -> RegionResult:
         """1 つの領域の推定（前景点・事前マスク・EdgeTAM のデコード・マスクの整形）。inputs は読むだけで、変えない。
 
         coarse_mask: 領域の粗いマスク（パッチ格子）。comps: その連結成分。tag: 処理時間の表示名。
         need_score: 偽なら、重なり解決用のスコアを求めない（重なりを解決しない取りこぼしの再推定では使わない）。
+        prototype: 前景点を選ぶ物体らしさの基準にするパッチ（パッチ格子）。None なら領域自身の core。
+        物体らしい画素が無く、点を置けなかった領域（粗い判定の誤り）は、推定せず空のマスクを返す。
         """
         core = np.zeros_like(coarse_mask, dtype=bool)
         for component in comps:
             core |= component.core
+        fg_points = self.foreground_points(inputs, coarse_mask, comps, core, prototype)
+        if not len(fg_points):
+            empty = np.zeros(inputs.size[::-1], dtype=bool)
+            return RegionResult(empty, np.zeros(inputs.size[::-1], dtype=np.float32) if need_score else None, core, [], [], None)
+
         coarse_map = patch_mean(coarse_mask)
         prior_map = self.build_prior_map(inputs, coarse_mask, coarse_map, core)
-
-        fg_points = self.foreground_points(inputs, coarse_mask, comps, core)
         logit, coords, labels = self.estimate_logit(inputs, prior_map, fg_points, tag)
 
         # 粗い前景らしさ（粗いマスクの周辺平均 × 前景確信度）
@@ -170,16 +181,21 @@ class RegionEstimator:
         return RegionResult(binary, resize_map(score, inputs.size, cv2.INTER_LINEAR), core, coords, labels, logit)
 
     def foreground_points(
-        self, inputs: RefineInput, coarse_mask: np.ndarray, comps: List[Component], core: np.ndarray
+        self,
+        inputs: RefineInput,
+        coarse_mask: np.ndarray,
+        comps: List[Component],
+        core: np.ndarray,
+        prototype: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """領域の正例点（パッチ座標）。EdgeTAM の高解像度特徴量で物体らしさを求め、粗いマスクの縁も含めて物体の上の画素から選ぶ。
 
-        背景の特徴が作れないとき（前景が画像の全体など）は、core 上のパッチの中心から選ぶ。
+        背景の特徴が作れないとき（前景が画像の全体など）は、core 上のパッチの中心から選ぶ。物体らしい画素が無ければ、空の配列。
         """
         peaks = [c.peak for c in comps]
         score = None
         if inputs.background_means is not None:
-            score = objectness_map(inputs.normalized_feats, inputs.background_means, core)
+            score = objectness_map(inputs.normalized_feats, inputs.background_means, core if prototype is None else prototype)
         if score is None:
             return prompt_points(core, peaks, self.foreground_points_per_class)
         return object_prompt_points(score, coarse_mask, peaks, self.foreground_points_per_class, self.grid)
