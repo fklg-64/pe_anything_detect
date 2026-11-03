@@ -59,6 +59,11 @@ def squared_distance_to_background(mask: np.ndarray) -> np.ndarray:
     return np.rint(distance * distance).astype(np.int32)
 
 
+def normalize_rows(features: np.ndarray) -> np.ndarray:
+    """特徴 (N, C) を行ごとに L2 正規化する。"""
+    return features / (np.linalg.norm(features, axis=-1, keepdims=True) + 1e-8)
+
+
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
     return e_x / np.sum(e_x, axis=axis, keepdims=True)

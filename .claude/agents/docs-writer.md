@@ -11,7 +11,7 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 | ファイル | 内容 |
 |---|---|
 | `docs/overview.md` | 全体像。入出力、全体フロー図、並行して走る処理のタイムライン図、処理時間、モジュール構成図、設定表 |
-| `docs/coarse_segmentation.md` | ① 粗い段階（`core/common/coarse_segmentation.py`・`semantic_merge.py`） |
+| `docs/coarse_segmentation.md` | ① 粗い段階（`core/common/coarse_segmentation.py`・`region_relabel.py`） |
 | `docs/detailed_segmentation.md` | ② 詳細段階（`semantic_refiner.py`・`region_estimator.py`・`edgetam_session.py`）と格子分離の概要 |
 | `docs/lattice_detection.md` | 格子の検出（`lattice.py`・`lattice_separator.py`）。シリンジの巣の画像で段階ごとに |
 | `docs/method_history.md` | 手法の変遷（採用 / 不採用の表）。手法を変えたら表を更新する（数値は、既存の記載と `outputs/<実験名>/` のレポートから、測定条件つきで写す） |

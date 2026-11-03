@@ -96,16 +96,6 @@ LATTICE_PHASE_PROBES = 16
 # デコーダーの予測 IoU（マスクと正解の IoU の予測値）が、この値以上のマスクを物体として採る。0.5 は、物体と一致した（マッチした）とみなす IoU の基準
 LATTICE_MIN_PREDICTED_IOU = 0.5
 
-# --- セマンティック（クラス）のまとめ方（semantic_merge.py） ---
-# プロンプトのロジットの差がこれ以内なら「違う」とは言えない（ノイズの範囲）。1 つの物体の領域（連結成分）のパッチを半分ずつにして、それぞれで
-# attention pool したトークンで求めたロジットの差は、中央値 0.47・75 パーセンタイル 0.91・90 パーセンタイル 1.37（MVTec・実画像・合成 660 組）。
-# 2 を超えると、カップ麺のクラス（麺・容器・ふた・包装）まで統合されはじめる
-PROMPT_TIE_TOLERANCE = 1.0
-# 同義語とみなす前景プロンプトの、テキスト埋め込みのコサイン距離（平均連結の階層クラスタリングを、この距離で切る）。0.08 は類似度 約 0.92。
-# tube / transparent tubes（0.94）・pill / capsule（0.93）・cable / wire（0.95）・plastic part / rubber part（0.96）を同義語とし、
-# white plastic lid / round white food container（0.92）・noodle / package（0.85）・bottle / cap（0.87）は別のものとする
-PROMPT_SYNONYM_DISTANCE = 0.08
-
 # --- OpenVINO 実行環境（core/openvino/runtime_utils.py） ---
 # pip 版 openvino との衝突を避けるため sys.path / PYTHONPATH から外すシステム版 OpenVINO の場所
 SYSTEM_OPENVINO_DIR = "/opt/intel/openvino"

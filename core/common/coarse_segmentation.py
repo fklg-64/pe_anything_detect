@@ -10,7 +10,7 @@ from scipy import sparse
 
 from core.utils import Timer, normalize_image
 from core.common.backend import CLIPBackend
-from core.common.mask_utils import knn_graph, propagate, softmax
+from core.common.mask_utils import knn_graph, normalize_rows, propagate, softmax
 from core.common.params import (
     CLIP_LOGIT_SCALE,
     EDGE_PROPAGATION_ALPHA,
@@ -18,10 +18,15 @@ from core.common.params import (
     EDGE_PROPAGATION_NEIGHBORS,
     FAISS_NUM_THREADS,
     KMEANS_SEED,
-    PROMPT_SYNONYM_DISTANCE,
-    PROMPT_TIE_TOLERANCE,
 )
-from core.common.semantic_merge import merge_near_ties, merge_synonyms_in_objects, synonym_representatives
+from core.common.region_relabel import (
+    has_split_object,
+    merge_weak_classes,
+    needs_relabel,
+    object_components,
+    rejudge_regions,
+    relabel_foreground,
+)
 from core.common.result import ClusterView
 
 
@@ -69,8 +74,6 @@ class CoarseSegmenter:
         fg_feats = self.extractor.extract_text_features(self.foreground_prompts)
         bg_feats = self.extractor.extract_text_features(self.background_prompts)
         self.fgbg_text_features = np.vstack([fg_feats, bg_feats])
-        # 同義語の前景プロンプトの代表（1 つの物体の中で、同義語のクラスをまとめるのに使う）
-        self._synonym_representative = synonym_representatives(fg_feats, PROMPT_SYNONYM_DISTANCE)
 
     # =========================================================================
     # CLIP特徴量
@@ -139,7 +142,7 @@ class CoarseSegmenter:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """クラスタごとのトークンをテキストと照合し、(パッチごとの前景確信度, パッチごとのプロンプト番号, クラスタごとの前景プロンプトのロジット) を返す。
 
-        ロジットは (クラスタ数, 前景プロンプト数)。僅差のクラスのまとめ（merge_near_ties）で使う。
+        ロジットは (クラスタ数, 前景プロンプト数)。前景のクラスの付け直し（_relabel_foreground）で、領域の名前の判定し直しの根拠に使う。
         """
         cluster_tokens: List[np.ndarray] = self.extractor.extract_cluster_tokens(patch_features, cluster_labels)
         confidences = np.zeros((len(cluster_tokens),), dtype=np.float32)
@@ -168,6 +171,8 @@ class CoarseSegmenter:
         Returns: CoarseForeground（各フィールドの意味はそちら）。
         """
         patch_tokens = fused_patch_features[0, 1:, :]
+        if edge_graph is None:  # 並列化をしない場合はここでグラフを計算する
+            edge_graph = self.edge_graph_of(edge_embed)
 
         # 1. PE の特徴を KMeans でクラスタ分けし、クラスタごとにテキストと照合して、パッチごとの前景確信度とプロンプトを得る
         with Timer("    ┌ Kmeansクラスタ処理時間"):
@@ -178,10 +183,15 @@ class CoarseSegmenter:
         # 2. EdgeTAM の特徴が似たパッチどうしで、前景確信度を伝播して揃える
         pe_clusters = ClusterView(pe_labels, self._prompt_per_cluster(pe_labels, prompt_index))
         with Timer("    ┌ EdgeTAM特徴での確信度の伝播処理時間"):
-            confidence, prompt_index = self._propagate_with_edgetam(confidence, prompt_index, edge_embed, edge_graph)
+            confidence, prompt_index = self._propagate_with_edgetam(confidence, prompt_index, edge_graph)
 
-        # 3. 1 つの物体が、似たプロンプトの別クラスに割れるのを防ぐ
-        prompt_index = self._merge_similar_classes(prompt_index, pe_labels, cluster_logits)
+        # 3. 前景のパッチのクラスを、前景だけのブロックの代表トークンの照合と EdgeTAM の特徴での伝播で付け直す
+        #    （種類の違う物体を分け、1 つの物体が似たプロンプトの別クラスに割れるのを戻し、部品の境目の混ざりを整える）
+        with Timer("    ┌ 前景のクラスの付け直し処理時間"):
+            prompt_index = self._relabel_foreground(
+                prompt_index, confidence > self.foreground_threshold, patch_features, patch_tokens, edge_embed, edge_graph,
+                pe_labels, cluster_logits,
+            )
 
         # 4. クラスタ番号を付け直す。伝播で判定が変わったパッチは、同じ PE のクラスタの中でもプロンプトが違うので、(PE のクラスタ, プロンプト) の組を新しいクラスタにする
         num_prompts = len(self.foreground_prompts) + len(self.background_prompts)
@@ -193,29 +203,23 @@ class CoarseSegmenter:
         foreground_mask = np.where(foreground_map > self.foreground_threshold, 1, 0)
         return CoarseForeground(foreground_map, foreground_mask, cluster_labels, cluster_index_list, pe_clusters)
 
-    def _merge_similar_classes(self, prompt_index: np.ndarray, pe_labels: np.ndarray, cluster_logits: np.ndarray) -> np.ndarray:
-        """1 つの物体の別のクラスタが、似たプロンプトを選んで別クラスに割れるのを防ぐ（semantic_merge.py）。
-
-        ロジットが僅差のプロンプトは、より大きいクラスへ統合する。僅差でなくても、同じ物体（連結成分）の中の同義語のクラスは 1 つにする。
-        """
-        num_foreground_prompts = len(self.foreground_prompts)
-        prompt_index = merge_near_ties(prompt_index, pe_labels, cluster_logits, num_foreground_prompts, PROMPT_TIE_TOLERANCE)
-        return merge_synonyms_in_objects(prompt_index, self.grid, num_foreground_prompts, self._synonym_representative)
-
     @staticmethod
     def _prompt_per_cluster(cluster_labels: np.ndarray, prompt_index: np.ndarray) -> List[int]:
         """クラスタ番号 0~ごとの対応プロンプト番号。プロンプトはクラスタの中では一定なので、先頭のパッチから取る。"""
         return [int(prompt_index[np.argmax(cluster_labels == label_idx)]) for label_idx in range(int(cluster_labels.max()) + 1)]
 
     @staticmethod
+    def edge_features_of(edge_embed: np.ndarray) -> np.ndarray:
+        """EdgeTAM の image_embed (1, C, h, w) -> パッチごとの L2 正規化した特徴 (h*w, C)。"""
+        return normalize_rows(edge_embed[0].reshape(edge_embed.shape[1], -1).T)
+
+    @staticmethod
     def edge_graph_of(edge_embed: np.ndarray) -> sparse.csr_matrix:
         """EdgeTAM の image_embed (1, C, h, w) のコサイン類似度の kNN グラフ（パッチ同士）。PEの特徴量抽出と並列で実行。"""
-        edge_features = edge_embed[0].reshape(edge_embed.shape[1], -1).T
-        edge_features = edge_features / (np.linalg.norm(edge_features, axis=-1, keepdims=True) + 1e-8)
-        return knn_graph(edge_features, EDGE_PROPAGATION_NEIGHBORS)
+        return knn_graph(CoarseSegmenter.edge_features_of(edge_embed), EDGE_PROPAGATION_NEIGHBORS)
 
     def _propagate_with_edgetam(
-        self, confidence: np.ndarray, prompt_index: np.ndarray, edge_embed: np.ndarray, graph: Optional[sparse.csr_matrix]
+        self, confidence: np.ndarray, prompt_index: np.ndarray, graph: sparse.csr_matrix
     ) -> Tuple[np.ndarray, np.ndarray]:
         """前景確信度を、EdgeTAM の特徴が似たパッチどうしで伝播して揃える。(前景確信度, プロンプト番号) を返す。
 
@@ -224,25 +228,63 @@ class CoarseSegmenter:
         前景を消す（AND のように）のではなく、確信度をならすだけなので、大きな物体は崩れにくい。判定が反転したパッチの
         プロンプトは、反転後と同じ側に判定されていた近傍のプロンプトの最頻値にする（無ければ画像全体でその側の最頻値）。
         """
-        # 並列化をしない場合はここでグラフを計算する
-        if graph is None:
-            graph = self.edge_graph_of(edge_embed)
         propagated = propagate(confidence, graph, EDGE_PROPAGATION_ALPHA, EDGE_PROPAGATION_ITERATIONS)
 
         num_foreground_prompts = len(self.foreground_prompts)
         threshold = self.foreground_threshold
         old_foreground, new_foreground = confidence > threshold, propagated > threshold
+        old_prompt_index = prompt_index
         prompt_index = prompt_index.copy()
         for patch in np.nonzero(old_foreground != new_foreground)[0]:
             neighbors = graph.indices[graph.indptr[patch]:graph.indptr[patch + 1]]
-            candidates = prompt_index[neighbors[old_foreground[neighbors] == new_foreground[patch]]]
+            # 近傍のプロンプトは、反転する前の判定のもの（先に反転した近傍の新しいプロンプトを読むと、前景のパッチに背景のプロンプトが付くことがある）
+            candidates = old_prompt_index[neighbors[old_foreground[neighbors] == new_foreground[patch]]]
             if not len(candidates):
-                candidates = prompt_index[old_foreground == new_foreground[patch]]
+                candidates = old_prompt_index[old_foreground == new_foreground[patch]]
             if len(candidates):
                 prompt_index[patch] = np.bincount(candidates).argmax()
             else:
                 prompt_index[patch] = 0 if new_foreground[patch] else num_foreground_prompts
         return propagated, prompt_index
+
+    def _relabel_foreground(
+        self,
+        prompt_index: np.ndarray,
+        foreground: np.ndarray,
+        patch_features: np.ndarray,
+        patch_tokens: np.ndarray,
+        edge_embed: np.ndarray,
+        graph: sparse.csr_matrix,
+        pe_labels: np.ndarray,
+        cluster_logits: np.ndarray,
+    ) -> np.ndarray:
+        """前景のパッチのプロンプト番号を付け直す（region_relabel.py）。領域（物体 × クラス）が 1 つしか無ければ、何もしない。
+
+        前景のパッチだけを、PE（fused）と EdgeTAM の特徴を並べた空間で KMeans して部品ごとのブロックにする（ブロック数は k_clusters）。
+        ブロックごとの代表トークンは extract_region_tokens（CLS を含まない value の平均）で求めるので、数パッチの小さなブロックでも画像全体の CLS に
+        引っ張られず、それらしい前景プロンプトに紐づく。その根拠で、次の 3 段で付け直す。
+          1. 領域ごとに、PE のクラスタのロジット（今のラベルの根拠）とブロックのロジットを集計して、名前を判定し直す
+          2. 画像全体で、ブロックの根拠が弱い小さいクラスを、大きいクラスへ統合する
+          3. 同じ物体の中で、今のラベルとブロックの照合を混ぜ、EdgeTAM の特徴が似たパッチどうしで伝播して、パッチごとに選ぶ
+        """
+        components = object_components(foreground, self.grid)
+        if not needs_relabel(prompt_index, components):
+            return prompt_index
+        # PE の fused 特徴はモデルの中で L2 正規化済み。EdgeTAM の特徴と並べても、2 つの特徴が同じ重みになる
+        features = np.hstack([patch_tokens[foreground], self.edge_features_of(edge_embed)[foreground]])
+        blobs = np.zeros(len(foreground), dtype=np.int64)
+        blobs[foreground] = self.fit_predict_kmeans(features, k=min(self.k_clusters, len(features)), niter=self.niter)
+        # 番号 0 は前景でないパッチ。ブロックは 1~
+        tokens = self.extractor.extract_region_tokens(patch_features, np.where(foreground, blobs + 1, 0))[1:]
+        blob_logits = CLIP_LOGIT_SCALE * normalize_rows(tokens) @ self.fgbg_text_features[: len(self.foreground_prompts)].T
+
+        prompt_index = rejudge_regions(prompt_index, components, cluster_logits[pe_labels] + blob_logits[blobs], self.k_clusters)
+        prompt_index = merge_weak_classes(prompt_index, foreground.astype(np.int64), blobs, blob_logits)
+        if not has_split_object(prompt_index, components):
+            return prompt_index
+        return relabel_foreground(
+            prompt_index, components, blobs, blob_logits, graph, EDGE_PROPAGATION_ALPHA, EDGE_PROPAGATION_ITERATIONS
+        )
 
     # =========================================================================
     # 粗いセマンティックラベル

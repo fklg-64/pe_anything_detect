@@ -39,7 +39,7 @@ flowchart TD
         direction LR
         C1["KMeans<br/>8 クラスタ"] --> C2["クラスタごとに<br/>テキストと照合"]
         C2 --> C3["EdgeTAM の特徴で<br/>前景確信度をならす"]
-        C3 --> C4["似たプロンプトの<br/>クラスをまとめる"]
+        C3 --> C4["前景のクラスを<br/>付け直す"]
     end
 
     subgraph R["② 詳細セグメンテーション（画素単位）"]
@@ -100,7 +100,7 @@ MVTec cable の 1 枚（第 6 層のモデル、この資料を作った PC）�
 | 前処理（リサイズ・正規化） | 2.3 ms | 2.7 ms |
 | EdgeTAM エンコーダ | 49.5 ms | 46.3 ms |
 | PE（kNN グラフが重なる） | 106.3 ms | 104.8 ms |
-| 粗い前景（KMeans・照合・伝播・まとめ） | 11.1 ms | 12.5 ms |
+| 粗い前景（KMeans・照合・伝播・付け直し） | 11.1 ms | 12.5 ms |
 | 精緻化（クラス・取りこぼし・後処理） | 83.8 ms | 197.7 ms |
 | **合計** | **255 ms** | **366 ms** |
 | デコード（回数 / 合計） | 2 回 / 20.1 ms | 8 回 / 88.4 ms |
@@ -115,7 +115,7 @@ MVTec cable の 1 枚（第 6 層のモデル、この資料を作った PC）�
 ```mermaid
 flowchart TD
     DEV["develop.py<br/>test_pytorch.py"] --> RUN["SegmentationRunner<br/>segmentation_runner.py"]
-    RUN --> COARSE["CoarseSegmenter<br/>coarse_segmentation.py<br/>semantic_merge.py"]
+    RUN --> COARSE["CoarseSegmenter<br/>coarse_segmentation.py<br/>region_relabel.py"]
     RUN --> REF["SemanticRefiner<br/>semantic_refiner.py"]
     RUN --> SES["EdgeTamSession<br/>edgetam_session.py"]
     RUN --> PAR["Workers / JobGroup<br/>parallel.py"]
@@ -134,7 +134,7 @@ flowchart TD
 | 処理 | ファイル |
 |---|---|
 | 全体の流れ | `core/common/segmentation_runner.py`（`segment`） |
-| ① 粗い推定 | `core/common/coarse_segmentation.py`（`CoarseSegmenter`）・`semantic_merge.py` |
+| ① 粗い推定 | `core/common/coarse_segmentation.py`（`CoarseSegmenter`）・`region_relabel.py`（前景のクラスの付け直し。名前の判定し直し・統合・境目の整え） |
 | ② 精緻化の進行 | `core/common/semantic_refiner.py`（`SemanticRefiner`） |
 | ② 1 領域の推定 | `core/common/region_estimator.py`（`RegionEstimator`）・`object_points.py` |
 | EdgeTAM の呼び出し口 | `core/common/edgetam_session.py`（`EdgeTamSession`。lock・前後処理） |

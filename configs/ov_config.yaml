@@ -61,4 +61,4 @@ save_gallery_html: true
 foreground_threshold: 0.5
 
 # 結果を出力するディレクトリ
-output_dir: "./outputs/experiment_results_20261103"
+output_dir: "./outputs/experiment_results_20261104"

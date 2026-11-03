@@ -213,3 +213,9 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
 
     def extract_cluster_tokens(self, patch_features: np.ndarray, fused_cluster_labels: np.ndarray) -> np.ndarray:
         return self.pool(self._tensor(patch_features), fused_cluster_labels)
+
+    @torch.no_grad()
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """TorchCLIPBackend.extract_region_tokens と同じ（CLS を見ず、領域のパッチの value の平均）。"""
+        labels = torch.from_numpy(np.asarray(region_labels)).to(device=self.device, dtype=torch.int64)
+        return self.trunk.custom_forward(self._tensor(patch_features), labels, normalize=True, pool="mean").cpu().numpy()
