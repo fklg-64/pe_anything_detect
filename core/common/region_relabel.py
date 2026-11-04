@@ -47,17 +47,17 @@ def has_split_object(prompt_index: np.ndarray, components: np.ndarray) -> bool:
     return len(keys) > len(np.unique(keys // (int(prompt_index.max()) + 1)))
 
 
-def rejudge_regions(prompt_index: np.ndarray, components: np.ndarray, evidence: np.ndarray, blob_count: int) -> np.ndarray:
+def rejudge_regions(prompt_index: np.ndarray, components: np.ndarray, evidence: np.ndarray, min_region_divisor: int) -> np.ndarray:
     """（物体, クラス）の領域ごとに、領域のパッチで平均した根拠が最も強い前景プロンプトへ付け直す（新しい名前も許す）。
 
     evidence: パッチごとの前景プロンプトの根拠 (N, 前景プロンプト数)（ロジット。大きいほどそのプロンプトらしい）。
-    前景を blob_count 個のブロックに分けたときの 1 ブロックの平均面積より小さい領域は、独立した根拠を持てない（根拠のノイズに引きずられる）ので、今のラベルのまま。
+    前景のパッチ数を min_region_divisor で割った面積（本体は k_clusters = 8 なので前景の 1/8。ブロック数 RELABEL_BLOCK_COUNT とは別）より小さい領域は、独立した根拠を持てない（根拠のノイズに引きずられる）ので、今のラベルのまま。
     """
     foreground, keys, inverse, _ = regions_of(prompt_index, components)
     area = np.bincount(inverse).astype(np.float64)
     total = np.zeros((len(keys), evidence.shape[1]))
     np.add.at(total, inverse, evidence[foreground])
-    judged = np.where(area >= len(foreground) / blob_count, np.argmax(total / area[:, None], axis=1), keys % (int(prompt_index.max()) + 1))
+    judged = np.where(area >= len(foreground) / min_region_divisor, np.argmax(total / area[:, None], axis=1), keys % (int(prompt_index.max()) + 1))
     result = prompt_index.copy()
     result[foreground] = judged[inverse]
     return result

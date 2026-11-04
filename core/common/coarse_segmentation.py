@@ -18,6 +18,7 @@ from core.common.params import (
     EDGE_PROPAGATION_NEIGHBORS,
     FAISS_NUM_THREADS,
     KMEANS_SEED,
+    RELABEL_BLOCK_COUNT,
 )
 from core.common.region_relabel import (
     has_split_object,
@@ -260,7 +261,7 @@ class CoarseSegmenter:
     ) -> np.ndarray:
         """前景のパッチのプロンプト番号を付け直す（region_relabel.py）。領域（物体 × クラス）が 1 つしか無ければ、何もしない。
 
-        前景のパッチだけを、PE（fused）と EdgeTAM の特徴を並べた空間で KMeans して部品ごとのブロックにする（ブロック数は k_clusters）。
+        前景のパッチだけを、PE（fused）と EdgeTAM の特徴を並べた空間で KMeans して部品ごとのブロックにする（ブロック数は RELABEL_BLOCK_COUNT = 32。画像全体の k_clusters = 8 より細かい）。
         ブロックごとの代表トークンは extract_region_tokens（CLS を含まない value の平均）で求めるので、数パッチの小さなブロックでも画像全体の CLS に
         引っ張られず、それらしい前景プロンプトに紐づく。その根拠で、次の 3 段で付け直す。
           1. 領域ごとに、PE のクラスタのロジット（今のラベルの根拠）とブロックのロジットを集計して、名前を判定し直す
@@ -273,11 +274,12 @@ class CoarseSegmenter:
         # PE の fused 特徴はモデルの中で L2 正規化済み。EdgeTAM の特徴と並べても、2 つの特徴が同じ重みになる
         features = np.hstack([patch_tokens[foreground], self.edge_features_of(edge_embed)[foreground]])
         blobs = np.zeros(len(foreground), dtype=np.int64)
-        blobs[foreground] = self.fit_predict_kmeans(features, k=min(self.k_clusters, len(features)), niter=self.niter)
+        blobs[foreground] = self.fit_predict_kmeans(features, k=min(RELABEL_BLOCK_COUNT, len(features)), niter=self.niter)
         # 番号 0 は前景でないパッチ。ブロックは 1~
         tokens = self.extractor.extract_region_tokens(patch_features, np.where(foreground, blobs + 1, 0))[1:]
         blob_logits = CLIP_LOGIT_SCALE * normalize_rows(tokens) @ self.fgbg_text_features[: len(self.foreground_prompts)].T
 
+        # 小さすぎる領域（前景の 1/k_clusters 未満）は判定し直さない。この基準はブロック数（RELABEL_BLOCK_COUNT）と別
         prompt_index = rejudge_regions(prompt_index, components, cluster_logits[pe_labels] + blob_logits[blobs], self.k_clusters)
         prompt_index = merge_weak_classes(prompt_index, foreground.astype(np.int64), blobs, blob_logits)
         if not has_split_object(prompt_index, components):

@@ -24,6 +24,14 @@ EDGE_PROPAGATION_ALPHA = 0.8
 EDGE_PROPAGATION_NEIGHBORS = 8
 EDGE_PROPAGATION_ITERATIONS = 3
 
+# --- 前景のクラスの付け直し（region_relabel） ---
+# 前景のパッチを PE + EdgeTAM の特徴で KMeans する「ブロック」の数。ブロックごとの代表トークン（CLS なし）と前景プロンプトの照合が、パッチごとのクラスの根拠になる。
+# 細かいほど、種類の違う物体が別のクラスになる（種類別合成 120 枚の V: 8 個 0.424 → 32 個 0.563 → 128 個 0.609）。代わりに、1 つの物体が複数クラスに割れる画像も増える
+# （単一物体 351 枚で 63 → 67 → 68 枚）。前景のマスクは変えず、前景 IoU は平均で変わらない。処理時間は 8 → 32 で約 +1ms（検証: tools/experiments/fine_coarse/）。
+# 判定し直し（rejudge_regions）が「小さすぎて独立した根拠を持てない領域」を決める面積の基準は、ブロック数と別に k_clusters（前景の 1/k_clusters）のまま
+# （ブロック数に連動させると、小さな領域に別の名前が付いて割れが増える）
+RELABEL_BLOCK_COUNT = 32
+
 # --- 画像の正規化（RGB。(画素値/255 - 平均) / 標準偏差） ---
 EDGETAM_MEAN = (0.485, 0.456, 0.406)
 EDGETAM_STD = (0.229, 0.224, 0.225)
