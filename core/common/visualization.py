@@ -1,6 +1,7 @@
-"""結果の保存・可視化（セグメンテーション結果には影響しない）。"""
+"""結果の保存・可視化（セグメンテーション結果には影響しない）。一覧HTMLは gallery.py。"""
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -8,31 +9,21 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from core.common.params import (
+    CLUSTER_COLOR_PALETTE,
+    DEBUG_DIR_NAME,
+    FOREGROUND_OVERLAY_ALPHA,
+    LEGEND_FONTSIZE,
+    POINT_COLOR_NEGATIVE,
+    POINT_COLOR_POSITIVE,
+    POINT_RADIUS,
+    RESULT_DPI,
+    RESULT_FIGSIZE,
+    SEMANTIC_COLORS,
+)
 from core.common.result import ClusterView, SegmentationResult
 
-# セマンティック可視化の色 (RGB)。0番は背景で常にシアン
-SEMANTIC_COLORS = np.array([
-    [0, 255, 255],
-    [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-    [255, 0, 255], [255, 128, 0], [128, 0, 255], [255, 255, 255],
-    [128, 64, 0], [255, 128, 192], [0, 128, 0], [128, 128, 128],
-], dtype=np.uint8)
-# 前景オーバーレイ（粗い前景マスク・EdgeTAM最終マスク）の赤の不透明度
-FOREGROUND_OVERLAY_ALPHA = 0.3
-# 前景オーバーレイに描くプロンプト点の半径(px)と色(BGR)。正例=緑、負例=赤
-POINT_RADIUS = 20
-POINT_COLOR_POSITIVE = (0, 255, 0)
-POINT_COLOR_NEGATIVE = (0, 0, 255)
-# インスタンス可視化: 色相の刻み（HSV の H は 0〜179。黄金角に近い値で、隣り合う番号の色が離れる）、重畳の不透明度、番号の文字の大きさ
-INSTANCE_HUE_STEP = 47
-INSTANCE_OVERLAY_ALPHA = 0.5
-INSTANCE_LABEL_SCALE = 1.0
-# セマンティック結果（重畳 + 凡例）のmatplotlib図
-RESULT_FIGSIZE = (10, 6)
-RESULT_DPI = 150
-LEGEND_FONTSIZE = 9
-# 精緻化の中間画像を入れる、保存先の下のフォルダ名
-DEBUG_DIR_NAME = "debug"
+SEMANTIC_COLOR_ARRAY = np.array(SEMANTIC_COLORS, dtype=np.uint8)
 
 
 def clean_prompt(prompt: str) -> str:
@@ -47,17 +38,15 @@ def semantic_class_names(all_prompts: List[str], prompt_indices: List[int]) -> L
 
 def semantic_colors(num_classes: int) -> np.ndarray:
     """クラス数分の色 (RGB, uint8)。足りなければ繰り返し、0番は常にシアン。"""
-    fg = SEMANTIC_COLORS[1:]
-    return np.vstack([SEMANTIC_COLORS[:1], fg[np.arange(num_classes - 1) % len(fg)]])[:num_classes]
+    fg = SEMANTIC_COLOR_ARRAY[1:]
+    return np.vstack([SEMANTIC_COLOR_ARRAY[:1], fg[np.arange(num_classes - 1) % len(fg)]])[:num_classes]
 
 
 class ResultSaver:
     """処理結果の画像・マスク・オーバーレイの書き出し。"""
 
-    def __init__(self, config: dict, feature_size: int):
-        self.feature_size = feature_size
+    def __init__(self, config: dict):
         self.k_clusters = config["k_clusters"]
-        self.color_palette = config["color_palette"]
         self.overlay_alpha = config["overlay_alpha"]
         self.show_result = config["show_result"]
 
@@ -68,26 +57,35 @@ class ResultSaver:
         result: SegmentationResult,
         all_prompts: List[str],
     ) -> None:
-        """all_prompts: 前景プロンプト -> 背景プロンプトの順に並べた全プロンプト（プロンプト番号はこの並びの添字）。"""
+        """all_prompts: 前景プロンプト -> 背景プロンプトの順に並べた全プロンプト（プロンプト番号はこの並びの添字）。
+
+        画像の書き出しは互いに独立なので、スレッドで並行して行う（PNG のエンコードは GIL を離す）。
+        スレッドセーフでない matplotlib の図だけは、このスレッドで描く（全体の時間は、ほぼ図の分で決まる）。
+        """
         class_names = semantic_class_names(all_prompts, result.prompt_indices)
         height, width = image_raw.shape[:2]
         size = (width, height)  # PIL の resize に渡す (幅, 高さ)
+        colors = semantic_colors(len(class_names))
+        overlay = cv2.addWeighted(
+            image_raw, 1.0 - self.overlay_alpha, colors[result.semantic_map], self.overlay_alpha, 0
+        )
 
-        # 最終結果
-        self._save_semantic_result(save_dir, image_raw, result.semantic_map, class_names)
-        self._save_class_masks(save_dir, result.semantic_map, class_names)
-        self._save_foreground_overlay_final(save_dir, image_raw, result.semantic_map)
-
-        # 粗い推定の中間結果
-        self._save_cluster_maps(save_dir, size, result)
-        self._save_cluster_prompts(save_dir, result, all_prompts)
-        mask_image = self._save_foreground_maps(save_dir, size, result)
-        self._save_foreground_overlay(save_dir, image_raw, mask_image, result)
-
-        # 精緻化の中間結果
-        if result.instance_map is not None:
-            self._save_instance_result(save_dir, image_raw, result.instance_map)
-        self._save_debug_images(save_dir / DEBUG_DIR_NAME, size, result.debug_images)
+        with ThreadPoolExecutor() as pool:
+            jobs = [
+                # 最終結果
+                pool.submit(self._save_semantic_map, save_dir, result.semantic_map, colors, overlay),
+                pool.submit(self._save_class_masks, save_dir, result.semantic_map, class_names),
+                pool.submit(self._save_foreground_overlay_final, save_dir, image_raw, result.semantic_map),
+                # 粗い推定の中間結果
+                pool.submit(self._save_cluster_maps, save_dir, size, result),
+                pool.submit(self._save_cluster_prompts, save_dir, result, all_prompts),
+                pool.submit(self._save_coarse_foreground, save_dir, image_raw, size, result),
+                # 精緻化の中間結果
+                pool.submit(self._save_debug_images, save_dir / DEBUG_DIR_NAME, size, result.debug_images),
+            ]
+            self._save_semantic_legend(save_dir, overlay, result.semantic_map, colors, class_names)
+            for job in jobs:
+                job.result()  # 書き出しの例外をここで再送出する
 
         print(f"Saving results to {save_dir}")
 
@@ -96,58 +94,23 @@ class ResultSaver:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _save_instance_result(save_dir: Path, image_raw: np.ndarray, instance_map: np.ndarray) -> None:
-        """インスタンスの ID 画像（パレット付き PNG）と、元画像への重畳（輪郭と番号つき）を保存する。"""
-        count = int(instance_map.max())
-        hues = (np.arange(count + 1) * INSTANCE_HUE_STEP % 180).astype(np.uint8)
-        hsv = np.stack([hues, np.full_like(hues, 200), np.full_like(hues, 255)], axis=-1)[:, None, :]
-        colors = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[:, 0, :]
-        colors[0] = 0
-
-        index_image = Image.fromarray(instance_map.astype(np.uint8), mode="P") if count < 256 else None
-        if index_image is not None:
-            index_image.putpalette(colors.flatten().tolist())
-            index_image.save(save_dir / "instance_map.png")
-
-        overlay = image_raw.copy()
-        foreground = instance_map > 0
-        overlay[foreground] = (INSTANCE_OVERLAY_ALPHA * colors[instance_map][foreground]
-                               + (1 - INSTANCE_OVERLAY_ALPHA) * image_raw[foreground]).astype(np.uint8)
-        for k in range(1, count + 1):
-            body = (instance_map == k).astype(np.uint8)
-            contours, _ = cv2.findContours(body, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            cv2.drawContours(overlay, contours, -1, (255, 255, 255), 2)
-            ys, xs = np.nonzero(body)
-            if len(ys):
-                cv2.putText(overlay, str(k), (int(xs.mean()), int(ys.mean())), cv2.FONT_HERSHEY_SIMPLEX,
-                            INSTANCE_LABEL_SCALE, (0, 0, 0), 4)
-                cv2.putText(overlay, str(k), (int(xs.mean()), int(ys.mean())), cv2.FONT_HERSHEY_SIMPLEX,
-                            INSTANCE_LABEL_SCALE, (255, 255, 255), 2)
-        cv2.imwrite(str(save_dir / "instance_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-
-    def _save_semantic_result(
-        self,
-        save_dir: Path,
-        image_raw: np.ndarray,
-        semantic_map: np.ndarray,
-        class_names: List[str],
-    ) -> None:
-        """セマンティックマップの保存と、元画像への重畳＋凡例の表示。"""
-        colors = semantic_colors(len(class_names))
-        color_image = colors[semantic_map]
-
-        # クラスIDそのものを保存（パレット付きPNG）
+    def _save_semantic_map(save_dir: Path, semantic_map: np.ndarray, colors: np.ndarray, overlay: np.ndarray) -> None:
+        """セマンティックマップ（クラスID。パレット付きPNG）と、元画像に色を重畳した画像を保存。"""
         index_image = Image.fromarray(semantic_map, mode="P")
         index_image.putpalette(colors.flatten().tolist())
         index_image.save(save_dir / "semantic_map.png")
 
-        # 元画像に色を重畳
-        overlay = cv2.addWeighted(
-            image_raw, 1.0 - self.overlay_alpha, color_image, self.overlay_alpha, 0
-        )
         cv2.imwrite(str(save_dir / "semantic_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
-        # 重畳画像 + 色とプロンプトの凡例
+    def _save_semantic_legend(
+        self,
+        save_dir: Path,
+        overlay: np.ndarray,
+        semantic_map: np.ndarray,
+        colors: np.ndarray,
+        class_names: List[str],
+    ) -> None:
+        """重畳画像 + 色とクラス名の凡例を matplotlib の図として保存。"""
         import matplotlib
         if not self.show_result:
             matplotlib.use("Agg")
@@ -192,28 +155,24 @@ class ResultSaver:
     def _colorize_labels(self, labels_2d: np.ndarray, size: Tuple[int, int]) -> Image.Image:
         """ラベルマップをパレットで着色し、元画像サイズへ拡大する。"""
         image = Image.fromarray(labels_2d.astype(np.uint8))
-        image.putpalette(self.color_palette)
+        image.putpalette(list(CLUSTER_COLOR_PALETTE))
         return image.resize(size, resample=Image.Resampling.NEAREST)
 
     def _save_cluster_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> None:
-        """KMeansのクラスタ（EdgeTAM併用時は伝播前のPEも）、整形前後の粗いセマンティックラベルを着色して保存。"""
-        grid = (self.feature_size, self.feature_size)
+        """KMeansのクラスタ（伝播前のPEと伝播後）と、粗いセマンティックラベルを着色して保存。"""
+        grid = result.foreground_map.shape  # パッチ格子
         for image_name, view in self._cluster_views(result):
             self._colorize_labels(view.labels.reshape(grid), size).save(save_dir / image_name)
         self._colorize_labels(result.semantic_labels.reshape(grid), size).save(
             save_dir / "coarse_semantic_segmentation.png"
         )
-        self._colorize_labels(result.raw_semantic_labels.reshape(grid), size).save(
-            save_dir / "coarse_semantic_segmentation_raw.png"
-        )
 
     def _cluster_views(self, result: SegmentationResult) -> List[Tuple[str, ClusterView]]:
-        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。EdgeTAM 併用時は、伝播前の PE、伝播後の順。"""
-        views = []
-        if result.pe_clusters is not None:
-            views.append((f"layer_fused_pe_k{self.k_clusters}.png", result.pe_clusters))
-        views.append((f"layer_fused_k{self.k_clusters}.png", ClusterView(result.cluster_labels, result.cluster_index_list)))
-        return views
+        """保存するクラスタ分けを (画像ファイル名, クラスタ分け) で返す。伝播前の PE、伝播後の順。"""
+        return [
+            (f"layer_fused_pe_k{self.k_clusters}.png", result.pe_clusters),
+            (f"layer_fused_k{self.k_clusters}.png", ClusterView(result.cluster_labels, result.cluster_index_list)),
+        ]
 
     def _save_cluster_prompts(self, save_dir: Path, result: SegmentationResult, all_prompts: List[str]) -> None:
         """クラスタごとの分類結果（対応するプロンプトの文）をテキストで保存。クラスタの画像と同じクラスタ番号。"""
@@ -228,7 +187,7 @@ class ResultSaver:
 
     def _save_foreground_maps(self, save_dir: Path, size: Tuple[int, int], result: SegmentationResult) -> Image.Image:
         """前景度合いマップと粗い前景マスクを保存し、マスク画像を返す。"""
-        grid = (self.feature_size, self.feature_size)
+        grid = result.foreground_map.shape
         foreground_map_2d = (result.foreground_map * 255).astype(np.uint8).reshape(grid)
         Image.fromarray(foreground_map_2d).resize(size, resample=Image.Resampling.BILINEAR).save(
             save_dir / "foreground_map.png"
@@ -238,6 +197,11 @@ class ResultSaver:
         mask_image = Image.fromarray(foreground_mask_2d).resize(size, resample=Image.Resampling.NEAREST)
         mask_image.save(save_dir / "foreground_mask.png")
         return mask_image
+
+    def _save_coarse_foreground(self, save_dir: Path, image_raw: np.ndarray, size: Tuple[int, int], result: SegmentationResult) -> None:
+        """前景度合いマップ・粗い前景マスクと、それを重畳した画像を保存。"""
+        mask_image = self._save_foreground_maps(save_dir, size, result)
+        self._save_foreground_overlay(save_dir, image_raw, mask_image, result)
 
     @staticmethod
     def _save_foreground_overlay(

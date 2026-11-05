@@ -6,140 +6,36 @@ core_dir = Path(__file__).resolve().parent
 if str(core_dir) not in sys.path:
     sys.path.insert(0, str(core_dir))
 
-from typing import Union, List, Tuple, Optional
+from typing import Tuple
 import torch
 import torch.nn as nn
-from PIL import Image
 import numpy as np
 
 from core.common.edgetam_helper import EdgeTamHelper
+from core.common.params import EDGETAM_WEIGHTS_URL
 from sam2.build_sam import build_sam2
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.modeling.backbones.image_encoder import FpnNeck
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.utils.transforms import SAM2Transforms
 
 from timm.models.repvit import RepVit
 
-# ベースとした実装（使わない）
-class EdgeTAMPredictor:
-    def __init__(self, config: dict):
-        """
-        モデルの初期化と重みのロードを行います。
-        """
-        self.checkpoint_path = config["edgetam_model_path"]
-        self.config_path = config["edgetam_model_config"]
-        self.device = config["device"]
-        self.dtype = getattr(torch, config["dtype"])
 
-        # モデルとPredictorの構築
-        sam_model = build_sam2(self.config_path, self.checkpoint_path, device=self.device)
-        self.predictor = SAM2ImagePredictor(sam_model)
-
-    def set_image(
-        self, 
-        image_input: Union[str, Path, np.ndarray, Image.Image], 
-    ) -> None:
-        # 画像パスが渡された場合はNumPy配列（RGB）に変換
-        if isinstance(image_input, (str, Path)):
-            image = Image.open(image_input).convert("RGB")
-            image_np = np.array(image)
-        elif isinstance(image_input, Image.Image):
-            image_np = np.array(image_input.convert("RGB"))
-        else:
-            image_np = image_input
-
-        # 推論モードとAutocastを適用して推論
-        with torch.inference_mode():
-            self.predictor.set_image(image_np)
-
-    def predict(
-        self, 
-        box: Union[List[float], np.ndarray] = None,
-        point_coords: Union[List[List[float]], np.ndarray] = None,
-        point_labels: Union[List[int], np.ndarray] = None,
-        mask_input: Union[List[int], np.ndarray] = None,
-        multimask_output: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        画像パスとプロンプトを受け取り、マスクを予測して返します。
-        
-        :param box: バウンディングボックスプロンプト [x1, y1, x2, y2]
-        :param point_coords: ポイント座標 [[x1, y1], [x2, y2], ...]
-        :param point_labels: ポイントラベル [1, 0, ...] (1: 前景, 0: 背景)
-        :param mask_input: マスク画像
-        :param multimask_output: 複数マスクを出力するかどうか
-        :return: (masks, scores, logits)
-        """
-        # 推論モードとAutocastを適用して推論
-        with torch.inference_mode():
-            masks, scores, logits = self.predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=box,
-                mask_input=mask_input,
-                multimask_output=multimask_output,
-            )
-
-        return masks, scores, logits
-
-
-class EdgeTamRunner:
-    """EdgeTAMのエンコーダ・デコーダをまとめたPyTorch版（旧パイプライン core/torch/legacy 用。共通パイプラインは TorchEdgeTamBackend を使う）。"""
-
-    def __init__(self, config: dict):
-        self.edgetam_encoder = RepVitModel(config)
-        self.edgetam_decoder = DecodeModel(config)
-
-    def transform(self, x: torch.Tensor) -> torch.Tensor:
-        return self.edgetam_encoder.transform(x)
-
-    def encode(
-        self, 
-        image_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.edgetam_encoder(image_tensor)
-
-    def decode(
-        self, 
-        high_res_feats0: torch.Tensor,
-        high_res_feats1: torch.Tensor,
-        image_embed: torch.Tensor,
-        point_coords: torch.Tensor,
-        point_labels: torch.Tensor,
-        mask_input: torch.Tensor,
-        has_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.edgetam_decoder(
-            high_res_feats0, high_res_feats1, image_embed,
-            point_coords=point_coords,
-            point_labels=point_labels,
-            mask_input=mask_input,
-            has_mask=has_mask,
-        )
-
-    def preprocess(
-        self,
-        orig_hw: Tuple[int, int],
-        point_coords: Optional[torch.Tensor] = None,
-        point_labels: Optional[torch.Tensor] = None,
-        box: Optional[torch.Tensor] = None,
-        mask_logits: Optional[torch.Tensor] = None,
-        normalize_coords: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return self.edgetam_decoder.preprocess(
-            orig_hw, point_coords, point_labels, box, mask_logits, normalize_coords
-        )
-
-    def postprocess(
-        self,
-        low_res_masks: torch.Tensor,
-        iou_predictions: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.edgetam_decoder.postprocess(
-            low_res_masks, iou_predictions
-        )
-
+def ensure_edgetam_weights(checkpoint_path) -> Path:
+    """重みが checkpoint_path に無ければ、そのパスへダウンロードする（途中で失敗しても壊れたファイルを残さない）"""
+    path = Path(checkpoint_path)
+    if path.exists():
+        return path
+    import urllib.request
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    print(f"EdgeTAM の重みが見つからないためダウンロードします: {EDGETAM_WEIGHTS_URL} -> {path}")
+    try:
+        urllib.request.urlretrieve(EDGETAM_WEIGHTS_URL, tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
 
 class EdgeTamModel:
     """SAM2モデルの読み込みと保持を担うクラス"""
@@ -149,6 +45,7 @@ class EdgeTamModel:
     @classmethod
     def get_model(cls, config_path, checkpoint_path, device="cpu") -> Tuple[SAM2Base, SAM2Transforms]:
         if cls._sam_model is None:
+            ensure_edgetam_weights(checkpoint_path)
             cls._sam_model: SAM2Base = build_sam2(config_path, checkpoint_path, device=device)
         if cls._transforms is None:
             # 閾値
@@ -228,7 +125,6 @@ class DecodeModel(BaseModel):
         self.edgetam_model, self._transforms = EdgeTamModel.get_model(
             self.config_path, self.checkpoint_path, self.device
         )
-        self.mask_threshold: float = self._transforms.mask_threshold
         self.no_mask_embed = self.edgetam_model.sam_prompt_encoder.no_mask_embed
 
     def _embed_masks(self, masks: torch.Tensor) -> torch.Tensor:
@@ -317,101 +213,6 @@ class DecodeModel(BaseModel):
         )
 
         return low_res_masks, iou_predictions
-
-    def preprocess(
-        self,
-        orig_hw: Tuple[int, int],
-        point_coords: Optional[torch.Tensor] = None,
-        point_labels: Optional[torch.Tensor] = None,
-        box: Optional[torch.Tensor] = None,
-        mask_logits: Optional[torch.Tensor] = None,
-        normalize_coords: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """入力プロンプト (ポイント、ボックス、マスク) の前処理と結合を行います。"""
-        unnorm_coords: Optional[torch.Tensor] = None
-        labels: Optional[torch.Tensor] = None
-        unnorm_box: Optional[torch.Tensor] = None
-        mask_input: Optional[torch.Tensor] = None
-
-        # --- 1. ポイントプロンプトの処理 ---
-        if point_coords is not None:
-            if point_labels is None:
-                raise ValueError("point_labels must be supplied if point_coords is supplied.")
-
-            unnorm_coords = self._transforms.transform_coords(
-                point_coords, normalize=normalize_coords, orig_hw=orig_hw
-            )
-            labels = point_labels
-            if unnorm_coords.ndim == 2:
-                unnorm_coords = unnorm_coords[None, ...]
-                labels = labels[None, ...]
-
-        # --- 2. ボックスプロンプトの処理 ---
-        if box is not None:
-            unnorm_box = self._transforms.transform_boxes(
-                box, normalize=normalize_coords, orig_hw=orig_hw
-            )  # B x 2 x 2
-
-        # --- 3. マスクプロンプトの処理 ---
-        if mask_logits is not None:
-            if mask_logits.ndim == 3:
-                mask_input = mask_logits[None, :, :, :]
-            elif mask_logits.ndim == 1:
-                # フラグ等で空マスクが必要な場合のゼロ埋めテンソル生成
-                batch_size = mask_logits.shape[0]
-                target_size = self.edgetam_model.image_size // 4
-                mask_input = torch.zeros(
-                    (batch_size, 1, target_size, target_size),
-                    dtype=torch.float32,
-                    device=mask_logits.device,
-                )
-            has_mask = torch.ones((1, ), dtype=torch.float32)
-        else:
-            has_mask = torch.zeros((1, ), dtype=torch.float32)
-
-        # --- 4. ポイントとボックスの統合 ---
-        concat_points: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        if unnorm_coords is not None and labels is not None:
-            concat_points = (unnorm_coords, labels)
-
-        if unnorm_box is not None:
-            box_coords = unnorm_box.reshape(-1, 2, 2)
-            box_labels = torch.tensor(
-                [[2, 3]], dtype=torch.int, device=unnorm_box.device
-            ).repeat(unnorm_box.size(0), 1)
-
-            if concat_points is not None:
-                concat_coords = torch.cat([box_coords, concat_points[0]], dim=1)
-                concat_labels = torch.cat([box_labels, concat_points[1]], dim=1)
-                concat_points = (concat_coords, concat_labels)
-            else:
-                concat_points = (box_coords, box_labels)
-
-        # プロンプトが何もない場合のエッジケース保護
-        if concat_points is None:
-            return mask_input, None, None
-
-        return mask_input, concat_points[0], concat_points[1], has_mask
-
-    def postprocess(
-        self,
-        low_res_masks: torch.Tensor,
-        iou_predictions: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います。"""
-        # マスクを元画像の解像度にリサイズ
-        # masks = self._transforms.postprocess_masks(low_res_masks, orig_hw)
-        low_res_masks = torch.clamp(low_res_masks, -32.0, 32.0)
-
-        # マスク画像を作成
-        masks = low_res_masks > self.mask_threshold
-
-        # 不要なバッチ次元を削除して float 型へキャスト
-        masks = masks.squeeze(0).float()
-        iou_predictions = iou_predictions.squeeze(0).float()
-        low_res_masks = low_res_masks.squeeze(0)
-
-        return masks, iou_predictions, low_res_masks
 
 
 class TorchEdgeTamBackend(EdgeTamHelper):

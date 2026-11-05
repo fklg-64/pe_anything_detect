@@ -1,15 +1,26 @@
-from core.openvino.runtime_utils import limit_blas_threads, make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
+from core.openvino.runtime_utils import limit_cpu_threads, make_compile_config, model_file_suffix  # openvino より先に import する（sys.path の整理）
 
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
-import cv2
 import numpy as np
 
 import openvino as ov
 import openvino_tokenizers
 
-from core.common.params import OPENCV_NUM_THREADS
+from core.common.params import PE_MEAN, PE_STD
+from core.openvino.compiled_model import OVModel, StaticPlan, static_input_side
+
+
+# 使わない出力。変換済みモデルは、画像全体の特徴量（raw_image_features）と CLS からパッチへの attention も出すが、粗い判定では使わない
+UNUSED_OUTPUTS = {"raw_image_features", "cls2patch_attention"}
+
+
+def _drop_unused_outputs(model: ov.Model) -> None:
+    """未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す（その出力だけに使う計算もコンパイルで消える。PE が約 2ms 速くなる）。"""
+    for result in model.get_results():
+        if result.output(0).get_names() & UNUSED_OUTPUTS:
+            model.remove_result(result)
 
 
 class OVCLIPFeatureExtractor:
@@ -21,16 +32,15 @@ class OVCLIPFeatureExtractor:
         self.use_int8 = config["pe_use_int8"]
         self.device = config["device"].upper()
         self.num_threads = config["ov_num_thread"]
+        # 画像モデルの入力の一辺（ov_static_shape が真のときだけ。None なら動的形状。compiled_model.py）
+        self.static_side = static_input_side(config)
 
         # 画像の正規化に使用する変数
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.mean = np.array(PE_MEAN).reshape(3, 1, 1)
+        self.std = np.array(PE_STD).reshape(3, 1, 1)
 
-        # OpenCVの処理に使用するスレッド数
-        cv2.setNumThreads(OPENCV_NUM_THREADS)
-
-        # NumPyのBLASのスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
-        limit_blas_threads()
+        # OpenCV・NumPy(BLAS)のスレッド数（OpenVINOのスレッドと競合して推論が遅くなるのを避ける。runtime_utils 参照）
+        limit_cpu_threads()
 
         # OpenVINOのモデルを読み込み
         self.load_ov_model()
@@ -49,42 +59,41 @@ class OVCLIPFeatureExtractor:
         visual_path = model_dir / f"pe_visual_model{suffix}"
         text_path = model_dir / f"pe_text_model{suffix}"
         patch_logits_path = model_dir / f"pe_patch_logits_model{suffix}"
+        region_tokens_path = model_dir / f"pe_region_tokens_model{suffix}"
         tokenizer_path = model_dir / "pe_tokenizer.xml"
 
-        visual_model = core.read_model(visual_path)
-        # 未使用の出力は計算・転送が無駄なので、コンパイル前にグラフから外す
-        for result in visual_model.get_results():
-            if result.output(0).get_names() & {"cls2patch_attention"}:
-                visual_model.remove_result(result)
+        side = self.static_side
+        self.visual_model = OVModel(
+            core, visual_path, self.device, self.num_threads, prepare=_drop_unused_outputs,
+            static=None if side is None else StaticPlan({"x": [1, 3, side, side]}),
+        )
         text_model = core.read_model(text_path)
         patch_logits_model = core.read_model(patch_logits_path)
+        region_tokens_model = core.read_model(region_tokens_path)
         tokenizer_model = core.read_model(tokenizer_path)
 
         # メタデータ
-        self.patch_size: int = visual_model.rt_info["patch_size"].astype(int)
+        self.patch_size: int = self.visual_model.rt_info["patch_size"].astype(int)
 
         # 特徴マップのサイズ
         self.feature_size = self.target_size // self.patch_size
 
         # コンパイルモデル
-        self.compiled_visual_model = core.compile_model(visual_model, self.device, compile_config)
         self.compiled_text_model = core.compile_model(text_model, self.device, compile_config)
         self.compiled_patch_logits_model = core.compile_model(patch_logits_model, self.device, compile_config)
+        self.compiled_region_tokens_model = core.compile_model(region_tokens_model, self.device, compile_config)
         self.compiled_tokenizer = core.compile_model(tokenizer_model, self.device, compile_config)
 
     def _forward_once(self) -> None:
         input_tensor = np.zeros((1, 3, self.target_size, self.target_size), dtype=np.float32)
-        self.compiled_visual_model([input_tensor])
+        self.visual_model([input_tensor])
 
-    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
-        """(1,3,S,S) -> (raw_image_features, raw_patch_features, fused_layer_features)"""
-        outs = self.compiled_visual_model([image_tensor])
-        raw_image_features = outs[self.compiled_visual_model.output("raw_image_features")]
-        if normalize:
-            raw_image_features = raw_image_features / np.linalg.norm(raw_image_features, axis=-1, keepdims=True)
-        raw_patch_features = outs[self.compiled_visual_model.output("raw_patch_features")]
-        fused_patch_features = outs[self.compiled_visual_model.output("fused_layer_features")]
-        return raw_image_features, raw_patch_features, fused_patch_features
+    def extract_image_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """(1,3,S,S) -> (raw_patch_features, fused_layer_features)"""
+        outs = self.visual_model([image_tensor])
+        raw_patch_features = outs[self.visual_model.output_index("raw_patch_features")]
+        fused_patch_features = outs[self.visual_model.output_index("fused_layer_features")]
+        return raw_patch_features, fused_patch_features
 
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
         """プロンプトの文字列 -> (N, D) のテキスト特徴量"""
@@ -99,3 +108,13 @@ class OVCLIPFeatureExtractor:
         """パッチ特徴 (1,N+1,C) とクラスタ番号 (N,) -> クラスタごとの代表トークン"""
         outs = self.compiled_patch_logits_model([patch_features, fused_cluster_labels])
         return outs[self.compiled_patch_logits_model.output(0)]
+
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """パッチ特徴 (1,N+1,C) と領域番号 (N,)（0 以上の整数。矩形の外も 1 つの番号にできる） -> 番号 0.. ごとの代表トークン (最大番号+1, D)
+
+        extract_cluster_tokens との違い: CLS トークンを見ず、領域のパッチの value の平均を取る。extract_cluster_tokens は CLS が注意の大半を受けるので、
+        数パッチの小さな領域では、どこを囲んでも画像全体の CLS とほぼ同じトークンになる（monkey_patch.custom_attentionpoollatent_forward）。
+        モデルは `python convert_openvino.py --region-only` で作る（本体の粗い判定は使わない）。
+        """
+        outs = self.compiled_region_tokens_model([patch_features, region_labels])
+        return outs[self.compiled_region_tokens_model.output(0)]

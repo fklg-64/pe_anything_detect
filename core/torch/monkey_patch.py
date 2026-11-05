@@ -11,7 +11,7 @@ from timm.models.eva import Eva, EvaBlock, AttentionRope
 from timm.layers.attention import maybe_add_mask, apply_rot_embed_cat, resolve_self_attn_mask
 from timm.layers.attention_pool import AttentionPoolLatent
 
-from typing import Optional, Tuple, List, Union
+from typing import List, Optional
 
 import timm.models.eva as eva_module
 import timm.layers.pos_embed as pos_embed_module
@@ -183,29 +183,24 @@ def attentionpoollatent_forward(
 #     return torch.cat(label_token_list, dim=0)
 
 
-def remove_cls_direction(features: torch.Tensor, alpha=1.0):
-    """
-    features: [B, P+1, C]
-    先頭トークンがCLS。
-    戻り値: [B, P+1, C]
-    """
-    cls = features[:, 0, :]       # [B, C]
-    patch = features[:, 1:, :]    # [B, P, C]
 
-    # CLSのノルムは任意でよい
-    denom = cls.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+REGION_POOL_MODES = ("cls_attn", "attn", "mean")
 
-    # 各patchをCLS方向へ射影する係数
-    coeff = (
-        (patch * cls[:, None, :]).sum(dim=-1, keepdim=True)
-        / denom[:, None, :]
-    )
 
-    # CLS方向成分を除去
-    cls_component = coeff * cls[:, None, :]
-    residual = patch - alpha * cls_component
+def _attention_pool_head(self: Eva, y: torch.Tensor, normalize: bool) -> torch.Tensor:
+    """attention pool の出力 y [B*K, Latent, C]（value の重み付き和）を、proj・MLP・head で画像埋め込み [B*K, OutDim] にする。"""
+    y = self.attn_pool.proj(y)
+    y = self.attn_pool.proj_drop(y)
+    y = y + self.attn_pool.mlp(self.attn_pool.norm(y))
 
-    return torch.cat([cls[:, None, :], residual], dim=1)
+    y = y[:, 0]  # [B*K, C]
+    y = self.fc_norm(y)
+    y = self.head_drop(y)
+    cls_tokens = self.head(y)  # [B*K, OutDim]
+
+    if normalize:
+        cls_tokens = F.normalize(cls_tokens, dim=-1)
+    return cls_tokens
 
 
 def custom_attentionpoollatent_forward(
@@ -214,8 +209,23 @@ def custom_attentionpoollatent_forward(
     cluster_labels: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
     normalize: bool = False,
+    pool: str = "cls_attn",
 ) -> torch.Tensor:
-    """パッチレベルでクラスタリングした領域のCLSレベルの特徴量を取得 (K動的対応・ベクトル化版)"""
+    """パッチレベルでクラスタリングした領域のCLSレベルの特徴量を取得 (K動的対応・ベクトル化版)
+
+    領域ごとに、その領域のパッチだけを見る attention pool で代表トークンを作る。pool は、何をまとめるかの選び方:
+
+      "cls_attn"  従来。CLS トークンを必ず注意の対象に含める（本体の粗い判定が使う）。CLS が注意の大半を受けるので、
+                  代表トークンは領域が小さいほど画像全体の CLS に近づく（package (1) で 1〜4 パッチ 99.6%、25〜99 パッチ 90%、
+                  100 パッチ以上でも約 70%）。数十パッチ以上のクラスタには効くが、矩形 1 つ（数パッチ）のような小さい領域では、
+                  どこを囲んでも同じトークンになる。
+      "attn"      領域のパッチだけに注意する（CLS を除く）。
+      "mean"      領域のパッチの value の平均（注意の重みを使わない）。小さい領域の前景/背景の分離・領域どうしの類似度が最も良かった。
+
+    ラベルに 1 つもパッチが無いとき（空の領域）は、どの pool でも CLS だけを見る（全部遮断すると softmax が NaN になるため）。
+    """
+    if pool not in REGION_POOL_MODES:
+        raise ValueError(f"pool は {REGION_POOL_MODES} のどれか: {pool}")
     B, N, C = x.shape
 
     # cluster_labels から動的に K (クラスタ数) を取得、あるいは入力形状から取得
@@ -249,19 +259,6 @@ def custom_attentionpoollatent_forward(
     k, v = kv.unbind(0)  # [B, Heads, N, HeadDim]
     k = self.attn_pool.k_norm(k)
 
-    # k = F.linear(
-    #     remove_cls_direction(x),
-    #     self.attn_pool.kv.weight[:C, :],
-    #     self.attn_pool.kv.bias[:C] if self.attn_pool.kv.bias is not None else None,
-    # ).reshape(B, N, self.attn_pool.num_heads, self.attn_pool.head_dim).permute(0, 2, 1, 3)
-    # k = self.attn_pool.k_norm(k)
-
-    # v = F.linear(
-    #     remove_cls_direction(x),
-    #     self.attn_pool.kv.weight[C:, :],
-    #     self.attn_pool.kv.bias[C:] if self.attn_pool.kv.bias is not None else None,
-    # ).reshape(B, N, self.attn_pool.num_heads, self.attn_pool.head_dim).permute(0, 2, 1, 3)
-
     # 3. 動的な K (クラスタ数) に向けた Mask の一括作成
     # 0 ~ max(cluster_labels) までのラベルを動的生成 [K, 1]
     max_label = cluster_labels_batch.max()
@@ -276,14 +273,25 @@ def custom_attentionpoollatent_forward(
     )  # [K, B, N-1]
     patch_valid = patch_valid.permute(1, 0, 2)  # [B, K, N-1]
 
-    # CLS トークン用 Mask (常に True): [B, K, 1]
+    # CLS トークン用 Mask: [B, K, 1]
     K_dynamic = labels_arange.shape[0]
-    cls_mask = torch.ones(
-        (B, K_dynamic, 1), dtype=torch.bool, device=x.device
-    )
+    if pool == "cls_attn":
+        cls_mask = torch.ones(
+            (B, K_dynamic, 1), dtype=torch.bool, device=x.device
+        )  # 常に True
+    else:
+        cls_mask = ~patch_valid.any(dim=-1, keepdim=True)  # 空の領域のときだけ True
 
     # 全体 Mask: [B, K, N]
     valid_mask = torch.cat([cls_mask, patch_valid], dim=-1)
+
+    if pool == "mean":
+        # 領域のパッチの value の平均。注意の重みは使わない（query・key も使わない）
+        weights = valid_mask.to(v.dtype)
+        weights = weights / weights.sum(dim=-1, keepdim=True)  # [B, K, N]
+        y = torch.einsum("bkn,bhnd->bkhd", weights, v)  # [B, K, Heads, HeadDim]
+        y = y.reshape(B * K_dynamic, 1, C).expand(-1, self.attn_pool.latent_len, -1)
+        return _attention_pool_head(self, y, normalize)
 
     # SDPA の attn_mask 形状にアライメント: [B, K, 1, 1, N] または [B * K, Heads, Latent, N] にReshape
     # 処理を単純化するため (B * K) をバッチ次元として統合
@@ -324,19 +332,7 @@ def custom_attentionpoollatent_forward(
     y = y.transpose(1, 2).reshape(
         B * K_dynamic, self.attn_pool.latent_len, C
     )
-    y = self.attn_pool.proj(y)
-    y = self.attn_pool.proj_drop(y)
-    y = y + self.attn_pool.mlp(self.attn_pool.norm(y))
-
-    y = y[:, 0]  # [B*K, C]
-    y = self.fc_norm(y)
-    y = self.head_drop(y)
-    cls_tokens = self.head(y)  # [B*K, OutDim]
-
-    if normalize:
-        cls_tokens = F.normalize(cls_tokens, dim=-1)
-
-    return cls_tokens  # [B*K, OutDim] (必要に応じて reshape(B, K, -1) や reshape(-1, OutDim) 可能)
+    return _attention_pool_head(self, y, normalize)  # [B*K, OutDim] (必要に応じて reshape(B, K, -1) や reshape(-1, OutDim) 可能)
 
 
 def attention_rope_forward(

@@ -11,13 +11,12 @@ import numpy as np
 class CLIPBackend(Protocol):
     target_size: int
     feature_size: int
+    patch_size: int
     mean: np.ndarray  # (3, 1, 1)
     std: np.ndarray   # (3, 1, 1)
 
-    def extract_image_features(
-        self, image_tensor: np.ndarray, normalize: bool = True
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(1,3,S,S) float32 -> (raw_image_features, raw_patch_features, fused_layer_features)"""
+    def extract_image_features(self, image_tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """(1,3,S,S) float32 -> (raw_patch_features, fused_layer_features)。画像全体の特徴量は使わないので返さない"""
         ...
 
     def extract_text_features(self, prompts: List[str]) -> np.ndarray:
@@ -26,6 +25,10 @@ class CLIPBackend(Protocol):
 
     def extract_cluster_tokens(self, patch_features: np.ndarray, fused_cluster_labels: np.ndarray) -> np.ndarray:
         """パッチ特徴 (1,N+1,C) とクラスタ番号 (N,) int64 -> クラスタごとのトークン"""
+        ...
+
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """パッチ特徴 (1,N+1,C) と領域番号 (N,) int64 -> 領域ごとのトークン"""
         ...
 
 

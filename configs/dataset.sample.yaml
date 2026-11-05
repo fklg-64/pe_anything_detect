@@ -1,0 +1,3 @@
+# 実行対象のデータセット。ファイルまたはディレクトリ（再帰的に png / jpg / bmp を探索）を並べる
+image_paths:
+  - "/path/to/your/image or directory"

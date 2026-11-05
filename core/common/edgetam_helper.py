@@ -1,7 +1,8 @@
 from typing import Optional, Tuple
 
-import cv2
 import numpy as np
+
+from core.common.params import EDGETAM_LOGIT_CLIP, EDGETAM_MEAN, EDGETAM_STD
 
 
 class EdgeTamHelper:
@@ -10,12 +11,9 @@ class EdgeTamHelper:
     def __init__(self, config: dict):
         self.target_size = config["image_size"]
 
-        # マスク閾値
-        self.mask_threshold = 0.0
-
         # 画像の正規化に使用する変数
-        self.mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
-        self.std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        self.mean = np.array(EDGETAM_MEAN).reshape(3, 1, 1)
+        self.std = np.array(EDGETAM_STD).reshape(3, 1, 1)
 
     def transform_coords(
         self,
@@ -23,7 +21,7 @@ class EdgeTamHelper:
         normalize: bool = False,
         orig_hw: Optional[Tuple[int, int]] = None,
     ) -> np.ndarray:
-        """入力座標 (NumPy配列) の正規化解除を行います。"""
+        """入力座標 (NumPy配列) の正規化解除を行います。正規化した座標を、モデルに入力した画像 (image_size 四方) の画素座標にします。"""
         coords = coords.astype(np.float32).copy()
 
         if normalize:
@@ -32,135 +30,40 @@ class EdgeTamHelper:
             coords[..., 0] = coords[..., 0] / w
             coords[..., 1] = coords[..., 1] / h
 
-        coords = coords * self.target_size  # unnormalize coords
+        coords[..., 0] *= self.target_size  # unnormalize coords
+        coords[..., 1] *= self.target_size
         return coords
-
-    def transform_boxes(
-        self,
-        boxes: np.ndarray,
-        normalize: bool = False,
-        orig_hw: Optional[Tuple[int, int]] = None,
-    ) -> np.ndarray:
-        """バウンディングボックス (NumPy配列) の変換を行います。"""
-        boxes = self.transform_coords(boxes.reshape(-1, 2, 2), normalize, orig_hw)
-        return boxes
-
-    def postprocess_masks(
-        self,
-        masks: np.ndarray,
-        orig_hw: Tuple[int, int],
-    ) -> np.ndarray:
-        """出力マスクを元画像の解像度 (orig_hw) にリサイズします (NumPy/OpenCV版)。"""
-        masks = masks.astype(np.float32)
-        target_h, target_w = orig_hw
-
-        batch_size, channels = masks.shape[0], masks.shape[1]
-        resized_masks = np.zeros(
-            (batch_size, channels, target_h, target_w), dtype=np.float32
-        )
-        for b in range(batch_size):
-            for c in range(channels):
-                resized_masks[b, c] = cv2.resize(
-                    masks[b, c],
-                    (target_w, target_h),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-        return resized_masks
 
     def preprocess(
         self,
         orig_hw: Tuple[int, int],
-        point_coords: Optional[np.ndarray] = None,
-        point_labels: Optional[np.ndarray] = None,
-        box: Optional[np.ndarray] = None,
-        mask_logits: Optional[np.ndarray] = None,
-        normalize_coords: bool = True,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
-        """入力プロンプト (ポイント、ボックス、マスク) の前処理と結合を行います (NumPy版)。"""
-        unnorm_coords: Optional[np.ndarray] = None
-        labels: Optional[np.ndarray] = None
-        unnorm_box: Optional[np.ndarray] = None
-        mask_input: Optional[np.ndarray] = None
+        point_coords: np.ndarray,
+        point_labels: np.ndarray,
+        mask_logits: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """デコーダーの入力（点とマスクのプロンプト）を作ります (NumPy版)。
 
-        # --- 1. ポイントプロンプトの処理 ---
-        if point_coords is not None:
-            if point_labels is None:
-                raise ValueError("point_labels must be supplied if point_coords is supplied.")
+        orig_hw: 点の座標を表す画像の大きさ (高さ, 幅)。point_coords (N, 2) は、その画像の画素座標 (x, y)。
+        mask_logits: 初期マスクのロジット (1, h, w)。
 
-            unnorm_coords = self.transform_coords(
-                point_coords, normalize=normalize_coords, orig_hw=orig_hw
-            )
-            labels = point_labels
-            if unnorm_coords.ndim == 2:
-                unnorm_coords = unnorm_coords[np.newaxis, ...]
-                labels = labels[np.newaxis, ...]
-
-        # --- 2. ボックスプロンプトの処理 ---
-        if box is not None:
-            unnorm_box = self.transform_boxes(
-                box, normalize=normalize_coords, orig_hw=orig_hw
-            )  # B x 2 x 2
-
-        # --- 3. マスクプロンプトの処理 ---
-        if mask_logits is not None:
-            if mask_logits.ndim == 3:
-                mask_input = mask_logits[np.newaxis, :, :, :]
-            elif mask_logits.ndim == 1:
-                # フラグ等で空マスクが必要な場合のゼロ埋め配列生成
-                batch_size = mask_logits.shape[0]
-                feature_size = self.target_size // 4
-                mask_input = np.zeros(
-                    (batch_size, 1, feature_size, feature_size),
-                    dtype=np.float32,
-                )
-            has_mask = np.ones((1,), dtype=np.float32)
-        else:
-            has_mask = np.zeros((1,), dtype=np.float32)
-
-        # --- 4. ポイントとボックスの統合 ---
-        concat_points: Optional[Tuple[np.ndarray, np.ndarray]] = None
-        if unnorm_coords is not None and labels is not None:
-            concat_points = (unnorm_coords, labels)
-
-        if unnorm_box is not None:
-            box_coords = unnorm_box.reshape(-1, 2, 2)
-            box_labels = np.tile(
-                np.array([[2, 3]], dtype=np.int32), (unnorm_box.shape[0], 1)
-            )
-
-            if concat_points is not None:
-                concat_coords = np.concatenate([box_coords, concat_points[0]], axis=1)
-                concat_labels = np.concatenate([box_labels, concat_points[1]], axis=1)
-                concat_points = (concat_coords, concat_labels)
-            else:
-                concat_points = (box_coords, box_labels)
-
-        # プロンプトが何もない場合のエッジケース保護（戻り値の要素数を4個に揃えて保護）
-        if concat_points is None:
-            return mask_input, None, None, has_mask
-
-        return mask_input, concat_points[0], concat_points[1], has_mask
+        Returns: (mask_input (1, 1, h, w), point_coords (1, N, 2)（モデル入力の画素座標）, point_labels (1, N), has_mask (1,))
+        """
+        unnorm_coords = self.transform_coords(point_coords, normalize=True, orig_hw=orig_hw)[np.newaxis, ...]
+        labels = point_labels[np.newaxis, ...]
+        mask_input = mask_logits[np.newaxis, :, :, :]
+        has_mask = np.ones((1,), dtype=np.float32)
+        return mask_input, unnorm_coords, labels, has_mask
 
     def postprocess(
         self,
         low_res_masks: np.ndarray,
         iou_predictions: np.ndarray,
-        orig_hw: Tuple[int, int],
-        need_masks: bool = True,
-    ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
-        """モデル出力の後処理 (オリジナル解像度への拡大および閾値処理) を行います (NumPy版)。
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """モデル出力の後処理を行います (NumPy版)。(予測 IoU (マスク数,)、低解像度ロジット (マスク数, h, w)) を返します。
 
-        need_masks=False のときは、リサイズ・二値化を省いて masks に None を返します（logits だけ使う呼び出し用）。
+        ロジットは絶対値 EDGETAM_LOGIT_CLIP 以下に収めます。マスクの二値化・拡大は呼び出し側（semantic_refiner）が必要な分だけ行います。
         """
-        masks: Optional[np.ndarray] = None
-        if need_masks:
-            # マスクを元画像の解像度にリサイズ
-            masks = self.postprocess_masks(low_res_masks, orig_hw)
-            masks = masks > self.mask_threshold
-            # 不要なバッチ次元を削除して float 型へキャスト
-            masks = np.squeeze(masks, axis=0).astype(np.float32)
-        low_res_masks = np.clip(low_res_masks, -32.0, 32.0)
+        low_res_masks = np.clip(low_res_masks, -EDGETAM_LOGIT_CLIP, EDGETAM_LOGIT_CLIP)
         iou_predictions = np.squeeze(iou_predictions, axis=0).astype(np.float32)
         low_res_masks = np.squeeze(low_res_masks, axis=0)
-
-        return masks, iou_predictions, low_res_masks
+        return iou_predictions, low_res_masks

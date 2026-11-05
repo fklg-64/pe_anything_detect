@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from open_clip.model import CustomTextCLIP
 
+from core.common.params import PE_MEAN, PE_STD
+
 # monkey_patch は import した時点で timm 側へのパッチ（動的な画像サイズ対応）が適用される。モデル生成より前に import すること
 from core.torch.monkey_patch import (
     attention_rope_forward,
@@ -20,9 +22,6 @@ from core.torch.monkey_patch import (
     timmmodel_forward,
 )
 
-# PE-Core / PE-Spatial（ViT）のブロック数。PyTorchで詳細な特徴量を取るときに、この全ブロックをパッチする
-NUM_BLOCKS = 12
-
 
 class TorchCLIPFeatureExtractor:
     """CLIPモデルの初期化、モンキーパッチ適用、および特徴量抽出を担当するクラス"""
@@ -32,7 +31,7 @@ class TorchCLIPFeatureExtractor:
         self.force_image_size = config["image_size"]
         self.to_openvino = config["to_openvino"]
         # クラスタリングに使う層（第 N ブロックの出力）。OpenVINO モデルの fused_layer_features に連結して出力される
-        self.cluster_layers = list(config.get("cluster_layers", [8, 9, 10]))
+        self.cluster_layers = list(config["cluster_layers"])
 
         self.model, self.preprocess = self._setup_model()
         self.tokenizer = open_clip.get_tokenizer(self.model_id)
@@ -54,7 +53,7 @@ class TorchCLIPFeatureExtractor:
         model.visual.forward = types.MethodType(timmmodel_forward, model.visual)
         # OpenVINO化の有無で設定変更（pytorchで処理する場合は、詳細な特徴量も取得）
         if not self.to_openvino:
-            for block in trunk.blocks[:NUM_BLOCKS]:
+            for block in trunk.blocks:
                 block.attn.forward = types.MethodType(attention_rope_forward, block.attn)
                 block.forward = types.MethodType(eva_block_forward, block)
         trunk.forward = types.MethodType(eva_forward, trunk)
@@ -67,7 +66,7 @@ class TorchCLIPFeatureExtractor:
         model.visual.to_openvino = self.to_openvino
         trunk.to_openvino = self.to_openvino
         # 保持する層。OpenVINO化では cluster_layers だけ、PyTorchの詳細な特徴量では全層
-        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, NUM_BLOCKS + 1))
+        trunk.store_layers = self.cluster_layers if self.to_openvino else list(range(1, len(trunk.blocks) + 1))
 
         return model, preprocess
 
@@ -104,18 +103,18 @@ class TorchCLIPBackend(TorchCLIPFeatureExtractor):
 
         # 画像の正規化に使用する変数（OVCLIPFeatureExtractorと同じ）
         self.target_size = self.force_image_size
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.mean = np.array(PE_MEAN).reshape(3, 1, 1)
+        self.std = np.array(PE_STD).reshape(3, 1, 1)
 
     @staticmethod
     def _to_numpy(x: torch.Tensor) -> np.ndarray:
         return x.detach().cpu().numpy()
 
-    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
+    def extract_image_features(self, image_tensor: np.ndarray):
         x = torch.from_numpy(np.ascontiguousarray(image_tensor)).to(device=self.device, dtype=torch.float32)
         with torch.no_grad():
-            raw_image, raw_patch, _, fused = self.model.encode_image(x, normalize=normalize)
-        return self._to_numpy(raw_image), self._to_numpy(raw_patch), self._to_numpy(fused)
+            _, raw_patch, _, fused = self.model.encode_image(x, normalize=False)
+        return self._to_numpy(raw_patch), self._to_numpy(fused)
 
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
         tokens = self.tokenizer(prompts).to(self.device)
@@ -123,10 +122,17 @@ class TorchCLIPBackend(TorchCLIPFeatureExtractor):
             return self._to_numpy(self.model.encode_text(tokens, normalize=normalize))
 
     def extract_cluster_tokens(self, patch_features: np.ndarray, fused_cluster_labels: np.ndarray) -> np.ndarray:
+        return self._pooled_tokens(patch_features, fused_cluster_labels, pool="cls_attn")
+
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """OVCLIPFeatureExtractor.extract_region_tokens と同じ（CLS を見ず、領域のパッチの value の平均）。"""
+        return self._pooled_tokens(patch_features, region_labels, pool="mean")
+
+    def _pooled_tokens(self, patch_features: np.ndarray, labels: np.ndarray, pool: str) -> np.ndarray:
         patch = torch.from_numpy(np.ascontiguousarray(patch_features)).to(device=self.device, dtype=torch.float32)
-        labels = torch.from_numpy(np.ascontiguousarray(fused_cluster_labels)).to(device=self.device, dtype=torch.int64)
+        labels = torch.from_numpy(np.ascontiguousarray(labels)).to(device=self.device, dtype=torch.int64)
         with torch.no_grad():
-            return self._to_numpy(self.model.visual.trunk.custom_forward(patch, labels, normalize=True))
+            return self._to_numpy(self.model.visual.trunk.custom_forward(patch, labels, normalize=True, pool=pool))
 
 
 class TorchCLIPProbe(TorchCLIPFeatureExtractor):
@@ -145,8 +151,8 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
 
         # 画像の正規化に使用する変数（OVCLIPFeatureExtractorと同じ）
         self.target_size = self.force_image_size
-        self.mean = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
-        self.std = np.array([0.5, 0.5, 0.5]).reshape(3, 1, 1)
+        self.mean = np.array(PE_MEAN).reshape(3, 1, 1)
+        self.std = np.array(PE_STD).reshape(3, 1, 1)
 
     def _tensor(self, x: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(x)).to(device=self.device, dtype=torch.float32)
@@ -196,12 +202,9 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
         return F.normalize(torch.cat([F.normalize(hs[l], dim=-1) for l in layers], dim=2), dim=-1)
 
     @torch.no_grad()
-    def extract_image_features(self, image_tensor: np.ndarray, normalize: bool = True):
+    def extract_image_features(self, image_tensor: np.ndarray):
         out = self.forward_all(image_tensor)
-        cls_token = self.trunk.forward_head(out["final"])[0]
-        if normalize:
-            cls_token = F.normalize(cls_token, dim=-1)
-        return cls_token.cpu().numpy(), out["final"].cpu().numpy(), self.fused_features(out["hs"]).cpu().numpy()
+        return out["final"].cpu().numpy(), self.fused_features(out["hs"]).cpu().numpy()
 
     @torch.no_grad()
     def extract_text_features(self, prompts: List[str], normalize: bool = True) -> np.ndarray:
@@ -210,3 +213,9 @@ class TorchCLIPProbe(TorchCLIPFeatureExtractor):
 
     def extract_cluster_tokens(self, patch_features: np.ndarray, fused_cluster_labels: np.ndarray) -> np.ndarray:
         return self.pool(self._tensor(patch_features), fused_cluster_labels)
+
+    @torch.no_grad()
+    def extract_region_tokens(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """TorchCLIPBackend.extract_region_tokens と同じ（CLS を見ず、領域のパッチの value の平均）。"""
+        labels = torch.from_numpy(np.asarray(region_labels)).to(device=self.device, dtype=torch.int64)
+        return self.trunk.custom_forward(self._tensor(patch_features), labels, normalize=True, pool="mean").cpu().numpy()

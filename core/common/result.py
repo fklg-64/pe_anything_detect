@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple
 
 import numpy as np
 
@@ -21,15 +21,13 @@ class SegmentationResult:
     point_coords: List[List[float]]    # EdgeTAMに与えたプロンプト点（画像座標、全クラス分）
     point_labels: List[int]            # 上の点のラベル（1=正例、0=負例）
 
-    # 粗い推定の中間結果（パッチ格子 feature_size x feature_size 上）
+    # 粗い推定の中間結果（パッチ格子（高さ x 幅）上）
     foreground_map: np.ndarray         # 前景らしさ
-    foreground_mask: np.ndarray        # 整形後の粗い前景マスク
-    cluster_labels: np.ndarray         # KMeansのクラスタ番号（平坦）。EdgeTAM 併用時は PE のクラスタ × 伝播後のプロンプトの組
-    raw_semantic_labels: np.ndarray    # 整形前の粗いセマンティックラベル
-    semantic_labels: np.ndarray        # 整形後の粗いセマンティックラベル
+    foreground_mask: np.ndarray        # 粗い前景マスク
+    cluster_labels: np.ndarray         # KMeansのクラスタ番号（平坦）。PE のクラスタ × 伝播後のプロンプトの組
+    semantic_labels: np.ndarray        # 粗いセマンティックラベル
     cluster_index_list: List[int]      # cluster_labels のクラスタごとの対応プロンプト番号
-    # EdgeTAM 併用時（use_edgetam_clustering）だけ、伝播前の PE だけのクラスタ分けと分類結果。併用しなければ None
-    pe_clusters: Optional[ClusterView] = None
+    pe_clusters: ClusterView           # 伝播前の PE だけのクラスタ分けと分類結果
 
     # インスタンス分離（instance_split: true のときだけ）。semantic_map の同じクラスの領域を、物体 1 個ずつに分けたもの
     instance_map: Optional[np.ndarray] = None       # (height, width) int32。0=背景、1~=インスタンス

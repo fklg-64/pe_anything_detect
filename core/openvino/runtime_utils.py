@@ -8,12 +8,7 @@ import os
 import sys
 from typing import Dict
 
-SYSTEM_OPENVINO_DIR = "/opt/intel/openvino"
-
-# NumPy の BLAS（OpenBLAS）のスレッド数。BLAS は既定で論理コア数（20）のスレッドを起こし、行列積（`@`）の後もしばらくスピン待ちするので、
-# OpenVINO のスレッド（ピン止め）とコアを取り合い、直後の推論が 2〜4 倍遅くなる（行列積 2ms の後のデコードが 7ms → 29ms）。
-# 本パイプラインの行列積は小さい（1024×256）ので、1 スレッドで 4ms 程度で済み、結果も同じ
-BLAS_NUM_THREADS = 1
+from core.common.params import BLAS_NUM_THREADS, OPENCV_NUM_THREADS, SYSTEM_OPENVINO_DIR
 
 
 def _remove_system_openvino_from_path() -> None:
@@ -37,6 +32,14 @@ def limit_blas_threads(num_threads: int = BLAS_NUM_THREADS) -> None:
     except ImportError:
         return
     threadpool_limits(limits=num_threads, user_api="blas")
+
+
+def limit_cpu_threads() -> None:
+    """OpenCV と NumPy の BLAS のスレッド数を制限する（OpenVINO のスレッドとコアを取り合って、推論が遅くなるのを避ける）。"""
+    import cv2  # cv2 は NumPy を読み込むので、モジュールの import 時に BLAS の環境変数を設定し終えるまで読まない
+
+    cv2.setNumThreads(OPENCV_NUM_THREADS)
+    limit_blas_threads()
 
 
 _remove_system_openvino_from_path()
