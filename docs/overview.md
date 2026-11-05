@@ -49,17 +49,20 @@ flowchart TD
         R3 --> R4["取りこぼしを<br/>再推定"]
         R4 --> R5["ノイズ除去<br/>隙間埋め"]
         R5 --> R6["格子状の物体を<br/>1 個ずつに"]
+        R6 --> R7["物体ごとに<br/>名前を決め直す"]
     end
 
     PE --> C
     ET --> C3
     C -->|"前景マスク・前景確信度・粗いラベル"| R
     ET -->|"特徴を使い回す"| R
+    PE -->|"パッチ特徴（名前の照合）"| R7
     R --> OUT["semantic_map"]
 ```
 
 粗い段階は **「だいたいどこに何があるか」**、詳細な段階は **「その正確な輪郭」** を決める。EdgeTAM エンコーダは 1 回だけ実行し、① の伝播と ② のデコードで使い回す。
 粗い結果は「正解」ではなく**ヒント**として渡す（内側は確実、縁は不明）ので、粗い段階の太りや欠けを引き継がない。
+最後に、EdgeTAM が切り出した物体の画素だけから PE の代表トークンを作り直して、物体ごとに名前を決め直す（② の 7。種類の違う物体を分ける。前景のマスクは変えない）。
 
 | 課題 | 1 段階だとどうなるか | 2 段階の解決 |
 |---|---|---|
@@ -107,6 +110,7 @@ MVTec cable の 1 枚（第 6 層のモデル、この資料を作った PC）�
 
 - 時間の大半は、特徴抽出（PE + EdgeTAM エンコーダ）と、クラス・領域ごとのデコード。デコードの回数は「（クラス数 + 再推定した成分数）× 反復回数」。
 - 格子状の物体を検出したときだけ、② の最後に約 +150ms（006 の 80 個）。検出したかの判定は毎回走り、約 14ms。
+- ② の最後の名前付け（2026-11-06 に追加）は平均 約 7ms（照合のモデル 2 回 約 2.3ms を含む）。上の表はそれより前の測定で、含まない。この検証の環境（WSL2・OpenVINO 4 スレッド）で 46 枚を交互に 5 周測った差は、1 画像あたり +6.8ms（+4.5%）。
 - NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runtime_utils.py`）。既定の 20 スレッドは、行列積の後も待機して OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする。
 - **コードの整理（2026-10-31）の前後の比較**: 同じ画像を、整理前と整理後で実行順を入れ替えながら 6 周測った。画像ごとの最小値の比（整理後 / 整理前）は 0.93〜1.00、中央値 0.986。出力は 42 枚で全項目一致。測定のばらつきが大きく（同じコードどうしでも ±1〜2%、周ごとの合計は ±10〜20%）、数 % の差は検出できない。
 
@@ -136,6 +140,7 @@ flowchart TD
 | 全体の流れ | `core/common/segmentation_runner.py`（`segment`） |
 | ① 粗い推定 | `core/common/coarse_segmentation.py`（`CoarseSegmenter`）・`region_relabel.py`（前景のクラスの付け直し。名前の判定し直し・統合・境目の整え） |
 | ② 精緻化の進行 | `core/common/semantic_refiner.py`（`SemanticRefiner`） |
+| ② 最終の名前付け | `core/common/region_relabel.py`（`name_final_regions`）・`coarse_segmentation.py`（`final_region_logits`。照合の根拠） |
 | ② 1 領域の推定 | `core/common/region_estimator.py`（`RegionEstimator`）・`object_points.py` |
 | EdgeTAM の呼び出し口 | `core/common/edgetam_session.py`（`EdgeTamSession`。lock・前後処理） |
 | ② 格子状の小物体の分離 | `core/common/lattice.py`（検出）・`lattice_separator.py`（`LatticeSeparator`） |

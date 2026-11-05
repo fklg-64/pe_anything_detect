@@ -4,6 +4,7 @@
     python tools/docs/make_relabel_doc_image.py [--images "PATH" ...] [--out docs/images/relabel_noodle.jpg]
 
 「なし」は CoarseSegmenter._relabel_foreground を何もしない関数に差し替えて再現する（= 粗い判定のクラスタが付けたラベルのまま）。OpenVINO 版（configs/ov_config.yaml）で実行する。
+④ だけの効果を見るため、精緻化の後の名前付け（SemanticRefiner.refine の region_logits。docs/detailed_segmentation.md「7. 最終の名前付け」）は、なし・ありの両方で外す。
 """
 import argparse
 import contextlib
@@ -51,6 +52,13 @@ def main() -> None:
     runner = SegmentationRunner(OVCLIPFeatureExtractor(config), OVEdgeTamRunner(config), config)
     coarse = runner.coarse
     relabel = coarse._relabel_foreground
+    refine = runner.refiner.refine
+
+    def refine_without_naming(*a, **k):  # 最後の名前付けを外す
+        k.pop("region_logits", None)
+        return refine(*a, **k)
+
+    runner.refiner.refine = refine_without_naming
     prompts = [short(p) for p in runner.foreground_prompts + runner.background_prompts]
     extra: dict = {}
 

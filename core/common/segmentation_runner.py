@@ -9,6 +9,7 @@
   5. 粗いセマンティック   assign_semantic_labels（パッチ単位のラベル）
   6. 精緻化               SemanticRefiner.refine（クラスごとに EdgeTAM デコーダ -> 1 枚のセマンティックマップ）
                           <- この間に、領域の推定（NumPy の整形）を、別の領域のデコードと重ねる
+                          最後に、EdgeTAM が切り出した物体ごとに、その画素の PE の代表トークンで名前を決め直す（CoarseSegmenter.final_region_logits）
 
 重ねる処理は worker_threads のスレッドで実行する（parallel.py。0 なら重ねず、順に実行する）。結果は決まった順に反映するので、出力は変わらない。
 結果の保存は run() / ResultSaver（segment には含まれない）。
@@ -97,7 +98,7 @@ class SegmentationRunner:
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             refined = self.refiner.refine(
                 resized, coarse_foreground.foreground_map, foreground_mask, semantic_labels, labels_list, width, height,
-                edgetam_features,
+                edgetam_features, region_logits=partial(self.coarse.final_region_logits, patch_features),
             )
 
         elapsed_time = time.time() - start

@@ -5,7 +5,8 @@
   2. クラスごとの推定      クラスごとに EdgeTAM で推定し、重なりはスコアの高いクラスを優先する    _refine_classes
   3. 取りこぼしの再推定    どのクラスにも覆われなかった粗い成分だけを、単独で推定し直す          _rescue_uncovered
   4. 後処理                小領域の除去 -> 前景内部の細い隙間を埋める -> 格子状の物体を 1 個ずつに分ける
-  5. 元画像の大きさへ戻す
+  5. 最終の名前付け        EdgeTAM が切り出した（物体, クラス）の領域ごとに、その画素の代表トークンで名前を決め直す（前景のマスクは変えない）  region_relabel.name_final_regions
+  6. 元画像の大きさへ戻す
 
 領域の推定（RegionEstimator.estimate）は何も書き換えないので、worker_threads があれば、次の領域のデコードと重ねて実行する。
 推定の結果を semantic_map に反映するのは常にこのクラスで、クラス番号の順（取りこぼしは検出した順）に行うので、出力はスレッドの有無で変わらない。
@@ -13,7 +14,7 @@
 
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -31,6 +32,8 @@ from core.common.mask_utils import (
 from core.common.parallel import JobGroup, Workers
 from core.common.params import MIN_ISOLATED_PATCHES
 from core.common.region_estimator import RefineInput, RegionEstimator, RegionResult
+from core.common.region_relabel import name_final_regions
+from core.utils import Timer
 
 
 @dataclass
@@ -61,6 +64,8 @@ class SemanticRefiner:
         self.estimator = RegionEstimator(session, feature_size, config)
         # 格子状に並んだ小物体を 1 個ずつに分ける（lattice_separator.py）
         self.lattice_separator = LatticeSeparator(session, config["foreground_threshold"])
+        # 最終の名前付けで、判定し直さない小さな領域の基準（前景の 1/k_clusters。粗い段階の rejudge_regions と同じ）
+        self.min_region_divisor: int = config["k_clusters"]
         self.workers = workers
 
     # =========================================================================
@@ -77,6 +82,7 @@ class SemanticRefiner:
         width: int,
         height: int,
         feats: Features,
+        region_logits: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ) -> RefineOutput:
         """粗いセマンティックセグメンテーションをEdgeTAMで精緻化し、1枚のセマンティックマップに統合する。
 
@@ -87,6 +93,8 @@ class SemanticRefiner:
 
         resized: リサイズ済み（正規化前）の画像。EdgeTAMエンコーダの入力と、初期マスクの縁を整えるガイドになる。
         feats: EdgeTAMエンコーダの出力（粗い判定の前に SegmentationRunner が 1 回だけ実行したもの）。
+        region_logits: 最終の名前付けの根拠（パッチごとの領域番号 (N,) -> 番号ごとの前景プロンプトのロジット。CoarseSegmenter.final_region_logits）。
+            None なら名前付けをせず、粗い段階のクラスのまま。
 
         Returns: RefineOutput（各フィールドの意味はそちら）。
         """
@@ -115,7 +123,14 @@ class SemanticRefiner:
         #    格子状に並んだ小物体（隙間が 1 パッチ未満で、1 つの塊になる）を、セルごとに 1 個ずつに分ける
         self._separate_lattice(inputs, state, resized, feats)
 
-        # 5. 元画像の大きさへ戻す（作業解像度が同じならそのまま）
+        # 5. EdgeTAM が切り出した物体ごとに、名前を決め直す（前景のマスクは変えない）
+        if region_logits is not None:
+            with Timer("    ┌ 最終の名前付け処理時間"):
+                state.semantic_map, prompt_indices = name_final_regions(
+                    state.semantic_map, prompt_indices, region_logits, self.estimator.grid, self.min_region_divisor
+                )
+
+        # 6. 元画像の大きさへ戻す（作業解像度が同じならそのまま）
         semantic_map = state.semantic_map
         if inputs.size != (width, height):
             semantic_map = cv2.resize(semantic_map, (width, height), interpolation=cv2.INTER_NEAREST)

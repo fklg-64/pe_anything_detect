@@ -11,6 +11,7 @@ OpenVINO 版（configs/ov_config.yaml）で実行する。
 import argparse
 import io
 import sys
+from functools import partial
 from pathlib import Path
 
 import cv2
@@ -356,7 +357,8 @@ def main() -> None:
         return original_rescue(inputs, state, class_components)
 
     estimator.build_prior_map, session.decode_prompts, refiner._rescue_uncovered = build_prior, decode, rescue
-    refined = refiner.refine(resized, foreground_map, fg_after, labels_after, labels_list, width, height, edgetam_features)
+    refined = refiner.refine(resized, foreground_map, fg_after, labels_after, labels_list, width, height, edgetam_features,
+                             region_logits=partial(coarse.final_region_logits, patch_features))
     del estimator.build_prior_map, session.decode_prompts, refiner._rescue_uncovered  # インスタンスの差し替えを外す（クラスのメソッドに戻る）
 
     n_fg = sum(refined.point_labels)

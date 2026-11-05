@@ -288,6 +288,21 @@ class CoarseSegmenter:
             prompt_index, components, blobs, blob_logits, graph, EDGE_PROPAGATION_ALPHA, EDGE_PROPAGATION_ITERATIONS
         )
 
+    def final_region_logits(self, patch_features: np.ndarray, region_labels: np.ndarray) -> np.ndarray:
+        """精緻化の後の名前付け（region_relabel.name_final_regions）の根拠。領域番号 (N,) -> 番号 0.. ごとの前景プロンプトのロジット (最大番号+1, 前景プロンプト数)。
+
+        CLS を含まない代表トークン（extract_region_tokens。領域のパッチだけ）と、CLS 込みの代表トークン（extract_cluster_tokens。粗い判定のクラスタと同じ）の
+        照合の和。CLS なしは領域ごとの違いをよく表し、CLS 込みは画像全体を共通の基準にして名前のばらつきを抑える（正解の物体の領域で、種類の分離 V が
+        CLS なし 0.561・CLS 込み 0.527・和 0.580）。
+        """
+        foreground_text = self.fgbg_text_features[: len(self.foreground_prompts)]
+        tokens = self.extractor.extract_region_tokens(patch_features, region_labels)
+        logits = CLIP_LOGIT_SCALE * normalize_rows(tokens) @ foreground_text.T
+        cls_tokens = np.asarray(self.extractor.extract_cluster_tokens(patch_features, region_labels))
+        rows = min(len(logits), len(cls_tokens))
+        logits[:rows] += CLIP_LOGIT_SCALE * normalize_rows(cls_tokens[:rows]) @ foreground_text.T
+        return logits
+
     # =========================================================================
     # 粗いセマンティックラベル
     # =========================================================================
