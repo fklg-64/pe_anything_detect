@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -9,6 +9,15 @@ class ClusterView(NamedTuple):
 
     labels: np.ndarray       # パッチごとのクラスタ番号（平坦）
     index_list: List[int]    # クラスタ番号ごとの対応プロンプト番号（前景プロンプト -> 背景プロンプトの通し番号）
+
+
+@dataclass
+class InstanceResult:
+    """密集した長方形の物体を 1 個ずつに分けた結果（config の dense_instances が真のとき。rect_separator.py）。"""
+
+    instance_map: np.ndarray           # (height, width) uint16。0=なし、1~=インスタンス（EdgeTAM の予測 IoU の高い順。重なる画素は面積の小さい方）
+    scores: np.ndarray                 # (インスタンス数,) 各インスタンスの EdgeTAM の予測 IoU
+    size: Tuple[float, float]          # 敷き詰めた長方形の大きさ（長辺, 短辺）。image_size 四方の入力の画素
 
 
 @dataclass
@@ -35,3 +44,6 @@ class SegmentationResult:
 
     # 精緻化の中間結果（名前 -> 0〜1 の2次元配列。保存時に元画像サイズへ拡大する）
     debug_images: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    # 密集した長方形の物体のインスタンス分離（dense_instances が偽、前景が無い、大きさが求まらないときは None）
+    instances: Optional[InstanceResult] = None

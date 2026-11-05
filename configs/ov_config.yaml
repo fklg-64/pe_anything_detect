@@ -57,6 +57,18 @@ show_result: false
 # output_dir直下に結果の一覧HTML（index.html。元画像と各結果画像・処理時間）を出力するか？
 save_gallery_html: true
 
+# 同じクラスの接触した物体を 1 個ずつに分ける（インスタンス分離。docs/instance_segmentation.md。結果は SegmentationResult.instance_map）。
+# EdgeTAMのデコーダーを物体の数だけ追加で実行するので、既定は無効。重なった物体は分けられない
+instance_split: false
+# 分け方: proposals（点ごとに提案を作って選別。接触した同種の物体で最も安定）/ merge（過分割 → デコーダーの一貫性とくびれで結合。離れた物体を過分割しにくい）
+instance_method: "proposals"
+
+# 向き・大きさが混在して接した長方形の物体（積んだ荷物・並べた部品）を 1 個ずつのインスタンスに分けるか？（学習なし。result.instances に入る）
+#   false: 分けない（従来どおり）
+#   true : 最終結果の前景に対して、大きさ（長辺・短辺）を画像から求め、その大きさの長方形を敷き詰めて EdgeTAM で 1 個ずつ切り出す。追加で 約 0.3 秒（OpenVINO 版）。
+#          長い直線の縁を持つ細長い長方形の密集向き（散らばった小さい部品には当たらない）。image_size は 512 のとき（core/common/rect_separator.py）
+dense_instances: false
+
 # 前景と判断するための自信度合い
 foreground_threshold: 0.5
 

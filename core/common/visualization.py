@@ -13,6 +13,12 @@ from core.common.params import (
     CLUSTER_COLOR_PALETTE,
     DEBUG_DIR_NAME,
     FOREGROUND_OVERLAY_ALPHA,
+    INSTANCE_HUE_STEP,
+    INSTANCE_SATURATION,
+    INSTANCE_SPLIT_HUE_STEP,
+    INSTANCE_SPLIT_LABEL_SCALE,
+    INSTANCE_SPLIT_OVERLAY_ALPHA,
+    INSTANCE_VALUE,
     LEGEND_FONTSIZE,
     POINT_COLOR_NEGATIVE,
     POINT_COLOR_POSITIVE,
@@ -83,6 +89,10 @@ class ResultSaver:
                 # 精緻化の中間結果
                 pool.submit(self._save_debug_images, save_dir / DEBUG_DIR_NAME, size, result.debug_images),
             ]
+            if result.instance_map is not None:
+                jobs.append(pool.submit(self._save_instance_result, save_dir, image_raw, result.instance_map))
+            if result.instances is not None:
+                jobs.append(pool.submit(self._save_instances, save_dir, image_raw, result.instances.instance_map))
             self._save_semantic_legend(save_dir, overlay, result.semantic_map, colors, class_names)
             for job in jobs:
                 job.result()  # 書き出しの例外をここで再送出する
@@ -147,6 +157,55 @@ class ResultSaver:
         colored_mask[:, :, 2] = ((semantic_map > 0) * 255).astype(np.uint8)
         overlay = cv2.addWeighted(image_cv, 1.0 - FOREGROUND_OVERLAY_ALPHA, colored_mask, FOREGROUND_OVERLAY_ALPHA, 0)
         cv2.imwrite(str(save_dir / "foreground_overlay_edgetam.png"), overlay)
+
+    @staticmethod
+    def _save_instance_result(save_dir: Path, image_raw: np.ndarray, instance_map: np.ndarray) -> None:
+        """インスタンス分離（instance_split）の ID 画像（パレット付き PNG）と、元画像への重畳（輪郭と番号つき）を保存する。"""
+        count = int(instance_map.max())
+        hues = (np.arange(count + 1) * INSTANCE_SPLIT_HUE_STEP % 180).astype(np.uint8)
+        hsv = np.stack([hues, np.full_like(hues, 200), np.full_like(hues, 255)], axis=-1)[:, None, :]
+        colors = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[:, 0, :]
+        colors[0] = 0
+
+        index_image = Image.fromarray(instance_map.astype(np.uint8), mode="P") if count < 256 else None
+        if index_image is not None:
+            index_image.putpalette(colors.flatten().tolist())
+            index_image.save(save_dir / "instance_map.png")
+
+        overlay = image_raw.copy()
+        foreground = instance_map > 0
+        overlay[foreground] = (INSTANCE_SPLIT_OVERLAY_ALPHA * colors[instance_map][foreground]
+                               + (1 - INSTANCE_SPLIT_OVERLAY_ALPHA) * image_raw[foreground]).astype(np.uint8)
+        for k in range(1, count + 1):
+            body = (instance_map == k).astype(np.uint8)
+            contours, _ = cv2.findContours(body, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(overlay, contours, -1, (255, 255, 255), 2)
+            ys, xs = np.nonzero(body)
+            if len(ys):
+                cv2.putText(overlay, str(k), (int(xs.mean()), int(ys.mean())), cv2.FONT_HERSHEY_SIMPLEX,
+                            INSTANCE_SPLIT_LABEL_SCALE, (0, 0, 0), 4)
+                cv2.putText(overlay, str(k), (int(xs.mean()), int(ys.mean())), cv2.FONT_HERSHEY_SIMPLEX,
+                            INSTANCE_SPLIT_LABEL_SCALE, (255, 255, 255), 2)
+        cv2.imwrite(str(save_dir / "instance_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    def _save_instances(self, save_dir: Path, image_raw: np.ndarray, instance_map: np.ndarray) -> None:
+        """密集物体（dense_instances）のインスタンスマップ（ラベルを着色した画像）と、元画像に色と境界線を重畳した画像を保存。
+        instance_split の保存（instance_map.png / instance_overlay.png）と重ならないよう、rect_ を付ける。"""
+        count = int(instance_map.max())
+        hues = (np.arange(1, count + 1) * INSTANCE_HUE_STEP) % 1.0
+        hsv = np.stack([hues * 179, np.full(count, INSTANCE_SATURATION * 255), np.full(count, INSTANCE_VALUE * 255)], axis=1).astype(np.uint8)
+        colors = np.vstack([np.zeros((1, 3), np.uint8), cv2.cvtColor(hsv[None], cv2.COLOR_HSV2RGB)[0]])    # 0 番（インスタンスなし）は黒
+        colored = colors[instance_map]
+        cv2.imwrite(str(save_dir / "rect_instance_map.png"), cv2.cvtColor(colored, cv2.COLOR_RGB2BGR))
+        overlay = image_raw.copy()
+        found = instance_map > 0
+        overlay[found] = cv2.addWeighted(image_raw, 1.0 - self.overlay_alpha, colored, self.overlay_alpha, 0)[found]
+        label = instance_map.astype(np.int32)
+        boundary = np.zeros(label.shape, bool)
+        boundary[:, 1:] |= label[:, 1:] != label[:, :-1]
+        boundary[1:, :] |= label[1:, :] != label[:-1, :]
+        overlay[boundary & found] = 255
+        cv2.imwrite(str(save_dir / "rect_instance_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
     # -------------------------------------------------------------------------
     # 粗い推定の中間結果

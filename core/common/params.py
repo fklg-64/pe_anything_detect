@@ -104,6 +104,102 @@ LATTICE_PHASE_PROBES = 16
 # デコーダーの予測 IoU（マスクと正解の IoU の予測値）が、この値以上のマスクを物体として採る。0.5 は、物体と一致した（マッチした）とみなす IoU の基準
 LATTICE_MIN_PREDICTED_IOU = 0.5
 
+# --- インスタンス分離（instance_splitter.py。config の instance_split が真のときだけ動く。同じクラスの接触した物体を 1 個ずつに分ける。docs/instance_segmentation.md） ---
+# 画像面積に対する、インスタンスの最小面積の割合（これ未満は捨てる）
+INSTANCE_MIN_AREA_RATIO = 0.0002
+# 距離変換の watershed を、この倍率に縮小して行う（全解像度では重いため）
+INSTANCE_EDT_SCALE = 0.25
+# 過分割に使う距離変換の山の高さ（領域の最大半径に対する割合）。小さいほど細かく分ける。どちらの方式も、ここで分けた断片が出発点になる
+INSTANCE_OVERSEG_H_FRAC = 0.1
+# 提案方式（proposals）: 提案のマスクのうち、クラスの領域に収まる割合の下限 / 既に採った物体に覆われていない新しい面積の割合の下限 / 重複とみなす IoU
+INSTANCE_PROPOSAL_INSIDE = 0.85
+INSTANCE_PROPOSAL_NEW_FRACTION = 0.5
+INSTANCE_PROPOSAL_NMS_IOU = 0.5
+# 結合方式（merge）: 隣り合う断片の一方を指したときのマスクが、もう一方の面積をこの割合以上覆えば同じ物体の候補。
+# かつ、断片の境界の長さが小さい方の直径のこの割合以上（くびれが無い）なら結合する
+INSTANCE_MERGE_COVER = 0.5
+INSTANCE_MERGE_NECK = 0.7
+
+# --- 密集した長方形の物体のインスタンス分離（rect_size.py / rect_tiling.py / rect_separator.py。config の dense_instances が真のときだけ動く） ---
+# 向き・大きさが混在して接した細長い長方形の物体（積んだ荷物・並べた部品）を 1 個ずつに分ける。学習はしない。物体の大きさ（長辺 L・短辺 S）は画像に 1 つと仮定し、
+#   ① 隣り合う平行な縁の間隔のヒストグラムから L・S を求め（rect_size.py）、② その大きさの長方形を前景に敷き詰め（rect_tiling.py）、
+#   ③ 長方形のマスク + 軸に平行な箱 + 中心の点で EdgeTAM をデコードして 1 個ずつ切り出す（rect_separator.py）。
+# 値は tools/experiments/dense_instances/ で選んだ（合成の積み荷 60 枚（開発 36・評価 24）と実画像 5 枚で選び、設定を固定してから独立した合成 30 枚で確かめた。
+# ただし RECT_DOUBLING は、独立した 30 枚の結果も見てから選んだ。報告: outputs/dense_instances/mixed.html 9 章）。
+# 長い直線の縁を持つ細長い長方形向き。散らばった小さい部品（短辺 24〜41 画素）では大きさが当たらない。画素数は、すべて作業解像度 image_size = 512 の画素
+RECT_IMAGE_SIZE = 512
+
+# ① 大きさ: 隣り合う平行な縁の間隔のヒストグラム
+# 画像を回す向きの刻み（度）。RECT_SCAN_HALF・RECT_SCAN_ANGLE_STEP と合わせて時間と精度を選ぶ（合成 90 枚 + 実画像 5 枚の F1 と、本体込みの処理時間）:
+#   5 度刻み・走査 128 画素 / 15 度（C1）0.805・633ms、7.5・96 / 15（C2）0.785・554ms、10・96 / 20（C3。既定）0.775・504ms、10・走査なし（C5）0.760・404ms
+RECT_GAP_ANGLE_STEP = 10.0
+# 縁の強さを求める前の平滑化（ガウシアンの標準偏差。画素）
+RECT_GRADIENT_SIGMA = 1.0
+# 前景（縁が前景の上にあるか調べる範囲）を膨らませる正方形の一辺（画素）。物体の縁は前景の外周にあるので、少し広げる
+RECT_FOREGROUND_DILATE = 5
+# 縦に続く縁だけを残す最小値フィルタの長さ（画素）。S 用は長辺どうしの継ぎ目（長い）だけ、L 用は短辺の端（短い）まで数える。256 に縮小して数えると S の当たりが 0.85 に落ちる
+RECT_SHORT_EDGE_LINE = 33
+RECT_LONG_EDGE_LINE = 9
+# 行の上の縁の極大を探す幅（画素）
+RECT_EDGE_NMS = 9
+# 数える縁の間隔の範囲（画素）。下限 RECT_MIN_GAP 未満は縁の二重線などで、物体の大きさではない
+RECT_MIN_GAP = 16
+RECT_MAX_GAP = 300
+# ヒストグラムの平滑化（標準偏差。間隔の画素）
+RECT_HISTOGRAM_SMOOTH_SIGMA = 1.0
+# S: ヒストグラムの極大のうち、最大のこの割合以上のものの中で最も小さい間隔（基本周期）を採る。隣り合う縁だけ数えるので、2 個分の間隔は現れない（0.6〜0.95 で結果は変わらない）
+RECT_PEAK_RATIO = 0.8
+# L の候補: S のこの倍より長い間隔の極大のうち、（間隔 ^ RECT_LONG_GAP_POWER × 値）が最大のもの。間隔で重みづけるのは、同じ行の長さを占める割合に近づけるため（1〜3 で当たりが 0.55〜0.88 に動く。2 を選んだ）
+RECT_LONG_MIN_RATIO = 1.4
+RECT_LONG_GAP_POWER = 2.0
+
+# ② L の補正: L の候補が 2 個分に見えるとき（端と端が接して並ぶ配置）だけ、敷き詰めの質で直す。候補の梯子は、60 から 1.2 倍刻みの 9 段（60 … 258 画素）のうち、
+# L の候補の RECT_SCAN_LOW_RATIO 倍以上（かつ S の RECT_SCAN_MIN_ASPECT 倍以上）、RECT_SCAN_HIGH_RATIO 倍以下のものと、L の候補自身
+RECT_LADDER_BASE = 60.0
+RECT_LADDER_RATIO = 1.2
+RECT_LADDER_STEPS = 9
+RECT_SCAN_LOW_RATIO = 0.45
+RECT_SCAN_MIN_ASPECT = 1.3
+RECT_SCAN_HIGH_RATIO = 1.15
+# 梯子の走査の敷き詰め: 画像を縮小する大きさ（画素）・向きの刻み（度）・候補の上限
+RECT_SCAN_HALF = 96
+RECT_SCAN_ANGLE_STEP = 20.0
+RECT_SCAN_TOP = 500
+# L の候補が敷き詰めの質で選んだ長さのこの倍以上なら、L の候補は 2 個分とみなして敷き詰めの長さを採る（1 個分と 2 個分の中間。1.3〜1.7 で結果はほぼ変わらない）
+RECT_DOUBLING = 1.5
+
+# ② 敷き詰め: 長方形 (L, S, 向き) を各位置に置いた点数（前景の割合 ^ RECT_COVERAGE_POWER × 4 辺の縁の強さ）の極大から、点数の高い順に、前景の割合が RECT_MIN_COVERAGE 以上で、
+# すでに選んだ長方形との重なりが自分の面積の RECT_MAX_OVERLAP 以下のものを選ぶ（貪欲）。縁の強さは、画像の縁の強さの RECT_EDGE_SCALE_PERCENTILE 分位点で割って RECT_EDGE_CLIP で打ち切る
+# 最終の敷き詰め: 画像を縮小する大きさ（画素）・向きの刻み（度）・候補の上限
+RECT_TILE_HALF = 256
+RECT_TILE_ANGLE_STEP = 15.0
+RECT_TILE_TOP = 800
+RECT_COVERAGE_POWER = 4
+RECT_MIN_COVERAGE = 0.8
+RECT_MAX_OVERLAP = 0.2
+RECT_EDGE_SCALE_PERCENTILE = 90
+RECT_EDGE_CLIP = 1.5
+# 点数の極大を探す正方形の一辺（画素。縮小した画像の）
+RECT_CANDIDATE_WINDOW = 5
+
+# ③ デコード: 初期マスクは長方形の内側 +PRIOR_LOGIT_RANGE・外側 -PRIOR_LOGIT_RANGE（長方形は RECT_MASK_SHRINK 倍に縮める）。箱は縮めた長方形の外接矩形（軸に平行）、点は中心。
+# 向きを戻さず再エンコードなしで 1 個ずつ切り出せる（正解の姿勢で recall 1.00。向き ±10°・大きさ 0.7〜1.2 倍まで許容）
+RECT_MASK_SHRINK = 0.85
+# デコーダーの 3 つの候補のうち、使う候補の番号（検証はすべてこの候補で行った）
+RECT_MASK_CANDIDATE = 1
+# デコードの窓（image_embed のトークン数。1 トークン = 16 画素）: 箱の長辺 / 16 + RECT_WINDOW_MARGIN_TOKENS を RECT_WINDOW_TOKEN_STEP の倍数に切り上げ、RECT_WINDOW_MIN_TOKENS 〜 RECT_WINDOW_MAX_TOKENS に収める。
+# 窓の大きさごとに一括でデコードする
+RECT_WINDOW_MARGIN_TOKENS = 3
+RECT_WINDOW_TOKEN_STEP = 4
+RECT_WINDOW_MIN_TOKENS = 8
+RECT_WINDOW_MAX_TOKENS = 32
+# 物体として採るマスクの下限: 面積（画素）と予測 IoU（0.5 は、物体と一致したとみなす IoU の基準）
+RECT_MIN_AREA = 20
+RECT_MIN_PREDICTED_IOU = 0.5
+# 重複の除去: 予測 IoU の高い順に採り、採った結果と IoU が RECT_NMS_IOU 以上、または小さい方の面積の RECT_NMS_CONTAIN 以上が重なるものを捨てる
+RECT_NMS_IOU = 0.3
+RECT_NMS_CONTAIN = 0.5
+
 # --- OpenVINO 実行環境（core/openvino/runtime_utils.py） ---
 # pip 版 openvino との衝突を避けるため sys.path / PYTHONPATH から外すシステム版 OpenVINO の場所
 SYSTEM_OPENVINO_DIR = "/opt/intel/openvino"
@@ -175,6 +271,14 @@ CLUSTER_COLOR_PALETTE = (
     240, 128, 128,
     255, 105, 180,
 )
+# インスタンスマップ（密集物体の分離）の色: インスタンスごとに色相をこの割合ずつずらす（黄金比。隣り合う番号が似た色にならない）。彩度・明度は固定
+INSTANCE_HUE_STEP = 0.618033988749895
+INSTANCE_SATURATION = 0.75
+INSTANCE_VALUE = 1.0
+# インスタンス分離（instance_split）の可視化: 色相の刻み（HSV の H は 0〜179。黄金角に近い値で、隣り合う番号の色が離れる）、重畳の不透明度、番号の文字の大きさ
+INSTANCE_SPLIT_HUE_STEP = 47
+INSTANCE_SPLIT_OVERLAY_ALPHA = 0.5
+INSTANCE_SPLIT_LABEL_SCALE = 1.0
 # 前景オーバーレイ（粗い前景マスク・EdgeTAM最終マスク）の赤の不透明度
 FOREGROUND_OVERLAY_ALPHA = 0.3
 # 前景オーバーレイに描くプロンプト点の半径(px)と色(BGR)。正例=緑、負例=赤

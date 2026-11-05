@@ -263,6 +263,7 @@ flowchart LR
 | `edgetam_refine_iterations` | 2 | デコーダの反復回数 |
 | `semantic_max_side` | 1024 | マスク演算の作業解像度（長辺） |
 | `worker_threads` | 2 | 領域の推定などを重ねるスレッド数（0 で重ねない。出力は変わらない） |
+| `dense_instances` | false | 長方形の物体を 1 個ずつに分ける処理を、② の後に行うか（[rect_instances.md](rect_instances.md)） |
 
 `core/common/params.py` の固定値:
 

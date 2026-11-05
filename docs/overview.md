@@ -10,6 +10,7 @@
 | [coarse_segmentation.md](coarse_segmentation.md) | ① 粗いセマンティックセグメンテーション |
 | [detailed_segmentation.md](detailed_segmentation.md) | ② 詳細セグメンテーション |
 | [lattice_detection.md](lattice_detection.md) | ② の格子の検出（シリンジの巣の画像で段階ごとに） |
+| [rect_instances.md](rect_instances.md) | 密集した長方形の物体の 1 個ずつの分離（`dense_instances`。既定は無効） |
 | [method_history.md](method_history.md) | これまでに試した手法と、現在の手法との比較 |
 
 ## 入力と出力
@@ -18,6 +19,7 @@
 |---|---|
 | 入力 | RGB 画像 1 枚、前景/背景のテキストプロンプト（`prompts/`） |
 | 出力 | `semantic_map`（元画像と同じ大きさ。0 = 背景、1〜 = 前景クラス）。クラスは前景プロンプトに対応 |
+| 出力（`dense_instances: true` のとき） | `instances`: 密集した長方形の物体のインスタンスマップ（元画像と同じ大きさ。0 = なし、1〜 = 1 個ずつ）・予測 IoU・長方形の大きさ（[rect_instances.md](rect_instances.md)） |
 
 左から、入力・KMeans のクラスタ・粗い前景マスク・EdgeTAM に渡す点・最終結果。コイン（前景が 1 種類）:
 
@@ -56,6 +58,9 @@ flowchart TD
     C -->|"前景マスク・前景確信度・粗いラベル"| R
     ET -->|"特徴を使い回す"| R
     R --> OUT["semantic_map"]
+    R -.->|"dense_instances のとき"| RC["長方形の物体の分離<br/>大きさ → 敷き詰め → 1 個ずつデコード"]
+    ET -.->|"特徴を使い回す"| RC
+    RC -.-> OUT2["instances"]
 ```
 
 粗い段階は **「だいたいどこに何があるか」**、詳細な段階は **「その正確な輪郭」** を決める。EdgeTAM エンコーダは 1 回だけ実行し、① の伝播と ② のデコードで使い回す。
@@ -107,6 +112,7 @@ MVTec cable の 1 枚（第 6 層のモデル、この資料を作った PC）�
 
 - 時間の大半は、特徴抽出（PE + EdgeTAM エンコーダ）と、クラス・領域ごとのデコード。デコードの回数は「（クラス数 + 再推定した成分数）× 反復回数」。
 - 格子状の物体を検出したときだけ、② の最後に約 +150ms（006 の 80 個）。検出したかの判定は毎回走り、約 14ms。
+- `dense_instances: true` のときだけ、② の後に約 +220ms（既定の設定。大きさの推定 約 160・敷き詰め 約 80・デコード 約 45。[rect_instances.md](rect_instances.md)）。
 - NumPy の BLAS のスレッドは 1 に制限している（`core/openvino/runtime_utils.py`）。既定の 20 スレッドは、行列積の後も待機して OpenVINO のスレッドとコアを取り合い、直後の推論を 2〜4 倍遅くする。
 - **コードの整理（2026-10-31）の前後の比較**: 同じ画像を、整理前と整理後で実行順を入れ替えながら 6 周測った。画像ごとの最小値の比（整理後 / 整理前）は 0.93〜1.00、中央値 0.986。出力は 42 枚で全項目一致。測定のばらつきが大きく（同じコードどうしでも ±1〜2%、周ごとの合計は ±10〜20%）、数 % の差は検出できない。
 
@@ -119,11 +125,14 @@ flowchart TD
     RUN --> REF["SemanticRefiner<br/>semantic_refiner.py"]
     RUN --> SES["EdgeTamSession<br/>edgetam_session.py"]
     RUN --> PAR["Workers / JobGroup<br/>parallel.py"]
+    RUN --> INST["InstanceSplitter<br/>instance_splitter.py"]
+    RUN --> RECT["RectSeparator<br/>rect_separator.py<br/>rect_size.py · rect_tiling.py"]
     REF --> EST["RegionEstimator<br/>region_estimator.py<br/>object_points.py"]
     REF --> LAT["LatticeSeparator<br/>lattice_separator.py<br/>lattice.py"]
     REF --> PAR
     EST --> SES
     LAT --> SES
+    RECT --> SES
     COARSE --> CLIP["CLIPBackend<br/>openvino/feature_extractor.py<br/>torch/feature_extractor.py"]
     SES --> ETB["EdgeTAM backend<br/>openvino/edgetam_runner.py<br/>torch/edgetam_runner.py"]
     HELP["mask_utils.py · params.py · utils.py"] -.-> COARSE
@@ -139,6 +148,8 @@ flowchart TD
 | ② 1 領域の推定 | `core/common/region_estimator.py`（`RegionEstimator`）・`object_points.py` |
 | EdgeTAM の呼び出し口 | `core/common/edgetam_session.py`（`EdgeTamSession`。lock・前後処理） |
 | ② 格子状の小物体の分離 | `core/common/lattice.py`（検出）・`lattice_separator.py`（`LatticeSeparator`） |
+| 同じクラスの接触した物体のインスタンス分離（`instance_split`。[instance_segmentation.md](instance_segmentation.md)） | `core/common/instance_splitter.py`（`InstanceSplitter`。距離変換の幾何は `mask_utils.py`） |
+| 密集した長方形の物体の分離（`dense_instances`） | `core/common/rect_size.py`（大きさ）・`rect_tiling.py`（敷き詰め）・`rect_separator.py`（`RectSeparator`。デコードと選別） |
 | 並行処理 | `core/common/parallel.py`（`Workers`・`JobGroup`） |
 | 点の選択・連結成分・ガイデッドフィルタ・隙間埋め | `core/common/mask_utils.py` |
 | 固定ハイパーパラメータ・表示の定数 | `core/common/params.py` |
@@ -161,6 +172,7 @@ flowchart TD
 | `ov_num_thread` | 4 | OpenVINO のスレッド数 |
 | `ov_static_shape` | true | 入力の大きさを固定してコンパイルする（約 12% 速い。出力は動的形状と bit 単位では一致しない）。true のときは、EdgeTAM のグラフも書き換える（出力は同じ） |
 | `worker_threads` | 2 | 推論と重ねて整形を実行する Python のスレッド数（0 で重ねない。出力は変わらない） |
+| `dense_instances` | false | 密集した長方形の物体を 1 個ずつのインスタンスに分けるか（[rect_instances.md](rect_instances.md)。真だと追加で 約 0.2 秒。`image_size` は 512 のとき） |
 | `model_dir` | `./weights/openvino_models` | OpenVINO モデルのフォルダ |
 
 コードに固定した値（近傍 3・logit 幅 8・スコア重み 0.5 など）は `core/common/params.py`。

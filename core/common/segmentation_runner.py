@@ -9,6 +9,8 @@
   5. 粗いセマンティック   assign_semantic_labels（パッチ単位のラベル）
   6. 精緻化               SemanticRefiner.refine（クラスごとに EdgeTAM デコーダ -> 1 枚のセマンティックマップ）
                           <- この間に、領域の推定（NumPy の整形）を、別の領域のデコードと重ねる
+  7. インスタンス分離     InstanceSplitter.split（config の instance_split が真のときだけ。同じクラスの接触した物体を 1 個ずつに分ける）
+  8. 密集物体の分離       RectSeparator.separate（config の dense_instances が真のときだけ。長方形の物体を 1 個ずつのインスタンスマップにする）
 
 重ねる処理は worker_threads のスレッドで実行する（parallel.py。0 なら重ねず、順に実行する）。結果は決まった順に反映するので、出力は変わらない。
 結果の保存は run() / ResultSaver（segment には含まれない）。
@@ -27,7 +29,9 @@ from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
 from core.common.edgetam_helper import EdgeTamHelper
 from core.common.edgetam_session import EdgeTamSession, Features
+from core.common.instance_splitter import InstanceSplitter
 from core.common.parallel import Job, Workers
+from core.common.rect_separator import RectSeparator
 from core.common.result import SegmentationResult
 from core.common.semantic_refiner import SemanticRefiner
 from core.common.gallery import ORIGINAL_STEM, write_gallery_html
@@ -59,6 +63,10 @@ class SegmentationRunner:
         self.session = EdgeTamSession(edgetam)
         self.coarse = CoarseSegmenter(extractor, config)
         self.refiner = SemanticRefiner(self.session, extractor.feature_size, config, self.workers)
+        # 同じクラスの接触した物体を 1 個ずつに分ける（docs/instance_segmentation.md。EdgeTAM のデコーダーを多く使うので既定は無効）
+        self.instance_splitter = InstanceSplitter(self.refiner.estimator, config) if config["instance_split"] else None
+        # 向き・大きさが混在して接した長方形の物体を 1 個ずつに分ける（追加で 約 0.3 秒。細長い長方形の密集向きなので、既定は偽）
+        self.rect_separator = RectSeparator(self.session) if config["dense_instances"] else None
         self.saver = ResultSaver(config)
         self.save_gallery_html = config["save_gallery_html"]
         self._gallery_times: dict[Path, float] = {}  # 一覧HTML用の 保存先 -> 処理時間(ms)
@@ -106,6 +114,11 @@ class SegmentationRunner:
             with Timer("インスタンス分離処理時間"):
                 instance_map, instance_classes = self.instance_splitter.split(refined.semantic_map, edgetam_features)
 
+        instances = None
+        if self.rect_separator is not None:
+            with Timer("密集物体のインスタンス分離処理時間"):
+                instances = self.rect_separator.separate(resized, refined.semantic_map, edgetam_features)
+
         elapsed_time = time.time() - start
         Timer.log(f"Inference Time: {elapsed_time * 1000:.2f} ms")
 
@@ -123,6 +136,7 @@ class SegmentationRunner:
             instance_map=instance_map,
             instance_classes=instance_classes,
             debug_images=refined.debug_images,
+            instances=instances,
         )
 
     # -------------------------------------------------------------------------

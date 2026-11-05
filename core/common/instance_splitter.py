@@ -11,11 +11,12 @@ merge:     距離変換の watershed で過分割し、隣り合う断片の一�
 意味的な前景（semantic_map > 0）は変えない。PE の特徴は使わない（同じ種類の物体は同じ特徴になり、区別する手がかりが無い）。
 検証は docs/instance_segmentation.md。
 """
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import cv2
 import numpy as np
 
+from core.common.edgetam_session import Features
 from core.common.mask_utils import (
     fragment_adjacency,
     fragment_stats,
@@ -33,24 +34,25 @@ from core.common.params import (
     INSTANCE_PROPOSAL_NEW_FRACTION,
     INSTANCE_PROPOSAL_NMS_IOU,
 )
-from core.common.semantic_refiner import SemanticRefiner
+from core.common.region_estimator import RegionEstimator
 
 METHODS = ("proposals", "merge")
 
 
 class InstanceSplitter:
-    def __init__(self, refiner: SemanticRefiner, config: dict):
-        self.refiner = refiner
-        self.method = config.get("instance_method", "proposals")
+    def __init__(self, estimator: RegionEstimator, config: dict):
+        """estimator: 精緻化と共通の RegionEstimator（EdgeTAM の口・パッチ格子・点の数・デコードの反復回数・座標変換を借りる）。"""
+        self.estimator = estimator
+        self.session = estimator.session
+        self.method = config["instance_method"]
         if self.method not in METHODS:
             raise ValueError(f"instance_method は {METHODS} のどれか: {self.method}")
-        self.background_point_count = config["edgetam_background_point_count"]
 
     # =========================================================================
     # メインの流れ
     # =========================================================================
 
-    def split(self, semantic_map: np.ndarray, feats: Tuple) -> Tuple[np.ndarray, List[int]]:
+    def split(self, semantic_map: np.ndarray, feats: Features) -> Tuple[np.ndarray, List[int]]:
         """semantic_map（0 = 背景、1~ = クラス）を、インスタンスの ID 画像に分ける。
 
         feats: EdgeTAM エンコーダの出力。
@@ -91,19 +93,20 @@ class InstanceSplitter:
     def _background_points(self, semantic_map: np.ndarray) -> List[List[float]]:
         """背景の負例点（画像座標）。意味的な前景から離れた、画像の端につながる背景から選ぶ。"""
         height, width = semantic_map.shape
-        size = self.refiner.feature_size
-        foreground = cv2.resize((semantic_map > 0).astype(np.float32), (size, size), interpolation=cv2.INTER_AREA) > 0.02
-        points = select_background_points(foreground, self.background_point_count, None)
-        return self.refiner.transform_coords(points.tolist(), width, height)
+        grid_h, grid_w = self.estimator.grid
+        foreground = cv2.resize((semantic_map > 0).astype(np.float32), (grid_w, grid_h), interpolation=cv2.INTER_AREA) > 0.02
+        points = select_background_points(foreground, self.estimator.background_point_count, None)
+        return self.estimator.transform_coords(points.tolist(), width, height)
 
-    def _decode(self, feats: Tuple, positives, background, width: int, height: int) -> Tuple[np.ndarray, float]:
-        """正例点と背景の負例点で EdgeTAM のデコーダーを反復し、(低解像度のロジット, IoU 予測) を返す。"""
+    def _decode(self, feats: Features, positives, background, width: int, height: int) -> Tuple[np.ndarray, float]:
+        """正例点と背景の負例点で EdgeTAM のデコーダーを反復し、(低解像度のロジット, IoU 予測) を返す。最初の反復の初期マスクは、ロジット 0 の空のマスク。"""
         coords = [list(map(float, p)) for p in positives] + [list(map(float, p)) for p in background]
         labels = [1] * len(positives) + [0] * len(background)
-        mask_input: Optional[np.ndarray] = None
+        high_res_w, high_res_h = self.estimator.high_res_size
+        mask_input = np.zeros((1, high_res_h, high_res_w), np.float32)
         logit, score = None, 0.0
-        for _ in range(self.refiner.refine_iterations):
-            _, scores, logits = self.refiner.predict_decoder(coords, labels, feats, height, width, mask_input)
+        for _ in range(self.estimator.refine_iterations):
+            scores, logits = self.session.decode_prompts(coords, labels, feats, height, width, mask_input)
             best = int(np.argmax(scores))
             mask_input = logits[best:best + 1]
             logit, score = logits[best], float(scores[best])
@@ -111,8 +114,7 @@ class InstanceSplitter:
 
     def _low_res(self, region: np.ndarray) -> np.ndarray:
         """領域を、デコーダーのロジットと同じ大きさに縮めたマスク。"""
-        size = self.refiner.high_res_feature_size
-        return cv2.resize(region.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA) >= 0.5
+        return cv2.resize(region.astype(np.float32), self.estimator.high_res_size, interpolation=cv2.INTER_AREA) >= 0.5
 
     # =========================================================================
     # 提案方式

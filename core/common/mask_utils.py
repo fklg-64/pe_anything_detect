@@ -403,3 +403,117 @@ def propagate(values: np.ndarray, graph: sparse.csr_matrix, alpha: float, iterat
     for _ in range(iterations):
         propagated = (1.0 - alpha) * values + alpha * (graph @ propagated)
     return propagated
+
+
+# =============================================================================
+# インスタンス分離の幾何（距離変換の watershed）
+# =============================================================================
+
+def peak_point(mask: np.ndarray) -> Tuple[int, int]:
+    """マスクの最も内側の点 (x, y)（距離変換の最大）。外接矩形の中だけで計算する（全体と同じ結果で、速い）。"""
+    ys, xs = np.nonzero(mask)
+    y0, x0 = ys.min(), xs.min()
+    crop = mask[y0:ys.max() + 1, x0:xs.max() + 1]
+    dist = distance_transform_edt(np.pad(crop, 1))[1:-1, 1:-1]
+    y, x = np.unravel_index(int(np.argmax(dist)), dist.shape)
+    return int(x + x0), int(y + y0)
+
+
+def h_maxima_markers(dist: np.ndarray, h: float) -> np.ndarray:
+    """h-maxima（高さ h 未満の山を無視した極大）を、ラベル画像（int32）にする。"""
+    kernel = np.ones((3, 3), np.uint8)
+    rec = np.maximum(dist - h, 0).astype(np.float32)
+    dist = dist.astype(np.float32)
+    for _ in range(400):
+        new = np.minimum(cv2.dilate(rec, kernel), dist)
+        if np.array_equal(new, rec):
+            break
+        rec = new
+    peaks = (rec == cv2.dilate(rec, kernel)) & (rec > 0) & (dist > 0)
+    _, labels = cv2.connectedComponents(peaks.astype(np.uint8), connectivity=8)
+    return labels.astype(np.int32)
+
+
+def watershed_from_markers(landscape: np.ndarray, markers: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """landscape（小さいほど先に冠水。0〜1）と markers（> 0 の ID）で region の中を分割する。region の外は背景として扱う。"""
+    n = int(markers.max())
+    image = np.dstack([(255 * np.clip(landscape, 0, 1)).astype(np.uint8)] * 3)
+    seeds = markers.copy()
+    seeds[~region] = n + 1          # 領域の外を 1 つの標識にして、領域の外へ広がらないようにする
+    out = cv2.watershed(image, seeds)
+    out[out == n + 1] = 0
+    boundary = out < 0               # 境界（-1）は、最も近い物体に付ける
+    if boundary.any() and (out > 0).any():
+        _, (iy, ix) = distance_transform_edt(~(out > 0), return_indices=True)
+        out[boundary] = out[iy, ix][boundary]
+    out[~region] = 0
+    out[out < 0] = 0
+    return out
+
+
+def upsample_labels(labels: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """小さい解像度のラベル画像を region の大きさへ拡大する。region の中でラベルが 0 の画素は、最も近いラベルで埋める。"""
+    full = cv2.resize(labels.astype(np.int32), (region.shape[1], region.shape[0]), interpolation=cv2.INTER_NEAREST)
+    full[~region] = 0
+    missing = region & (full == 0)
+    if missing.any() and (full > 0).any():
+        _, (iy, ix) = distance_transform_edt(full == 0, return_indices=True)
+        full[missing] = full[iy, ix][missing]
+    return full
+
+
+def split_by_distance(region: np.ndarray, h_frac: float, scale: float) -> np.ndarray:
+    """距離変換の山（h-maxima。高さは連結成分の最大半径の h_frac 倍）をシードにした watershed。ラベル画像（0 = 領域外）を返す。"""
+    height, width = region.shape
+    size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    small = cv2.resize(region.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+    dist = distance_transform_edt(small)
+    n, comp = cv2.connectedComponents(small.astype(np.uint8), connectivity=8)
+    markers = np.zeros(small.shape, np.int32)
+    offset = 0
+    for i in range(1, n):
+        part = comp == i
+        d = np.where(part, dist, 0)
+        top = float(d.max())
+        if top <= 0:
+            continue
+        found = h_maxima_markers(d, max(h_frac * top, 1.0))
+        found[~part] = 0
+        markers[found > 0] = found[found > 0] + offset
+        offset = int(markers.max())
+    if offset == 0:
+        return np.zeros(region.shape, np.int32)
+    landscape = 1.0 - dist / max(float(dist.max()), 1e-6)
+    return upsample_labels(watershed_from_markers(landscape, markers, small), region)
+
+
+def fragment_adjacency(labels: np.ndarray) -> dict:
+    """隣り合う断片のペア (a, b)（a < b）と、境界の長さ（接する画素数）。"""
+    pairs = {}
+    kernel = np.ones((3, 3), np.uint8)
+    for value in np.unique(labels):
+        if not value:
+            continue
+        grown = cv2.dilate((labels == value).astype(np.uint8), kernel).astype(bool)
+        touching = labels[grown & (labels != value)]
+        for other, count in zip(*np.unique(touching[touching > 0], return_counts=True)):
+            if other > value:
+                key = (int(value), int(other))
+                pairs[key] = max(pairs.get(key, 0), int(count))
+    return pairs
+
+
+def fragment_stats(labels: np.ndarray) -> dict:
+    """断片ごとの (最内点 (x, y), 内接円の直径)。"""
+    stats = {}
+    for value in np.unique(labels):
+        if not value:
+            continue
+        body = labels == value
+        ys, xs = np.nonzero(body)
+        y0, x0 = ys.min(), xs.min()
+        crop = body[y0:ys.max() + 1, x0:xs.max() + 1]
+        dist = distance_transform_edt(np.pad(crop, 1))[1:-1, 1:-1]
+        py, px = np.unravel_index(int(np.argmax(dist)), dist.shape)
+        stats[int(value)] = ((int(px + x0), int(py + y0)), float(2 * dist.max()))
+    return stats

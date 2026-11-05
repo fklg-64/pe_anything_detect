@@ -242,8 +242,10 @@ flowchart LR
 固定値（`core/common/params.py` の `INSTANCE_*`）: 過分割の山の高さ 0.1、提案の収まる割合 0.85・新しい面積 0.5・重複 IoU 0.5、結合の覆う割合 0.5・くびれ 0.7。
 
 - **意味的な前景は変えない**。semantic_map のクラスごとの領域の中を分けるだけ（PE の特徴は使わない。理由は §6）。
-- **EdgeTAM のエンコードは 1 回**。`instance_split: true` で `use_edgetam_clustering: false` のときも、精緻化の前に 1 回だけ実行して共有する。
+- **EdgeTAM のエンコードは 1 回**。粗い判定・精緻化・インスタンス分離で同じ特徴を共有する（`EdgeTamSession`）。
 - **実験との一致**: 実験（`tools/experiments/instance_split/methods.py` の PR・MG）と、同じ意味的な結果・同じ特徴から、**インスタンスの分割が一致**（verify の 11 枚で確認。意味的な前景が空の 2 枚は両方とも 0 個）。OpenVINO 版でも動作する（`develop.py` と同じ構成で `run()` が保存まで通る）。
+- **pe+edgetam の構成（`EdgeTamSession`・`RegionEstimator`）への移植（2026-11-05）**: `InstanceSplitter(estimator, config)` は精緻化と同じ `RegionEstimator` から EdgeTAM の口・パッチ格子・背景点の数・デコードの反復回数・座標変換を借りる。初期マスクは、ロジット 0 の空のマスク（旧と同じ）。verify 72 枚（正解の意味的な結果）で旧実装の保存結果と比べて、**PyTorch 版は個数・PQ が 72/72 枚とも完全に一致**（proposals・merge とも）。OpenVINO 版は個数が 70/72（proposals）・71/72（merge）で、PQ は各条件で ±0.03 以内（数値の差による）。
+- **`dense_instances`（[rect_instances.md](rect_instances.md)）と同時に有効にできる**。結果の入れ物と保存名は別（こちらは `instance_map` / `instance_classes` と `instance_map.png`・`instance_overlay.png`、あちらは `instances` と `rect_instance_map.png`・`rect_instance_overlay.png`）。
 - **処理時間**（OpenVINO、FP32、4 スレッド。小さい物体が多い 1 枚の例）: 断片 19 個で、デコード 38 回 約 340ms、距離変換の watershed 約 60ms、合計 約 0.5 秒。物体が少なければ 0.1〜0.2 秒。**断片の数（領域の大きさと形）に比例する**ので、リアルタイム用途には重い。断片の最内点の距離変換は、外接矩形の中だけで計算する（全体と同じ結果で、1 断片 40ms → 3ms）。
 - **限界**: §5・§6 のとおり、重なった同種の物体は分けられない。本体の意味的な結果が前景を落とす・つなぐ画像（小さい物体、雑多な背景）では、分離の前に頭打ちになる。
 - 実験用のコード（`tools/experiments/instance_split/`）は、検証の再現のために残す。
