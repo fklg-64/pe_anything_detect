@@ -5,7 +5,7 @@ OpenVINO・PyTorch の推論は GIL を離すので、推論の最中に別ス�
 
   - EdgeTAM の特徴の kNN グラフ作り      PE の推論と重ねる           （SegmentationRunner）
   - 領域（クラス・取りこぼしの成分）の推定  次の領域のデコードと重ねる  （SemanticRefiner）
-  - クラスごとの小さな成分の検出          クラス間で重ねる            （mask_utils.remove_small_regions）
+  - クラスごとの小さな成分の検出          クラス間で重ねる            （detail/mask_cleanup.remove_small_regions）
 
 worker_threads が 0 のときは、スレッドを使わず、結果を取り出すとき（result()）にその場で実行する。
 """

@@ -1,10 +1,10 @@
 """説明資料（docs/coarse_segmentation.md §④）用の画像を作る: 前景のクラスの付け直しの、なし / ありを並べる。
 入力・粗いラベル（なし / あり）・最終結果（なし / あり）を、画像ごとに 1 行にする。
 
-    python tools/docs/make_relabel_doc_image.py [--images "PATH" ...] [--out docs/images/relabel_noodle.jpg]
+    python tools/docs/make_relabel_doc_image.py [--images "PATH" ...] [--out docs/images/relabel_noodle.jpg] [--model-dir DIR]
 
-「なし」は CoarseSegmenter._relabel_foreground を何もしない関数に差し替えて再現する（= 粗い判定のクラスタが付けたラベルのまま）。OpenVINO 版（configs/ov_config.yaml）で実行する。
-④ だけの効果を見るため、精緻化の後の名前付け（SemanticRefiner.refine の region_logits。docs/detailed_segmentation.md「7. 最終の名前付け」）は、なし・ありの両方で外す。
+「なし」は CoarseSegmenter.relabeler.relabel（ForegroundRelabeler）を何もしない関数に差し替えて再現する（= 粗い判定のクラスタが付けたラベルのまま）。OpenVINO 版（configs/ov_config.yaml）で実行する。
+④ だけの効果を見るため、精緻化の後の名前付け（SemanticRefiner.refine の patch_features。docs/detailed_segmentation.md「7. 最終の名前付け」）は、なし・ありの両方で外す。
 """
 import argparse
 import contextlib
@@ -44,18 +44,22 @@ def color_of(name: str, extra: dict) -> tuple:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--images", nargs="+", default=[str(DATASET / "noodle (2).png"), str(DATASET / "noodle (3).png")])
+    parser.add_argument("--images", nargs="+", default=[str(DATASET / "noodle (2).png")])
     parser.add_argument("--out", default="docs/images/relabel_noodle.jpg")
+    parser.add_argument("--model-dir", default=None, help="OpenVINO モデルのフォルダ。既定は設定の model_dir")
     args = parser.parse_args()
 
     config = load_config()
+    if args.model_dir:
+        config["model_dir"] = args.model_dir
     runner = SegmentationRunner(OVCLIPFeatureExtractor(config), OVEdgeTamRunner(config), config)
     coarse = runner.coarse
-    relabel = coarse._relabel_foreground
+    relabeler = coarse.relabeler
+    relabel = relabeler.relabel
     refine = runner.refiner.refine
 
     def refine_without_naming(*a, **k):  # 最後の名前付けを外す
-        k.pop("region_logits", None)
+        k.pop("patch_features", None)
         return refine(*a, **k)
 
     runner.refiner.refine = refine_without_naming
@@ -68,7 +72,7 @@ def main() -> None:
         base = cv2.resize(image, (DISPLAY, DISPLAY), interpolation=cv2.INTER_AREA)
         panels.append((f"{Path(path).stem}  入力", base))
         for label, enabled in (("付け直しなし", False), ("付け直しあり", True)):
-            coarse._relabel_foreground = relabel if enabled else (lambda prompt_index, *a, **k: prompt_index)
+            relabeler.relabel = relabel if enabled else (lambda prompt_index, *a, **k: prompt_index)
             with contextlib.redirect_stdout(io.StringIO()):
                 result = runner.segment(image)
             grid = result.foreground_mask.shape
@@ -84,7 +88,7 @@ def main() -> None:
             for k, p in enumerate(result.prompt_indices, start=1):
                 final = overlay(final, (semantic == k), color_of(prompts[p], extra), 0.55)
             panels.append((f"最終結果  {label}", final))
-    coarse._relabel_foreground = relabel
+    relabeler.relabel = relabel
     # 列: 入力 / 粗い（なし）/ 最終（なし）/ 粗い（あり）/ 最終（あり）の順に並んでいる
     save_panels(Path(args.out), panels, ncols=5, size=2.4)
 

@@ -3,7 +3,7 @@
 
     python tools/docs/make_points_doc_images.py [--images toothbrush/035 toothbrush/005] [--out docs/images/points_toothbrush.jpg]
 
-従来の選び方は core/common/mask_utils.prompt_points（RegionEstimator.foreground_points を差し替えて再現する）。OpenVINO 版（configs/ov_config.yaml）で実行する。
+従来の選び方は core/common/detail/prompt_points.prompt_points（RegionEstimator.foreground_points を差し替えて再現する）。OpenVINO 版（configs/ov_config.yaml）で実行する。
 MVTec の場所は --mvtec（既定: E:/WPy64-31241/datasets/mvtec_anomaly_detection）。正解は MVTec 配布物に無い fg_mask/<カテゴリ>/<番号>.png。
 """
 import argparse
@@ -19,7 +19,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.openvino.runtime_utils import make_compile_config  # noqa: F401  (import openvino より前に /opt/intel/openvino を外す)
-from core.common.mask_utils import prompt_points
+from core.common.detail.prompt_points import prompt_points
 from core.common.segmentation_runner import SegmentationRunner
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor

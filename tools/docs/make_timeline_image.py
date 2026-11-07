@@ -19,8 +19,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from core.common import mask_utils
-from core.common.region_estimator import RegionEstimator
+from core.common import segmentation_runner
+from core.common.detail import mask_cleanup
+from core.common.detail.region_estimator import RegionEstimator
 from core.common.segmentation_runner import SegmentationRunner
 from core.openvino.edgetam_runner import OVEdgeTamRunner
 from core.openvino.feature_extractor import OVCLIPFeatureExtractor
@@ -60,10 +61,9 @@ def instrument() -> None:
                 record(label, start, time.perf_counter())
         return wrapper
 
-    from core.common.coarse_segmentation import CoarseSegmenter
-    CoarseSegmenter.edge_graph_of = staticmethod(timed(CoarseSegmenter.edge_graph_of, "kNN グラフ"))
+    segmentation_runner.edge_graph_of = timed(segmentation_runner.edge_graph_of, "kNN グラフ")  # SegmentationRunner._start_edge_graph が呼ぶ名前
     RegionEstimator.estimate = timed(RegionEstimator.estimate, "領域の推定")
-    mask_utils._small_pieces = timed(mask_utils._small_pieces, "小領域の検出")
+    mask_cleanup._small_pieces = timed(mask_cleanup._small_pieces, "小領域の検出")
 
 
 # 帯の色: 種類ごと

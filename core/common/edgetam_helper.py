@@ -61,7 +61,7 @@ class EdgeTamHelper:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """モデル出力の後処理を行います (NumPy版)。(予測 IoU (マスク数,)、低解像度ロジット (マスク数, h, w)) を返します。
 
-        ロジットは絶対値 EDGETAM_LOGIT_CLIP 以下に収めます。マスクの二値化・拡大は呼び出し側（semantic_refiner）が必要な分だけ行います。
+        ロジットは絶対値 EDGETAM_LOGIT_CLIP 以下に収めます。マスクの二値化・拡大は呼び出し側（detail/refiner.py）が必要な分だけ行います。
         """
         low_res_masks = np.clip(low_res_masks, -EDGETAM_LOGIT_CLIP, EDGETAM_LOGIT_CLIP)
         iou_predictions = np.squeeze(iou_predictions, axis=0).astype(np.float32)

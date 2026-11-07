@@ -1,4 +1,4 @@
-"""全体で共有する小さなヘルパー（処理時間の計測、画像の読み込み・前処理、設定ファイルの読み込み）。"""
+"""全体で共有する小さなヘルパー（処理時間の計測、画像の読み込み・前処理、特徴量の数値演算、設定ファイルの読み込み）。"""
 
 import contextlib
 import cv2
@@ -107,6 +107,15 @@ def normalize_image(
         plane -= mean[c]
         plane /= std[c]
     return output
+
+# 特徴量の数値演算
+def normalize_rows(features: np.ndarray) -> np.ndarray:
+    """特徴 (N, C) を行ごとに L2 正規化する。"""
+    return features / (np.linalg.norm(features, axis=-1, keepdims=True) + 1e-8)
+
+def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
 # yaml設定データの読み込み
 def load_config(config_path: str = "./configs/ov_config.yaml") -> dict:

@@ -3,7 +3,7 @@
 
     python tools/docs/make_naming_doc_image.py --images PATH ... [--out docs/images/naming_types.jpg]
 
-「なし」は SemanticRefiner.refine に region_logits を渡さずに再現する（= 粗い段階のクラスの名前のまま）。OpenVINO 版（configs/ov_config.yaml）で実行する。
+「なし」は SemanticRefiner.refine に patch_features を渡さずに再現する（= 粗い段階のクラスの名前のまま）。OpenVINO 版（configs/ov_config.yaml）で実行する。
 """
 import argparse
 import contextlib
@@ -50,7 +50,7 @@ def main() -> None:
         return colors.setdefault(name, SEMANTIC_COLORS[1 + len(colors) % (len(SEMANTIC_COLORS) - 1)])
 
     def without_naming(*a, **k):
-        k.pop("region_logits", None)
+        k.pop("patch_features", None)
         return refine(*a, **k)
 
     panels = []

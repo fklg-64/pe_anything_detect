@@ -14,7 +14,7 @@ from typing import Union
 from PIL import Image
 
 MAX_WIDTH = 1200   # 資料で文字が読める幅。これを超える画像は縮小する
-JPEG_QUALITY = 80  # 80 で、図の文字・線が劣化して見えない（85 だと約 1.2 倍の容量）
+JPEG_QUALITY = 72  # 72 でも、図の文字・線は読める（80 は約 1.25 倍の容量。画像の合計 5MB の上限のため 2026-11-07 に 80 から下げた）
 
 
 def save_jpeg(image: Image.Image, dest: Union[str, Path], max_width: int = MAX_WIDTH, quality: int = JPEG_QUALITY) -> int:

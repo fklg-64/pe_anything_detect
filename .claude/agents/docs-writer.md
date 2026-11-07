@@ -10,9 +10,9 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 
 | ファイル | 内容 |
 |---|---|
-| `docs/overview.md` | 全体像。入出力、全体フロー図、並行して走る処理のタイムライン図、処理時間、モジュール構成図、設定表 |
-| `docs/coarse_segmentation.md` | ① 粗い段階（`core/common/coarse_segmentation.py`・`region_relabel.py`） |
-| `docs/detailed_segmentation.md` | ② 詳細段階（`semantic_refiner.py`・`region_estimator.py`・`edgetam_session.py`）と格子分離の概要 |
+| `docs/overview.md` | 全体像。入出力、全体フロー図、処理ごとの変化の一覧、コードの構成（`coarse/`・`detail/`）、並行して走る処理のタイムライン図、処理時間、設定表 |
+| `docs/coarse_segmentation.md` | ① 粗い段階（`core/common/coarse/`。`segmenter.py`・`clusters.py`・`propagation.py`・`relabel.py`）。0 入力と特徴量・① KMeans・② 判定・③ 伝播・④ 付け直し・⑤ ラベル |
+| `docs/detailed_segmentation.md` | ② 詳細段階（`core/common/detail/`。`refiner.py`・`region_estimator.py`・`prompt_points.py`・`mask_cleanup.py`・`naming.py`・`lattice*.py`）。1 準備・2 クラスごとの推定・3 重なり・4 取りこぼし・5 後処理・6 格子・7 名前付け |
 | `docs/lattice_detection.md` | 格子の検出（`lattice.py`・`lattice_separator.py`）。シリンジの巣の画像で段階ごとに |
 | `docs/method_history.md` | 手法の変遷（採用 / 不採用の表）。手法を変えたら表を更新する（数値は、既存の記載と `outputs/<実験名>/` のレポートから、測定条件つきで写す） |
 | `docs/images/` | 資料の画像（JPEG）。下の 4 つのスクリプトが作る |
@@ -22,23 +22,24 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 - 人は長い文章より図を速く理解する。**各節は「フロー図（mermaid）→ 実画像 → 2〜4 行の箇条書き → 表」の順**。段落で説明しない。
 - 1 つの節の文章は 10 行以内。経緯・実験の数値は `method_history.md` に隔離し、処理の資料には書かない。
 - フロー図は関数名つき。`flowchart LR`（段階が少ない）か `TD`。シーケンス図は、関数の呼び合い（スレッド・lock）を示すときだけ。
-- 例の画像は、各ステップの直下に併記する。基準の画像を先に示し、複数クラス・取りこぼしなど**基準では起きない処理**は、2 枚目の画像（cable）で示す。「他の画像の例」という章は作らない。
+- 例の画像（コイン `coin` とカップ麺 `noodle (2)`）は、**各ステップの直下に、2 枚を続けて**置く（コイン → カップ麺の順）。コインでは起きない処理（複数クラスの重なり・取りこぼしの再推定など）は、カップ麺だけの画像でよい。起きない処理は「起きない」と書く（`d4_rescue` はコインでは作られない）。「他の画像の例」という章は作らない。
 - 数値・因果は、**コードを読んだ内容か、実行して測った値だけ**を書く。図から読み取れることは「図の左は…」と見たまま書く。確認していない原因は断定しない。旧資料の数値を写すときは、現在のコード・`configs/ov_config.yaml`・`core/common/params.py` と食い違っていないか確かめ、出典（実験名・測定日）を付ける。
 - 処理時間の数値は、**この資料を作った PC で、静かな状態で測った値**を、測定条件つきで書く（別の画像・別の PC の値と混ぜない）。
 
 ## 手順
 
 0. **画像を決める**: 基準の画像と 2 枚目の画像のパス・接頭辞・呼び名を、ユーザーに聞く（`AskUserQuestion`）。聞かれたくなければ、前回の接頭辞（`docs/images/` を見る）を使う。環境に無い画像（シリンジなど）は、既存の画像を流用してよい（その旨を資料に書く）。
-1. **仕様を読む**: `CLAUDE.md`、`core/common/segmentation_runner.py`（`segment`）、`coarse_segmentation.py`、`semantic_refiner.py`、`region_estimator.py`、`parallel.py`、`params.py`、`configs/ov_config.yaml`。変更点は `git log` / `git diff`。
+1. **仕様を読む**: `CLAUDE.md`、`core/common/segmentation_runner.py`（`segment`）、`coarse/segmenter.py`、`detail/refiner.py`、`detail/region_estimator.py`、`parallel.py`、`params.py`、`configs/ov_config.yaml`。変更点は `git log` / `git diff`。
 2. **画像を作り直す**（OpenVINO 版。モデルは資料の前提のものを `--model-dir` で指す。例: 第 6 層なら `weights/openvino_models_l6`）:
    ```bash
    python tools/docs/make_doc_images.py --image "<基準の画像>" --prefix coin --model-dir weights/openvino_models_l6
-   python tools/docs/make_doc_images.py --image "<2 枚目の画像>" --prefix cable --model-dir weights/openvino_models_l6
+   python tools/docs/make_doc_images.py --image "<2 枚目の画像>" --prefix noodle --model-dir weights/openvino_models_l6
    python tools/docs/make_timeline_image.py --image "<2 枚目の画像>" --model-dir weights/openvino_models_l6   # タイムライン図。静かな状態で
+   python tools/docs/make_relabel_doc_image.py --model-dir weights/openvino_models_l6                         # ④ の「なし / あり」（カップ麺 (2)）
    ```
    - 最後に「本体の segment と semantic_map が一致: True」になることを確認する（段階ごとの再現が本体とずれていないか。本体はスレッドあり、再現はスレッドなしなので、並行処理で出力が変わらない確認にもなる）。
    - ログ（クラスタの判定・伝播で反転したパッチ数・連結成分・点の数・再推定した成分）を、資料の数値に使う。**ログは `> log.txt` に残してから読む**（画面の末尾だけでは足りない）。
-   - 本体の処理を変えたときは、`make_doc_images.py` の再現部分も直す（estimator・session・refiner のメソッドをインスタンスで包んで記録している）。
+   - `make_doc_images.py` は、本体と**同じ段階の関数を同じ順に呼ぶ**（`coarse/` の関数・`RegionEstimator`・`SemanticRefiner` の各段階・`RegionNamer`）。本体の処理の順や関数を変えたときは、その呼び出しも直す（最後の一致の確認が落ちる）。
    - `make_lattice_doc_images.py`（格子。シリンジの画像が要る）・`make_points_doc_images.py`（正例点の比較。MVTec の `fg_mask` が要る）は、データがあるときだけ再生成する。
 3. **画像を見る**（Read で画像を開く）。資料の記述が図と合っているか、日本語が欠けていないか（`make_doc_images.py` は、`Noto Sans CJK JP` → `Yu Gothic` → `Meiryo` → `MS Gothic` の順で最初に有るフォントを使う）を確かめる。
 4. **資料を書く・直す**。
@@ -51,8 +52,8 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 
 ## 画像のサイズ（git に載せるため小さくする）
 
-- 画像は **JPEG・幅 1200px 以下・品質 80** で保存する（`tools/docs/shrink_images.py` の `MAX_WIDTH` / `JPEG_QUALITY`）。`make_doc_images.py` は最初からこの設定で保存する。
-- `docs/images/` の合計は **5MB 以下**（`lint_docs.py` が検査する）。超えるときは、使っていない画像を消す → `python tools/docs/shrink_images.py --max-width 1000` → `MAX_WIDTH` 1000・`JPEG_QUALITY` 75 に下げて再生成、の順。
+- 画像は **JPEG・幅 1200px 以下・品質 72** で保存する（`tools/docs/shrink_images.py` の `MAX_WIDTH` / `JPEG_QUALITY`）。`make_doc_images.py` は最初からこの設定で保存する。
+- `docs/images/` の合計は **5MB 以下**（`lint_docs.py` が検査する）。超えるときは、使っていない画像を消す → `python tools/docs/shrink_images.py --max-width 1000` → `MAX_WIDTH` を 1000 に下げて再生成、の順。
 - PNG を新しく置かない。`.gitignore` は `*.png`・`*.jpg` を除外しているが、`docs/images/*.jpg` だけは例外にしてある。
 
 ## 報告

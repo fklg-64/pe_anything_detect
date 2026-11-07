@@ -9,7 +9,9 @@
   5. 粗いセマンティック   assign_semantic_labels（パッチ単位のラベル）
   6. 精緻化               SemanticRefiner.refine（クラスごとに EdgeTAM デコーダ -> 1 枚のセマンティックマップ）
                           <- この間に、領域の推定（NumPy の整形）を、別の領域のデコードと重ねる
-                          最後に、EdgeTAM が切り出した物体ごとに、その画素の PE の代表トークンで名前を決め直す（CoarseSegmenter.final_region_logits）
+                          最後に、EdgeTAM が切り出した物体ごとに、その画素の PE の代表トークンで名前を決め直す（RegionNamer。detail/naming.py）
+
+段階ごとのコードは、粗い段階（4・5）が core/common/coarse/、詳細段階（6）が core/common/detail/ にある。
 
 重ねる処理は worker_threads のスレッドで実行する（parallel.py。0 なら重ねず、順に実行する）。結果は決まった順に反映するので、出力は変わらない。
 結果の保存は run() / ResultSaver（segment には含まれない）。
@@ -24,13 +26,15 @@ from typing import Tuple, Union
 import numpy as np
 
 from core.utils import Timer, load_image, resize_image
-from core.common.coarse_segmentation import CoarseForeground, CoarseSegmenter
 from core.common.backend import CLIPBackend, EdgeTamBackend
+from core.common.coarse.propagation import edge_graph_of
+from core.common.coarse.segmenter import CoarseForeground, CoarseSegmenter
+from core.common.detail.naming import RegionNamer
+from core.common.detail.refiner import SemanticRefiner
 from core.common.edgetam_helper import EdgeTamHelper
 from core.common.edgetam_session import EdgeTamSession, Features
 from core.common.parallel import Job, Workers
 from core.common.result import SegmentationResult
-from core.common.semantic_refiner import SemanticRefiner
 from core.common.gallery import ORIGINAL_STEM, write_gallery_html
 from core.common.visualization import ResultSaver
 
@@ -59,14 +63,15 @@ class SegmentationRunner:
 
         self.session = EdgeTamSession(edgetam)
         self.coarse = CoarseSegmenter(extractor, config)
-        self.refiner = SemanticRefiner(self.session, extractor.feature_size, config, self.workers)
+        self.namer = RegionNamer(extractor, self.coarse.prompts, self.coarse.grid, config["k_clusters"])
+        self.refiner = SemanticRefiner(self.session, extractor.feature_size, config, self.workers, self.namer)
         self.saver = ResultSaver(config)
         self.save_gallery_html = config["save_gallery_html"]
         self._gallery_times: dict[Path, float] = {}  # 一覧HTML用の 保存先 -> 処理時間(ms)
 
         # tools から参照されるプロンプト一覧
-        self.foreground_prompts = self.coarse.foreground_prompts
-        self.background_prompts = self.coarse.background_prompts
+        self.foreground_prompts = self.coarse.prompts.foreground
+        self.background_prompts = self.coarse.prompts.background
 
     def segment(self, image_raw: np.ndarray) -> SegmentationResult:
         """1枚の画像（RGB）をセグメンテーションする。ファイルへの保存はしない（保存は run / ResultSaver）。"""
@@ -98,7 +103,7 @@ class SegmentationRunner:
         with Timer("詳細セマンティックセグメンテーション処理時間"):
             refined = self.refiner.refine(
                 resized, coarse_foreground.foreground_map, foreground_mask, semantic_labels, labels_list, width, height,
-                edgetam_features, region_logits=partial(self.coarse.final_region_logits, patch_features),
+                edgetam_features, patch_features=patch_features,
             )
 
         elapsed_time = time.time() - start
@@ -135,7 +140,7 @@ class SegmentationRunner:
 
     def _start_edge_graph(self, edgetam_features: Features) -> Job:
         """EdgeTAM の image_embed の kNN グラフ作りを、別スレッドで始める（スレッドが無ければ、result() を呼んだときに実行する）。"""
-        return self.workers.submit(partial(self.coarse.edge_graph_of, edgetam_features[2]))
+        return self.workers.submit(partial(edge_graph_of, edgetam_features[2]))
 
     def _extract_clip_features(self, resized: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """CLIP（PE）のパッチ特徴と fused パッチ特徴（正規化も含む）。"""

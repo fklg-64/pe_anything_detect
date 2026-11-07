@@ -22,7 +22,7 @@ from scipy import ndimage as ndi
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.openvino.runtime_utils import make_compile_config  # noqa: F401  (import openvino より前に /opt/intel/openvino を外す)
-from core.common import lattice as L
+from core.common.detail import lattice as L
 from core.common.params import (
     LATTICE_DETECT_SIZE,
     LATTICE_MIN_CELLS,

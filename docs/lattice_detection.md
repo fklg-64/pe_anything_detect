@@ -1,8 +1,9 @@
 # 格子の検出方法
 
 規則的に並んだ同じ物体（巣・トレイ・ブリスター）の**格子（並びの周期）を画像から見つけ、各物体の中心と箱を求める**。
-`core/common/lattice.py`（`detect`・`find_phase`・`cell_centers`・`cell_half_size`）と、`LatticeSeparator.separate`（`lattice_separator.py`）の前半。
+`core/common/detail/lattice.py`（`detect`・`find_phase`・`cell_centers`・`cell_half_size`）と、`LatticeSeparator.separate`（`detail/lattice_separator.py`）の前半。
 全体は [overview.md](overview.md)、この結果を使うセルごとのデコードは [detailed_segmentation.md](detailed_segmentation.md)。
+**この資料の画像は、シリンジの巣（006。格子が見つかる例）。** コイン・カップ麺は格子ではなく、検出は何も返さない（[detailed_segmentation.md](detailed_segmentation.md#6-格子状に並んだ小物体の分離) の図）。
 
 | | 内容 |
 |---|---|
@@ -138,4 +139,4 @@ python tools/docs/make_lattice_doc_images.py   # 006 の 8 枚（docs/images/lat
 python tools/docs/lint_docs.py
 ```
 
-本体の `lattice.py`・`LatticeSeparator.separate` と同じ手順を再現して図を作り、最後に精密化したベクトル・補正後のセルの中心が本体の出力と一致することを確かめる。
+本体の `detail/lattice.py`・`LatticeSeparator.separate` と同じ手順を再現して図を作り、最後に精密化したベクトル・補正後のセルの中心が本体の出力と一致することを確かめる。
